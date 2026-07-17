@@ -123,23 +123,47 @@ run() {  # run <子目录> <端口> [额外参数...]
 
 > `--gpus '"device=0"'` 单卡绑定;多实例分卡时换 device=1/2/3。拓扑:GPU0-1 一对、GPU2-3 一对,跨对(1↔2)走 NUMA 慢,多卡压同一对内。
 
-### 待测 11 个模型(权重已在 NFS)
+### 4.1 逐模型 serve 命令(deploy-config 除注明外均自动加载)
 
-| 子目录 | 模型 | 类别 | 优先级 | 已知坑(接入前查) |
-|---|---|---|---|---|
-| `Qwen3-TTS-1.7B-CustomVoice` | Qwen3-TTS | A 克隆/多语 | ★1 | 预设音色库 / WebSocket 端点 |
-| `VoxCPM2` | VoxCPM2 | A 48k | ★2 | 采样率 48k 确认 |
-| `Fun-CosyVoice3-0.5B-2512` | CosyVoice3 | A 轻量 | ★2 | 在线示例仓标注缺,先走离线 |
-| `Ming-omni-tts-0.5B` | Ming-omni-tts | A/D 方言 | ★3 | 音色嵌入,无需 ref_text;方言/TTA 模式参数 |
-| `MOSS-TTS-Nano` | MOSS-Nano | A 0.1B/48k | ★3 | 需 ref_audio;续写模式 |
-| `MOSS-TTS-Realtime` | MOSS-Realtime | A 低延迟 | ★3 | async_chunk 流式 |
-| `GLM-TTS` | GLM-TTS | A 备选 | ★3 | **克隆需 ref_text** |
-| `MOSS-VoiceGenerator` | 音色设计 | B | ★4 | 文字描述造声线,无需参考 |
-| `SoulX-Singer` | 歌声 SVS+SVC | E | ★4 | ⚠️ **需手动补 `phone_set.json`(HF 不发)**;非流式 |
-| `stable-audio-open-1.0` | 音乐+音效 | D | ★5 | 离线,无 OpenAI 端点 |
-| `ACE-Step-v1-3.5B` | 文生音乐 | D | ★5 | 扩散,非 TTS 端点;确认 recipe 调用方式 |
+> 大多数模型 deploy-config 按 model_type 自动加载,用上面的 `run <子目录> <端口>` 模板即可;
+> 下表"额外参数"列是模板之外要补的 flag。端点默认 `POST /v1/audio/speech`,注明的除外。
 
-> 每模型精确的 `--deploy-config` yaml、附属权重(codec/vocoder)离线摆放名、tokenizer 占位路径,逐个照 `recipes/<org>/<model>.md` 落实(**待补:逐模型 serve 命令,下一步做**)。
+| 子目录 | 模型 | ★ | 额外参数 | 端点 / 关键请求参数 | 输入要求 |
+|---|---|---|---|---|---|
+| `Qwen3-TTS-1.7B-CustomVoice` | Qwen3-TTS | ★1 | (无,自动加载 `qwen3_tts.yaml`) | `/v1/audio/speech`:`voice`=预设音色、`instructions`=风格 | **有预设音色**,无需 ref |
+| `VoxCPM2` | VoxCPM2 | ★2 | (无) | `/v1/audio/speech`:`ref_audio` 可选 | 可预设可克隆;**48k** |
+| `Fun-CosyVoice3-0.5B-2512` | CosyVoice3 | ★2 | (无) | `/v1/audio/speech`:`ref_audio`+`ref_text` | **克隆必需** ref_audio+ref_text |
+| `Ming-omni-tts-0.5B` | Ming-omni-tts | ★3 | `--enforce-eager` | `/v1/audio/speech`:`instructions`(方言 JSON)、`ref_audio` | 音色嵌入,方言走 instructions;**44.1k** |
+| `MOSS-TTS-Nano` | MOSS-Nano | ★3 | ⚠️需 codec(见 4.2) | `/v1/audio/speech`:`ref_audio` **必需** | ref_audio 必需;voice/ref_text 被忽略;**48k** |
+| `MOSS-TTS-Realtime` | MOSS-Realtime | ★3 | ⚠️需 codec | `/v1/audio/speech`:`ref_audio` 必需,`stream=true` | 低延迟流式;24k |
+| `GLM-TTS` | GLM-TTS | ★3 | (无) | `/v1/audio/speech`:`ref_audio`+`ref_text` **必需** | 克隆必需 ref_text;首请求慢(懒加载) |
+| `MOSS-VoiceGenerator` | 音色设计 | ★4 | ⚠️需 codec | `/v1/audio/speech`:`input`=声线文字描述 | 无 ref;文字造声线 |
+| `SoulX-Singer` | 歌声 SVS+SVC | ★4 | ⚠️见 4.3 | **`/v1/chat/completions`**:`input_audio`+`target_audio` | 缺依赖,见 4.3 |
+| `stable-audio-open-1.0` | 音乐+音效 | ★5 | `--enforce-eager --gpu-memory-utilization 0.9`,**无 deploy-config** | **`/v1/audio/generate`**:`input`、`audio_length`(≤47s)、`guidance_scale` | 非 TTS;44.1k 立体声 |
+| ~~`ACE-Step-v1-3.5B`~~ | 文生音乐 | ❌ | — | — | **本镜像不支持(见 4.4)** |
+
+### 4.2 MOSS 三兄弟共享 codec(已补进下载脚本)
+
+MOSS-Nano / Realtime / VoiceGenerator 起服务要一份 codec(上游默认从 HF 自动拉,`HF_HUB_OFFLINE=1` 下必须本地有)。已加进 `download_speech_models.sh` 默认集:
+- `moss_codec` → `OpenMOSS-Team/MOSS-Audio-Tokenizer`(Realtime / VoiceGenerator 用)
+- `moss_codec_nano` → `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano`(Nano 用)
+
+起服务时给容器传 `-e MOSS_TTS_CODEC_PATH=$ROOT/MOSS-Audio-Tokenizer`(Nano 用 `-Nano` 那个)。补下命令:
+```bash
+MODELS="moss_codec moss_codec_nano" bash download_speech_models.sh
+```
+
+### 4.3 SoulX-Singer 前处理权重(已补)+ 仍需手动 phone_set
+
+1. **`SoulX-Singer-Preprocess` 权重** → 已加进下载脚本(`soulx_preprocess`),**下到 `$ROOT/SoulX-Singer-Preprocess`,与 `SoulX-Singer` 同级** —— 代码 `utils.py:172` 自动发现该同级目录,免配环境变量。
+2. **`phone_set.json`**(HF 不发,仍需手动补进模型目录)。
+3. 端点是 **`/v1/chat/completions`** 不是 audio/speech,且要显式 `--deploy-config vllm_omni/deploy/soulxsinger_svs.yaml`(SVC 用 `_svc.yaml`)+ `--enforce-eager`。
+
+补下命令:`MODELS=soulx_preprocess bash download_speech_models.sh`
+
+### 4.4 ACE-Step —— 独立处理,不在本镜像范围
+
+当前 commit 的 vllm-omni **没有 ACE-Step 的 recipe / deploy-config / 模型实现**,本镜像 `vllm serve` 认不出。**由独立流程处理、最终嵌入 gpustack**,不在本手册/本镜像的开测范围。音乐/音效在本镜像内用已支持的 **Stable-Audio-Open** 兜底。
 
 ---
 
