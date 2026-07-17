@@ -1,0 +1,113 @@
+name: Build vLLM-Omni ARM64 image to ACR
+
+# 全模型通用镜像出包流水线(照 index-tts / LightX2V 的 build-arm64 模式)。
+#
+# 与那两个的差异 —— vLLM-Omni 更省一段:
+#   LightX2V 要自建 CUDA+torch base(PyPI aarch64 torch 是 CPU-only,得自己编),
+#   还要 sync-base-to-dockerhub 把 base 搬到 Docker Hub。
+#   vLLM-Omni 直接用 vllm 官方镜像 vllm/vllm-openai(自带 arm64 + sm_80 预编译
+#   kernel,且本来就在 Docker Hub)当 base → 无需自建 base、无需 sync 流水线。
+#   本流水线只 build app 层:COPY 源码 + `uv pip install .`(见 docker/Dockerfile.cuda)。
+#
+# 预检结论(IndexTTS-2 实测报告已确认):vllm/vllm-openai:v0.25.0 官方带 arm64,
+#   torch 2.11.0+cu130 与 vllm kernel .so 均含 sm_80(A100 可用)。
+#
+# Secrets(repo Settings -> Secrets,与 gpustack / index-tts fork 同名):
+#   ACR_USERNAME / ACR_PASSWORD
+#
+# Run: GitHub -> Actions -> "Build vLLM-Omni ARM64 image to ACR" -> Run workflow
+#   or: gh workflow run build-arm64.yml --ref main
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'vLLM 官方 base(Docker Hub 公开,GHA runner 拉得快)'
+        default: 'vllm/vllm-openai:v0.25.0'
+        required: true
+      dest_tag:
+        description: '要发布的浮动 ACR tag'
+        default: 'arm64-a100-latest'
+        required: true
+
+env:
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni
+
+jobs:
+  build:
+    # GitHub 原生 arm64 runner(与 index-tts / LightX2V 一致)。
+    # base 从 Docker Hub 拉(快),app 层只拷代码 + pip install,不重编 CUDA 扩展。
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: write   # 建 GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # setuptools_scm 需要 git 历史/tag 生成版本号
+
+      - name: Compute immutable tag
+        id: tags
+        run: |
+          echo "version=arm64-a100-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push (arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.cuda
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            BASE_IMAGE=${{ github.event.inputs.base_image }}
+          tags: |
+            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: vLLM-Omni ${{ steps.tags.outputs.version }}
+          body: |
+            vLLM-Omni 全模型通用 arm64 镜像 — 推送到阿里云 ACR。
+
+            - Floating tag: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}`
+            - Immutable tag: `${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}`
+            - Digest: `${{ steps.build.outputs.digest }}`
+            - Base: `${{ github.event.inputs.base_image }}`
+            - Commit: ${{ github.sha }}
+
+            **覆盖范围:** 该 commit 仓库里的全部模型(`vllm serve <model> --omni`)。
+            **分发(隔离网):** 在 238 跑 `lx2v-node.sh prepare-transfer`(pull → save → NFS tar),节点 `docker load`。
+            **上机预检:** `docker run --rm --gpus all <img> python -c "import torch;print(torch.cuda.get_arch_list())"` 确认含 sm_80。
+
+      - name: Summary
+        run: |
+          {
+            echo "### vLLM-Omni arm64 image pushed to ACR"
+            echo ""
+            echo "- \`${ACR_REPO}:${{ github.event.inputs.dest_tag }}\` (floating)"
+            echo "- \`${ACR_REPO}:${{ steps.tags.outputs.version }}\` (immutable)"
+            echo ""
+            echo "Distribute: on 238 run \`lx2v-node.sh prepare-transfer\`, then \`docker load\` on nodes."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ACR_REPO: ${{ env.ACR_REPO }}
