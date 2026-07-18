@@ -149,7 +149,10 @@ def get_vllm_omni_version() -> str:
             version = get_version()
         except Exception as e:
             print(f"Warning: Failed to get version from git, using fallback: {e}")
-            version = "dev"
+            # Must be a valid PEP 440 version — it's fed back into
+            # SETUPTOOLS_SCM_PRETEND_VERSION below, and a bare "dev" raises
+            # packaging.version.InvalidVersion, failing the whole build.
+            version = "0.0.0.dev0"
 
         # Determine separator: '+' for normal versions, '.' for dev versions with '+'
         sep = "+" if "+" not in version else "."
