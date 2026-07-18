@@ -94,6 +94,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.audio_task_manager import AUDIO_TASK_MANAGER, resolve_save_path
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
@@ -106,6 +107,11 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
+)
+from vllm_omni.entrypoints.openai.protocol.audio_tasks import (
+    AudioTaskRequest,
+    AudioTaskResponse,
+    AudioTaskStatus,
 )
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
@@ -140,8 +146,13 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
-from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle, atomic_write_bytes
+from vllm_omni.entrypoints.openai.stores import (
+    AUDIO_TASK_STORE,
+    AUDIO_TASKS,
+    VIDEO_STORE,
+    VIDEO_TASKS,
+)
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
@@ -1097,6 +1108,11 @@ async def omni_init_app_state(
     # real user request is fast instead of paying a 100s compilation tax.
     await state.openai_serving_speech.warmup()
 
+    # Speech pipeline is warm: flip the readiness gate consumed by /ready so
+    # GPUStack only routes traffic (and marks the instance Ready) after warmup,
+    # never during the multi-minute cold start.
+    state.server_ready = True
+
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
@@ -1669,6 +1685,39 @@ async def health(raw_request: Request) -> JSONResponse:
     except EngineDeadError:
         return JSONResponse(
             content={"status": "unhealthy"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+
+
+@router.get("/ready")
+async def ready(raw_request: Request) -> JSONResponse:
+    """Readiness probe for the GPUStack backend (``health_check_path``).
+
+    Unlike ``/health`` (engine-alive), ``/ready`` returns 200 only after the
+    model is loaded *and* warmed up (``state.server_ready`` is set right after
+    ``warmup()``), so the scheduler doesn't mark the instance Ready or route
+    traffic during the multi-minute cold start. Mirrors LightX2V's launcher
+    ``/ready`` (503 while loading, 200 when ready).
+    """
+    if not getattr(raw_request.app.state, "server_ready", False):
+        return JSONResponse(
+            content={"ready": False},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    engine_client = getattr(raw_request.app.state, "engine_client", None) or getattr(
+        raw_request.app.state, "diffusion_engine", None
+    )
+    if engine_client is None:
+        return JSONResponse(
+            content={"ready": False, "reason": "No engine initialized"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    try:
+        await engine_client.check_health()
+        return JSONResponse(content={"ready": True})
+    except EngineDeadError:
+        return JSONResponse(
+            content={"ready": False},
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
 
@@ -3309,6 +3358,168 @@ async def download_video(video_id: str) -> Response:
         )
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Async audio task API (GPUStack integration).
+#
+# Contract mirrors LightX2V / IndexTTS so the GPUStack facade drives TTS via
+# submit + poll (needed because generation can exceed a minute). Reuses the
+# generic store/registry (AUDIO_TASK_STORE / AUDIO_TASKS) and the same speech
+# handler as the synchronous /v1/audio/speech; models are unaffected.
+# ---------------------------------------------------------------------------
+
+# Per-model safety cap (defense against engine-killing over-long text, e.g.
+# IndexTTS' hard sentence cliff). Set per model deployment; the authoritative
+# user-facing limit lives upstream in new-api.
+_AUDIO_MAX_TEXT_LEN = int(os.environ.get("VLLM_OMNI_AUDIO_MAX_TEXT_LEN", "5000"))
+
+
+async def _run_audio_generation_job(
+    handler: OmniOpenAIServingSpeech,
+    request: AudioTaskRequest,
+    task_id: str,
+    save_result_path: str,
+    app_state: Any | None = None,
+) -> None:
+    job = await AUDIO_TASK_STORE.get(task_id)
+    if job is None:
+        logger.warning("Audio task %s missing before generation started; skipping", task_id)
+        return
+
+    await AUDIO_TASK_STORE.update_fields(
+        task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()}
+    )
+    try:
+        speech_request = request.to_speech_request()
+        # _generate_audio_bytes is the non-streaming byte path: it returns
+        # (bytes, media_type). create_speech() would return a FastAPI
+        # Response/StreamingResponse instead, so we must call the lower-level
+        # helper to get raw bytes for the NFS write.
+        audio_bytes, _media_type = await handler._generate_audio_bytes(speech_request, request_id=task_id)
+        if not isinstance(audio_bytes, bytes | bytearray):
+            raise RuntimeError("Speech handler did not return raw audio bytes")
+        await atomic_write_bytes(bytes(audio_bytes), save_result_path)
+        logger.info("Audio task %s wrote %d bytes to %s", task_id, len(audio_bytes), save_result_path)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()}
+        )
+    except asyncio.CancelledError:
+        await AUDIO_TASK_STORE.update_fields(
+            task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()}
+        )
+        raise
+    except (EngineGenerateError, EngineDeadError) as exc:
+        logger.exception("Audio task %s failed (engine error)", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        # Background tasks can't propagate to FastAPI handlers; signal shutdown
+        # when the engine is dead (same as the video job).
+        if app_state is not None and isinstance(exc, EngineDeadError):
+            terminate_if_errored(server=app_state.server, engine=app_state.engine_client)
+    except Exception as exc:
+        logger.exception("Audio task %s failed", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+@router.post(
+    "/v1/tasks/audio/",
+    responses={
+        HTTPStatus.OK.value: {"model": AudioTaskResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def create_audio_task(request: AudioTaskRequest, raw_request: Request) -> AudioTaskResponse:
+    """Submit an asynchronous TTS task (returns immediately; poll for status)."""
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API"
+        )
+
+    if not (request.input or "").strip():
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Empty synthesis text")
+    if len(request.input) > _AUDIO_MAX_TEXT_LEN:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                f"Text too long ({len(request.input)} > {_AUDIO_MAX_TEXT_LEN}); "
+                "tune VLLM_OMNI_AUDIO_MAX_TEXT_LEN for this model."
+            ),
+        )
+
+    task_id = request.task_id or f"audio_task_{random_uuid()}"
+    save_result_path = resolve_save_path(request.save_result_path, task_id, STORAGE_MANAGER.storage_path)
+
+    try:
+        ref = await AUDIO_TASK_MANAGER.reserve(task_id, save_result_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail=str(exc)) from exc
+
+    task = asyncio.create_task(
+        _run_audio_generation_job(handler, request, task_id, save_result_path, app_state=raw_request.app.state)
+    )
+    await AUDIO_TASKS.upsert(task_id, task)
+    return ref
+
+
+@router.get("/v1/tasks/", response_model=list[AudioTaskResponse])
+async def list_audio_tasks() -> list[AudioTaskResponse]:
+    return await AUDIO_TASK_MANAGER.list_tasks()
+
+
+# Declared before the parametrized /v1/tasks/{task_id}/status so the literal
+# "queue/status" is not captured as task_id="queue".
+@router.get("/v1/tasks/queue/status")
+async def get_audio_queue_status() -> JSONResponse:
+    return JSONResponse(content=await AUDIO_TASK_MANAGER.queue_status())
+
+
+@router.get("/v1/tasks/{task_id}/status", response_model=AudioTaskResponse)
+async def get_audio_task_status(task_id: str) -> AudioTaskResponse:
+    job = await AUDIO_TASK_MANAGER.get_status(task_id)
+    if job is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Task not found")
+    return job
+
+
+@router.get("/v1/tasks/{task_id}/result")
+async def get_audio_task_result(task_id: str) -> Response:
+    job = await AUDIO_TASK_MANAGER.get_status(task_id)
+    if job is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Task not found")
+    if job.status == AudioTaskStatus.FAILED:
+        raise HTTPException(status_code=422, detail=f"Audio task failed: {job.error}")
+    if job.status != AudioTaskStatus.COMPLETED or not job.save_result_path:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Result not ready")
+    if not os.path.exists(job.save_result_path):
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Result file not found on disk")
+    return FileResponse(path=job.save_result_path, filename=os.path.basename(job.save_result_path))
+
+
+@router.delete("/v1/tasks/{task_id}")
+async def delete_audio_task(task_id: str) -> JSONResponse:
+    cancelled = await AUDIO_TASK_MANAGER.cancel(task_id)
+    if not cancelled and await AUDIO_TASK_MANAGER.get_status(task_id) is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Task not found")
+    return JSONResponse(content={"task_id": task_id, "cancelled": cancelled})
 
 
 @profiler_router.post("/start_profile")

@@ -188,6 +188,42 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._sweeper_task = None
 
 
+def _atomic_write_sync(data: bytes, dest_path: str) -> str:
+    """Write ``data`` to an arbitrary absolute path atomically.
+
+    Unlike ``LocalStorageManager`` (which confines writes under its own
+    storage root), the async audio task API must write to the exact
+    ``save_result_path`` the GPUStack facade injects — typically an NFS
+    absolute path outside the local storage root. The temp file is created in
+    the destination directory so ``os.replace`` is an atomic same-filesystem
+    rename; readers never observe a half-written file.
+    """
+    dest = os.path.realpath(dest_path)
+    parent = os.path.dirname(dest)
+    os.makedirs(parent, exist_ok=True)
+    tmp_name: str | None = None
+    try:
+        with NamedTemporaryFile("wb", dir=parent, delete=False) as f:
+            tmp_name = f.name
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, dest)
+        return dest
+    except Exception:
+        if tmp_name is not None:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+        raise
+
+
+async def atomic_write_bytes(data: bytes, dest_path: str) -> str:
+    """Async wrapper around :func:`_atomic_write_sync` (runs in a thread)."""
+    return await asyncio.to_thread(_atomic_write_sync, data, dest_path)
+
+
 def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:

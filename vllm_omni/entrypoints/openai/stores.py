@@ -3,6 +3,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
+from vllm_omni.entrypoints.openai.protocol.audio_tasks import AudioTaskResponse
 from vllm_omni.entrypoints.openai.protocol.videos import VideoResponse
 
 T = TypeVar("T", bound=BaseModel)
@@ -72,3 +73,8 @@ class AsyncDictStore(Generic[T]):
 
 VIDEO_STORE: AsyncDictStore[VideoResponse] = AsyncDictStore()
 VIDEO_TASKS: TaskRegistry = TaskRegistry()
+
+# Async audio task API (GPUStack integration) — reuses the same generic
+# store/registry as video.
+AUDIO_TASK_STORE: AsyncDictStore[AudioTaskResponse] = AsyncDictStore()
+AUDIO_TASKS: TaskRegistry = TaskRegistry()
