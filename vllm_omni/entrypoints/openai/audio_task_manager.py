@@ -54,9 +54,10 @@ def resolve_save_path(
 
 
 class AudioTaskManager:
-    def __init__(self, max_queue_size: int = 8) -> None:
-        self._store = AUDIO_TASK_STORE
-        self._tasks = AUDIO_TASKS
+    def __init__(self, max_queue_size: int = 8, *, store=None, tasks=None) -> None:
+        # store/tasks default to the module-level singletons; injectable for tests.
+        self._store = store if store is not None else AUDIO_TASK_STORE
+        self._tasks = tasks if tasks is not None else AUDIO_TASKS
         self._lock = asyncio.Lock()
         self._max = max_queue_size
 

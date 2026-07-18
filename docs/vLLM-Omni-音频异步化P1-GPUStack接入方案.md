@@ -278,4 +278,28 @@ async def ready(raw_request):
 
 ---
 
+## 10. 真机验证记录(2026-07-18,0020)
+
+P1 已按本方案落地(commit `fcb6b9d0`)并在 **鲲鹏 ARM + A100-40G(0020)** 真机跑通全契约。
+
+**环境**:镜像 `vllm-omni:arm64-a100-latest`(digest `4b2def0b499e`,含 P1 代码)· 模型 `Qwen3-TTS-1.7B-CustomVoice`(2 stage)· `docker run … vllm serve … --omni`。
+
+**启动 / 就绪**:`AsyncOmniEngine initialized in 331s`(冷启动 ~5.5min:torch.compile 37.9s + CUDA graph + code_predictor warmup);启动日志确认 7 条新路由全注册(`/ready`、`POST /v1/tasks/audio/`、`GET /v1/tasks/`、`/v1/tasks/queue/status`、`/v1/tasks/{id}/status`、`/v1/tasks/{id}/result`、`DELETE /v1/tasks/{id}`);`GET /ready → 200 OK`(warmup 后,`server_ready` 生效)。
+
+**契约冒烟**(全绿):
+
+| 步骤 | 结果 |
+|---|---|
+| `POST /v1/tasks/audio/`(voice=vivian) | `{"task_id":"audio_task_83f19…","status":"pending","start_time":null,"end_time":null,"save_result_path":"/tmp/async_smoke.wav"}` |
+| `GET /v1/tasks/{id}/status` 轮询 | `"status":"completed"`,`start_time=1784364100.24`,`end_time=1784364102.01`(生成 ~1.77s)—— **字段是 start_time/end_time,非 created_at/completed_at** |
+| 落盘(save_result_path,原子写) | `/tmp/async_smoke.wav` **203K** |
+| `GET /v1/tasks/queue/status` | `{is_processing:false, current_task:null, pending_count:0, active_count:0, queue_size:8, queue_available:8}` 六字段全对 |
+| `GET /v1/tasks/{id}/result` | `RIFF WAVE audio, 16 bit, mono 24000 Hz` |
+
+**Codex 审查三点在真机确认成立**:① job 走 `_generate_audio_bytes` 拿到真字节(203K WAV,非坏掉的 FastAPI Response);② `end_time` 正确填充;③ 包路径对(路由全注册、无导入错)。
+
+**结论**:P1 引擎异步契约(submit→poll→落盘 NFS→取件 + queue + /ready)真机验证通过,可供 GPUStack 门面按 IndexTTS 同款异步链路接入(P3)。
+
+---
+
 *配套:`vLLM-Omni-全模型镜像构建与开测手册.md`(镜像/开测)、`vLLM-Omni-语音模型全景与选型.md`(选型)、`vLLM-Omni-大模型量化与Offload可行性调研.md`(不量化结论)。*
