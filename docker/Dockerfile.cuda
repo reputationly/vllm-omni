@@ -17,6 +17,15 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
 
+# Step 2b: Third-party runtime deps for community speech models (VoxCPM2 needs
+# `voxcpm`, CosyVoice3 needs `s3tokenizer`, etc.). Best-effort per-package so a
+# missing arm64 wheel can't fail the whole image build — the model that needs a
+# skipped dep will surface a clear ImportError at serve time.
+RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
+    for pkg in "voxcpm>=2.0.2" "s3tokenizer>=0.3.0" "torchdiffeq>=0.2.5" "cn2an>=0.5.22" "funasr>=1.0.0"; do \
+      uv pip install --python "$PY" --no-cache-dir "$pkg" || echo "WARN: failed to install $pkg (model needing it won't serve)"; \
+    done
+
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []

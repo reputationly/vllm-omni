@@ -79,6 +79,17 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
+# Third-party runtime deps for community speech models, so the general arm64
+# image can *serve* them offline (not just run tests). Kept separate from `dev`
+# (which also pulls test/lint tooling). Baked into docker/Dockerfile.cuda.
+models = [
+    "voxcpm>=2.0.2",       # VoxCPM2 talker (voxcpm.core)
+    "s3tokenizer>=0.3.0",  # CosyVoice3 speech tokenizer
+    "torchdiffeq>=0.2.5",  # covo_audio token2wav ODE solver
+    "cn2an>=0.5.22",       # Chinese number normalization (TTS)
+    "funasr>=1.0.0",       # speaker/ASR frontends
+]
+
 forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
