@@ -913,10 +913,20 @@ class MossAudioTokenizerProjectedTransformer(StreamingContainer):
         self.input_dimension = input_dimension
         self.output_dimension = output_dimension
 
-        self.input_proj = nn.Linear(input_dimension, d_model, bias=False)
+        # Match upstream (and the V1 codec / quantizer pattern below): a
+        # projection is only a real Linear when it actually changes dimension;
+        # when in==out it is an Identity with no weight in the checkpoint.
+        # Building an unconditional Linear here made the loader demand 6 proj
+        # weights (encoder.{3,5}.input_proj / decoder.{0,2,4}.output_proj) that
+        # the MOSS-Audio-Tokenizer checkpoint legitimately does not ship.
+        self.input_proj = (
+            nn.Linear(input_dimension, d_model, bias=False) if input_dimension != d_model else nn.Identity()
+        )
         self.transformer = MossAudioTokenizerTransformer(d_model=d_model, **kwargs)
         self.conv_layout = conv_layout
-        self.output_proj = nn.Linear(d_model, output_dimension, bias=False)
+        self.output_proj = (
+            nn.Linear(d_model, output_dimension, bias=False) if d_model != output_dimension else nn.Identity()
+        )
 
     def forward(self, x, input_lengths, *args, **kwargs):
         x = self.input_proj(x.transpose(1, 2))  # (B, D, T) -> (B, T, D)

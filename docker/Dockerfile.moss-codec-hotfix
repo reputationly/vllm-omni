@@ -1,0 +1,26 @@
+# Overlay 热修镜像:把 full-MOSS codec 两处修复烤进已构建的 vllm-omni 镜像。
+# 不做 pip 重装,只 COPY 两个改好的文件进 site-packages —— ~1-2 分钟出包。
+#
+# 修复内容:
+#   1) audio_tokenizer_v2.py         —— encoder/decoder proj 条件式(修加载缺 6 权重崩溃)
+#   2) modeling_moss_tts_codec.py    —— codec 声道按路径判定(修 mono 变体时长减半/快一倍)
+# 解锁:MOSS-TTSD / VoiceGenerator / SoundEffect / Realtime(共用此 codec)。
+#
+# 构建(在仓库根目录,context=repo;arm64 机器上跑,如 Mac Apple Silicon 或某节点):
+#   REG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly
+#   docker build -f docker/Dockerfile.moss-codec-hotfix \
+#     --build-arg BASE=$REG/vllm-omni:arm64-a100-latest \
+#     -t $REG/vllm-omni:arm64-a100-latest .
+#   docker push $REG/vllm-omni:arm64-a100-latest
+# (覆盖同 tag;或换 arm64-a100-moss-hotfix 另起 tag 再灰度)
+
+ARG BASE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni:arm64-a100-latest
+FROM ${BASE}
+
+ARG MOSS_DIR=/usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/models/moss_tts
+
+COPY vllm_omni/model_executor/models/moss_tts/audio_tokenizer_v2.py ${MOSS_DIR}/audio_tokenizer_v2.py
+COPY vllm_omni/model_executor/models/moss_tts/modeling_moss_tts_codec.py ${MOSS_DIR}/modeling_moss_tts_codec.py
+
+# 构建期自检:确认两处修复都在(proj 条件式 + 声道按路径)
+RUN python3 -c "import pathlib; s=pathlib.Path('${MOSS_DIR}/audio_tokenizer_v2.py').read_text(); assert 'if input_dimension != d_model else nn.Identity()' in s, 'proj fix missing'; c=pathlib.Path('${MOSS_DIR}/modeling_moss_tts_codec.py').read_text(); assert 'number_channels = 2 if' in c, 'channel fix missing'; print('MOSS codec hotfix baked OK')"

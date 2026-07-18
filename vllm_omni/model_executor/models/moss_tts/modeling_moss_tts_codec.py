@@ -727,6 +727,15 @@ class MossTTSCodecDecoder(nn.Module):
     def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
         try:
             codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
+            # The MOSS-Audio-Tokenizer checkpoint's native config declares
+            # number_channels=2 (it is stereo-capable), but the mono variants
+            # (Delay/Realtime/TTSD/SoundEffect/VoiceGenerator) decode a single
+            # channel. Leaving it at 2 makes the codec de-interleave a mono
+            # stream into two channels, halving the audio length (~2x too fast).
+            # Align the codec's channel count with the same path-based heuristic
+            # used for the wrapper's ``inferred_channels`` below: only the "v2"
+            # stereo codec path keeps 2 channels.
+            codec_cfg.number_channels = 2 if "v2" in codec_path.lower() else 1
             codec = MossAudioTokenizerV2Model(codec_cfg)
             logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
             return codec_cfg, codec
