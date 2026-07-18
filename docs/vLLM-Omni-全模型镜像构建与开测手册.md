@@ -165,6 +165,24 @@ MODELS="moss_codec moss_codec_nano" bash download_speech_models.sh
 
 当前 commit 的 vllm-omni **没有 ACE-Step 的 recipe / deploy-config / 模型实现**,本镜像 `vllm serve` 认不出。**由独立流程处理、最终嵌入 gpustack**,不在本手册/本镜像的开测范围。音乐/音效在本镜像内用已支持的 **Stable-Audio-Open** 兜底。
 
+### 4.5 MOSS-TTSD(多说话人对话,对手戏一次成型)
+
+- 权重:`MOSS-TTSD-v1.0/`(8B,`MossTTSDelayModel`,n_vq=16,24kHz)· deploy `moss_ttsd.yaml` 自动加载(2 stage 同卡:talker + codec decoder)。
+- **bf16 原样跑,不量化**(~26G 单卡,40G 宽裕;A100 量化只省显存不提速,详见 `大模型量化与Offload可行性调研.md`)。
+- **必需 codec**:`-e MOSS_TTS_CODEC_PATH=$ROOT/MOSS-Audio-Tokenizer`(复用已下的,非 Nano 版)。
+- 端点 `/v1/audio/speech`;多说话人对话文本按 **MOSS-TTSD 官方 README 的说话人标记格式**(`[S1]`/`[S2]` 等)组织,`ref_audio` 做零样本克隆。deploy 默认 `max_num_seqs=4 / gpu_memory_utilization=0.85 / async_chunk`。
+
+```bash
+run() 用法(见 §4 模板)之外补 codec 环境变量:
+docker run -d --name omni-moss-ttsd --gpus '"device=0"' \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -e MOSS_TTS_CODEC_PATH=$ROOT/MOSS-Audio-Tokenizer \
+  -v $ROOT:$ROOT -p 8098:8098 \
+  "$IMG" vllm serve "$ROOT/MOSS-TTSD-v1.0" --omni --trust-remote-code --port 8098
+```
+
+> 短剧用法:对手戏/群聊一次生成,和"IndexTTS 逐句拼接"同脚本 A/B 听**衔接自然度 + 音色是否稳**。
+
 ---
 
 ## 5. 每模型必测 5 项(照 IndexTTS-2 模板)
@@ -190,4 +208,50 @@ MODELS="moss_codec moss_codec_nano" bash download_speech_models.sh
 
 ---
 
-*待办:第 4 节逐模型的精确 serve 命令 + deploy-config(照 recipes 落实)。当前 commit 62589203 全模型 recipe 齐备。*
+## 7. Qwen3-TTS 开测三连(0020,复制即用)
+
+先验证镜像+全链路的最省事路径(有预设音色,不用先备参考音频)。
+
+### ① 上镜像(ACR 拉 或 NFS tar load)
+
+```bash
+REG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+IMG=$REG/reputationly/vllm-omni:arm64-a100-latest
+# 能连 ACR:
+docker pull "$IMG"
+# 隔离网走 tar(在 238/能连 ACR 的机器先 save 到 NFS,再在 0020):
+#   docker load < /nfs-models/_transfer/vllm-omni-arm64-<date>.tar
+```
+
+### ② 起服务(GPU0,挂 NFS,离线)
+
+```bash
+ROOT=/nfs-models/wuhanjisuan894/vllm-omni-speech
+docker run -d --name omni-qwen3tts --gpus '"device=0"' \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -v $ROOT:$ROOT -p 8091:8091 \
+  "$IMG" vllm serve "$ROOT/Qwen3-TTS-1.7B-CustomVoice" --omni --trust-remote-code --port 8091
+
+# 等就绪(轮询 health;首次加载 + torch.compile 可能 1-2 分钟)
+until curl -sf http://localhost:8091/health >/dev/null; do echo "waiting..."; sleep 5; done; echo "READY"
+# 看日志确认无 kernel/tokenizer 报错:
+docker logs -f omni-qwen3tts   # Ctrl-C 退出
+```
+
+### ③ 冒烟测试(预设音色出一段 wav)
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"这是一次配音冒烟测试,声音清晰、语气自然。","voice":"vivian","language":"Chinese"}' \
+  --output /tmp/qwen3tts_smoke.wav
+ls -lh /tmp/qwen3tts_smoke.wav && file /tmp/qwen3tts_smoke.wav   # 有内容 + 是 WAV 即通
+```
+
+预设音色:`vivian / ryan / aiden / dylan / eric / serena / sohee / uncle_fu` 等(`GET /v1/audio/voices` 查全);情感/风格走 `instructions`,克隆走 `ref_audio`,音色库上传走 `POST /v1/audio/voices`。
+
+**通过判据**:health 200 + 日志无 sm_80/tokenizer 报错 + wav 有声。这一步同时证明镜像本身 OK,后续模型照 §4 逐个换 `serve` 路径即可。
+
+---
+
+*第 4 节逐模型 serve 命令已落实(commit 62589203 全模型 recipe 齐备)。CLAP 评测用法由独立 agent 负责,不在本手册。*
