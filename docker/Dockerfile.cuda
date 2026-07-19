@@ -26,6 +26,14 @@ RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
       uv pip install --python "$PY" --no-cache-dir "$pkg" || echo "WARN: failed to install $pkg (model needing it won't serve)"; \
     done
 
+# Step 2c: Bake the A100 40G x2 deploy-configs for the 8B MOSS models (TTSD /
+# SoundEffect / VoiceGenerator) to a stable in-image path so GPUStack (and any
+# operator) can reference them via
+# `--deploy-config /deploy-configs/<model>_a100_40g.yaml` to split the talker +
+# codec across 2 GPUs. These are the validated 2-card configs; single-card TTS
+# models need no deploy-config. Calibrate a config = rebuild this image.
+COPY deploy-configs/ /deploy-configs/
+
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []

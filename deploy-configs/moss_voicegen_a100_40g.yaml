@@ -1,0 +1,57 @@
+# MOSS-VoiceGenerator on A100 PCIE 40G ×2 —— 从官方 moss_voice_generator.yaml 改:两 stage 分卡。
+# 原 yaml 两 stage 同卡(devices "0"),1.7B talker(0.60)+ codec(0.12)在单张 40G 上
+# 边缘 OOM(实测 stage0 占 34G + codec 5.5G ≈ 占满,差 26MiB)。这里 stage0→容器内
+# device0、stage1(codec)→容器内 device1,各占一整张卡。起容器时 --gpus '"device=2,3"'。
+async_chunk: true
+trust_remote_code: true
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 0
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.60
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 196608
+    max_model_len: 196608
+    devices: "1"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
