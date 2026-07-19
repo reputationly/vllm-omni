@@ -17,10 +17,18 @@
 ARG BASE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni:arm64-a100-latest
 FROM ${BASE}
 
+ARG PKG=/usr/local/lib/python3.12/dist-packages/vllm_omni
 ARG MOSS_DIR=/usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/models/moss_tts
 
+# MOSS codec 两处修复(解锁 TTSD/VoiceGen/SoundEffect/Realtime)
 COPY vllm_omni/model_executor/models/moss_tts/audio_tokenizer_v2.py ${MOSS_DIR}/audio_tokenizer_v2.py
 COPY vllm_omni/model_executor/models/moss_tts/modeling_moss_tts_codec.py ${MOSS_DIR}/modeling_moss_tts_codec.py
+# ming.py register bug 修复(解锁 AudioX 等导入 transformers_utils/processors 的模型)
+COPY vllm_omni/transformers_utils/processors/ming.py ${PKG}/transformers_utils/processors/ming.py
 
-# 构建期自检:确认两处修复都在(proj 条件式 + 声道按路径)
-RUN python3 -c "import pathlib; s=pathlib.Path('${MOSS_DIR}/audio_tokenizer_v2.py').read_text(); assert 'if input_dimension != d_model else nn.Identity()' in s, 'proj fix missing'; c=pathlib.Path('${MOSS_DIR}/modeling_moss_tts_codec.py').read_text(); assert 'number_channels = 2 if' in c, 'channel fix missing'; print('MOSS codec hotfix baked OK')"
+# 构建期自检:确认三处修复都在(proj 条件式 + 声道按路径 + ming register try/except)
+RUN python3 -c "import pathlib; \
+s=pathlib.Path('${MOSS_DIR}/audio_tokenizer_v2.py').read_text(); assert 'if input_dimension != d_model else nn.Identity()' in s, 'proj fix missing'; \
+c=pathlib.Path('${MOSS_DIR}/modeling_moss_tts_codec.py').read_text(); assert 'number_channels = 2 if' in c, 'channel fix missing'; \
+m=pathlib.Path('${PKG}/transformers_utils/processors/ming.py').read_text(); assert 'Ming processor auto-registration skipped' in m, 'ming fix missing'; \
+print('MOSS codec + ming hotfix baked OK')"

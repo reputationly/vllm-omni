@@ -479,5 +479,23 @@ class MingFlashOmniProcessor(ProcessorMixin):
         return list(dict.fromkeys(names))
 
 
-AutoFeatureExtractor.register("MingWhisperFeatureExtractor", MingWhisperFeatureExtractor)
-AutoProcessor.register("MingFlashOmniProcessor", MingFlashOmniProcessor)
+# transformers >= 5.5 requires the config *class* (not a model_type string) as the
+# first arg to register — it does ``key.__module__`` internally, so passing a string
+# raises ``AttributeError: 'str' object has no attribute '__module__'`` at import time
+# and crashes ANY model whose import chain touches this module (e.g. AudioX via
+# ``transformers_utils/processors/__init__``). Match the gr00t fix
+# (``AutoProcessor.register(Gr00tN1d7Config, ...)``). Wrapped defensively so a future
+# transformers API change can't crash unrelated model imports again.
+try:
+    from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniConfig
+
+    AutoFeatureExtractor.register(MingFlashOmniConfig, MingWhisperFeatureExtractor)
+    AutoProcessor.register(MingFlashOmniConfig, MingFlashOmniProcessor)
+except Exception as _ming_reg_err:  # pragma: no cover - defensive
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "Ming processor auto-registration skipped (%s); Ming models may not auto-resolve "
+        "their processor, but unrelated model imports are unaffected.",
+        _ming_reg_err,
+    )
