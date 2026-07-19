@@ -17,14 +17,32 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
 
-# Step 2b: Third-party runtime deps for community speech models (VoxCPM2 needs
-# `voxcpm`, CosyVoice3 needs `s3tokenizer`, etc.). Best-effort per-package so a
-# missing arm64 wheel can't fail the whole image build — the model that needs a
-# skipped dep will surface a clear ImportError at serve time.
+# Step 2b: Third-party runtime deps for community speech/singing models.
+#   voxcpm (VoxCPM2), s3tokenizer (CosyVoice3), funasr (SoulX ASR / MOSS),
+#   BS-RoFormer (SoulX vocal-sep + F0 — SVC & 集成 preprocess 都要),
+#   g2pM/g2p-en/ToJyutping (SoulX 集成 preprocess 的中/英/粤 G2P).
+# Best-effort per-package so a missing arm64 wheel can't fail the whole build —
+# the model needing a skipped dep surfaces a clear ImportError at serve time.
+# NOTE: install the individual g2p packages, NOT `pip install -e ".[soulx-svs]"`
+# (that reinstalls vllm-omni editable in-place — a footgun; Phase 2 POC 踩过).
 RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
-    for pkg in "voxcpm>=2.0.2" "s3tokenizer>=0.3.0" "torchdiffeq>=0.2.5" "cn2an>=0.5.22" "funasr>=1.0.0"; do \
+    for pkg in "voxcpm>=2.0.2" "s3tokenizer>=0.3.0" "torchdiffeq>=0.2.5" "cn2an>=0.5.22" "funasr>=1.0.0" \
+               "BS-RoFormer" "g2pM>=0.1.2.5" "g2p-en>=2.1.0" "ToJyutping>=3.2.0"; do \
       uv pip install --python "$PY" --no-cache-dir "$pkg" || echo "WARN: failed to install $pkg (model needing it won't serve)"; \
     done
+
+# Step 2b-2: NLTK data for g2p-en (SoulX 集成 preprocess 的英文 G2P 初始化会在运行时
+# 下这些;离线节点下不了 → 构建时预置)。新旧 NLTK 的 tagger 名不同,两个都装。
+ENV NLTK_DATA=/usr/local/share/nltk_data
+RUN python3 -m nltk.downloader -d /usr/local/share/nltk_data \
+      averaged_perceptron_tagger averaged_perceptron_tagger_eng cmudict \
+      || echo "WARN: nltk data download failed (English SVS 集成 preprocess may need it)"
+
+# NOTE(离线 HF cache,不烤进镜像):SoulX SVC 的 WhisperEncoder 加载
+# `openai/whisper-base`(~1.1G);AudioX 需 `t5-base` + `openai/clip-vit-base-patch32`;
+# MOSS 家族需 `OpenMOSS-Team/MOSS-Audio-Tokenizer[-Nano]`。这些与模型权重一样走
+# NFS 的 HF cache(HF_HOME),由部署侧预填(见 memory: vllm-omni-phase2-image-deps /
+# vllm-omni-gpustack-deploy-prereqs),镜像只带 pip 依赖,保持精简。
 
 # Step 2c: Bake the A100 40G x2 deploy-configs for the 8B MOSS models (TTSD /
 # SoundEffect / VoiceGenerator) to a stable in-image path so GPUStack (and any
@@ -33,6 +51,12 @@ RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
 # codec across 2 GPUs. These are the validated 2-card configs; single-card TTS
 # models need no deploy-config. Calibrate a config = rebuild this image.
 COPY deploy-configs/ /deploy-configs/
+
+# SoulX-Singer SVS/SVC single-stage diffusion deploy-configs (Phase 2). They live
+# under the package at vllm_omni/deploy/; copy them to the same /deploy-configs/
+# path convention so the GPUStack catalog can reference
+# /deploy-configs/soulxsinger_{svs,svc}.yaml uniformly with the MOSS configs.
+COPY vllm_omni/deploy/soulxsinger_svs.yaml vllm_omni/deploy/soulxsinger_svc.yaml /deploy-configs/
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

@@ -87,12 +87,30 @@ curl -sS -X POST localhost:8093/v1/chat/completions -H 'Content-Type: applicatio
 
 ---
 
+## 3.1 SVC + 集成 preprocess(POC 第二轮,2026-07-19)
+
+镜像 61bcf3d6,单卡 A100 40G。两条未验证链路真机跑通:
+
+| 用例 | 模式 | http | 声道/采样率 | 时长 | 判读 |
+|---|---|---|---|---|---|
+| zh_prompt 音色唱 music(**喂原始音频**) | SVS 集成 preprocess | 200 | mono/24000 | 51.40s | ✅ 服务器内联 ASR+音符+音高+人声分离,免预计算 JSON;偶发个别字不清(ASR 识错) |
+| zh_prompt 音色转 music 歌声 | SVC 歌声转换 | 200 | mono/24000 | 51.48s | ✅ 换音色,无大问题 |
+
+**离线依赖/前置(内嵌固化清单 —— 均为镜像/cache 缺项,POC 逐一补齐验通)**:
+- **pip**:`BS-RoFormer`(人声分离+F0,SVC/集成 preprocess 都要)+ `g2pM`/`g2p-en`/`ToJyutping`(中/英/粤 G2P,集成 preprocess 识歌词后转音素要)
+- **NLTK 数据**:`averaged_perceptron_tagger` + `cmudict`(g2p-en 初始化时下,离线需预置)
+- **HF cache**:`openai/whisper-base`(SVC 的 WhisperEncoder 加载;`HF_HUB_OFFLINE=1` 下会崩 → 必须预填进 HF cache。HF 直连不通,用 `HF_ENDPOINT=https://hf-mirror.com` + `HF_HUB_DISABLE_XET=1` 下,~1.1G)
+- **模型视图**:SVC 用**独立视图目录** `SoulX-Singer-svc`(`config.json` 声明 `architectures:[SoulXSingerSVCPipeline]` + `mv model-svc.pt` 进来),与 SVS 的 `SoulX-Singer` 分开;`--model` 各指各的
+- **已有**:`SoulX-Singer-Preprocess`(rmvpe/paraformer/rosvot)+ ffmpeg(镜像已带)
+
+**质量注记**:集成 preprocess 靠 ASR 自动识歌词,偶发个别字不清(识错传导 + 唱歌拉长字音);要字正腔圆用 precomputed(手工校对元数据)。SVS/SVC 两条 deploy 各用 `soulxsinger_{svs,svc}.yaml`。
+
+---
+
 ## 4. 待补
 
 | 维度 | 待测 |
 |---|---|
-| SVC 模式 | 歌声转换;需 `model-svc.pt`(HF 目录里,SVC deploy) |
-| 在线 preprocess | prompt_audio+target_audio 直接跑(需下 FunASR/ROSVOT),验端到端 |
 | 控制 | melody vs score、pitch_shift、多语言(粤语/英文) |
 | 显存/时长 | 峰值显存、更长曲目、并发 |
 | 人声分离 | `vocal_sep=true`(带伴奏输入) |
@@ -107,7 +125,7 @@ curl -sS -X POST localhost:8093/v1/chat/completions -H 'Content-Type: applicatio
 | 端点 | `POST /v1/chat/completions`(多模态)+ `--deploy-config soulxsinger_svs.yaml` |
 | 启动 | 单卡 gpu_mem 0.5;`--trust-remote-code`;`DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN`;就绪判 `/health` |
 | 采样率 | 24kHz mono |
-| 前置坑 | ①写最小 config.json(model_type)②phone_set.json(GitHub 拉)③precomputed 跳过 FunASR/ROSVOT |
-| 实测 | precomputed SVS:32步9.7s → 50.96s 歌声,http 200 |
-| 用途 | 歌声合成/翻唱(给参考音色 + 曲谱/旋律) |
-| 待补 | SVC、在线preprocess、控制模式、多语言、显存并发 |
+| 前置坑 | ①最小 config.json(SVS/SVC 各一份,architectures 区分)②phone_set.json(GitHub 拉)③集成 preprocess 缺 BS-RoFormer/g2pM/g2p-en/ToJyutping/NLTK 数据④SVC 缺 HF cache 的 openai/whisper-base |
+| 实测 | precomputed SVS 9.7s→50.96s;集成 preprocess SVS 51.40s;SVC 51.48s;均 http 200,24k mono |
+| 用途 | 歌声合成(给音色+曲谱/旋律)/ 歌声转换(换音色翻唱);集成 preprocess 免手写元数据,precomputed 更字正腔圆 |
+| 待补 | 控制模式(score/pitch_shift)、多语言(粤/英)、显存并发、人声分离(vocal_sep) |

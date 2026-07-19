@@ -113,6 +113,7 @@ from vllm_omni.entrypoints.openai.protocol.audio_tasks import (
     AudioTaskResponse,
     AudioTaskStatus,
 )
+from vllm_omni.entrypoints.openai.protocol.audiogen_tasks import AudioGenTaskRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -813,6 +814,13 @@ async def omni_init_app_state(
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
+        # Flip the readiness gate consumed by GPUStack's /ready probe. The speech/LLM
+        # path sets state.server_ready after warmup (~L1114); this pure-diffusion
+        # branch returns early and never reached it, so /ready stayed 503 forever and
+        # GPUStack never marked diffusion instances (AudioX / SoulX-Singer /
+        # Stable-Audio) Ready. The model is loaded + warmed by this point, so it is
+        # safe to advertise readiness here.
+        state.server_ready = True
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
 
@@ -3475,6 +3483,125 @@ async def create_audio_task(request: AudioTaskRequest, raw_request: Request) -> 
 
     task = asyncio.create_task(
         _run_audio_generation_job(handler, request, task_id, save_result_path, app_state=raw_request.app.state)
+    )
+    await AUDIO_TASKS.upsert(task_id, task)
+    return ref
+
+
+# ---------------------------------------------------------------------------
+# Async diffusion-audio task API (AudioX / SoulX-Singer).
+#
+# Sibling of the TTS async API above: same submit+poll contract and the SAME
+# task store / manager / registry (so the global status/result/cancel endpoints
+# below serve both). The only difference is the byte source — these models are
+# diffusion models served through the CHAT handler in diffusion mode
+# (modalities=["audio"]), which returns a base64 WAV in
+# choices[0].message.audio.data. A new submit endpoint (/v1/tasks/audiogen/)
+# runs that path and writes the decoded bytes to save_result_path.
+# ---------------------------------------------------------------------------
+
+
+async def _run_audio_gen_job(
+    handler: OmniOpenAIServingChat,
+    request: AudioGenTaskRequest,
+    task_id: str,
+    save_result_path: str,
+    app_state: Any | None = None,
+) -> None:
+    job = await AUDIO_TASK_STORE.get(task_id)
+    if job is None:
+        logger.warning("Audiogen task %s missing before generation started; skipping", task_id)
+        return
+
+    await AUDIO_TASK_STORE.update_fields(
+        task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()}
+    )
+    try:
+        # raw_request is unused in the diffusion branch of create_chat_completion,
+        # so calling with raw_request=None is safe (the None-guard is only on the
+        # non-diffusion branch).
+        chat_req = request.to_chat_request()
+        resp = await handler.create_chat_completion(chat_req, raw_request=None)
+        if isinstance(resp, ErrorResponse):
+            # Surface the handler's error message; the except block below records
+            # it as FAILED with the error text.
+            raise RuntimeError(getattr(getattr(resp, "error", None), "message", None) or str(resp))
+        # Diffusion audio returns a base64 WAV in choices[0].message.audio.data
+        # (an OpenAIChatCompletionAudio). Decode it to raw bytes for the NFS write.
+        audio_b64 = resp.choices[0].message.audio.data
+        if not audio_b64:
+            raise RuntimeError("Diffusion chat completion returned no audio data")
+        audio_bytes = base64.b64decode(audio_b64)
+        await atomic_write_bytes(audio_bytes, save_result_path)
+        logger.info("Audiogen task %s wrote %d bytes to %s", task_id, len(audio_bytes), save_result_path)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()}
+        )
+    except asyncio.CancelledError:
+        await AUDIO_TASK_STORE.update_fields(
+            task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()}
+        )
+        raise
+    except (EngineGenerateError, EngineDeadError) as exc:
+        logger.exception("Audiogen task %s failed (engine error)", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        if app_state is not None and isinstance(exc, EngineDeadError):
+            terminate_if_errored(server=app_state.server, engine=app_state.engine_client)
+    except Exception as exc:
+        logger.exception("Audiogen task %s failed", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+@router.post(
+    "/v1/tasks/audiogen/",
+    responses={
+        HTTPStatus.OK.value: {"model": AudioTaskResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def create_audio_gen_task(request: AudioGenTaskRequest, raw_request: Request) -> AudioTaskResponse:
+    """Submit an asynchronous diffusion-audio task (AudioX / SoulX-Singer).
+
+    Returns immediately with a PENDING record; poll the shared global status /
+    result / cancel endpoints (keyed by task_id) exactly like the TTS async API.
+    """
+    handler = Omnichat(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Chat Completion API"
+        )
+
+    if not (request.input or "").strip():
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Empty generation text")
+
+    task_id = request.task_id or f"audiogen_task_{random_uuid()}"
+    save_result_path = resolve_save_path(request.save_result_path, task_id, STORAGE_MANAGER.storage_path)
+
+    try:
+        ref = await AUDIO_TASK_MANAGER.reserve(task_id, save_result_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail=str(exc)) from exc
+
+    task = asyncio.create_task(
+        _run_audio_gen_job(handler, request, task_id, save_result_path, app_state=raw_request.app.state)
     )
     await AUDIO_TASKS.upsert(task_id, task)
     return ref

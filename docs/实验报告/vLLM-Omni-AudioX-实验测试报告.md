@@ -79,11 +79,30 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 
 ---
 
+## 3.1 视频任务 + 文本语义边界(POC 第二轮,2026-07-19)
+
+镜像 61bcf3d6(+ ming 热 patch),单卡 A100 40G,官方 V2M 样例 mp4(≤10s),默认 250 步。**六玩法全部真机跑通**,格式统一 44.1k stereo、时长 = `seconds_total`。
+
+| 任务 | 提示 | http | 声道/采样率 | 时长 | 听感 |
+|---|---|---|---|---|---|
+| v2a | (纯视频) | 200 | 2 / 44100 | 10.00s | ✅ 视频→音效 |
+| v2m | (纯视频) | 200 | 2 / 44100 | 10.00s | ✅ 视频→音乐 |
+| tv2a | "drum beating sound and human talking" + 视频 | 200 | 2 / 44100 | 10.00s | 鼓点清晰;**人声几乎听不到**(见下) |
+| tv2m | "uplifting cinematic score" + 视频 | 200 | 2 / 44100 | 10.00s | ✅ 文本+视频→配乐 |
+| t2a(对照) | "two people chatting in a cafe, human voices murmuring" | 200 | 2 / 44100 | 10.00s | ✅ 出"有人说话的嘟囔纹理" |
+
+**关键边界(内嵌后须提示业务)**:
+- **AudioX 不产清晰语音**:"human talking" 只出**人声纹理/嘟囔**,永远没词句 → 要真人对白走 TTS(Qwen3-TTS/CosyVoice),不是 AudioX。
+- **文本与视频语义须一致**:tv2a 里"talking"几乎听不到,因素材是 V2M(音乐)样例、画面无人说话 → 视频条件与文本冲突,弱线索(人声)被强线索(鼓点 + 无人声画面)掩蔽。**对照纯 t2a(无视频冲突)能出人声纹理** → 证明是冲突/掩蔽所致,非模型无能力。换一段"有人说话画面"的视频、text↔video 一致即可改善。
+- **多事件提示**:显著声(打击乐)盖过细弱声(人声);要突出某类声,别和更强的声混一条提示。
+- **适用**:拟音 / 环境音 / BGM / 视频自动配音效·配乐;**不适合**要清晰人声·对白的场景。
+
+---
+
 ## 4. 待补
 
 | 维度 | 待测 |
 |---|---|
-| 视频任务 v2a/v2m/tv2a/tv2m | 需 mp4 输入,验视频→音频/音乐同步 |
 | 显存/并发 | 峰值显存、单卡吞吐、多副本密度 |
 | 步数/采样扫 | 步数 vs 音质拐点、sigma/cfg_rescale 对伪影影响 |
 | 时长上限 | `seconds_total` 上限(>10s?)与显存关系 |
@@ -103,5 +122,6 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 | 时长 | = `seconds_total`(与步数/内容无关) |
 | 质量 | 生产 ≥250 步;密集声干净;稀疏/静音有 VAE 气泡伪影;音量低靠 facade 归一 |
 | 前置坑 | ①ming.py register bug(需修+固化)②离线需 t5-base+clip 进 hf_cache |
-| 用途 | 短剧音效/BGM、环境音、拟音;视频配音(v2*,待测) |
-| 待补 | 视频任务、显存并发、步数扫、时长上限、去咔哒 |
+| 用途 | 短剧音效/BGM、环境音、拟音;视频自动配音效·配乐(v2*/tv2* 已验) |
+| 边界 | **不产清晰语音**(human talking 只出人声纹理,无词句→要对白走 TTS);text↔video 语义冲突会互相掩蔽 |
+| 待补 | 显存并发、步数扫、时长上限、去咔哒 |

@@ -89,6 +89,66 @@ def test_to_speech_request_strips_async_fields_and_disables_stream():
 
 
 # --------------------------------------------------------------------------- #
+# 2b. Facade ref-audio bridge: ref_audio_path / ref_audio_2_path -> file:// URI.
+#     The GPUStack facade materializes voice-clone / second-speaker reference
+#     audio onto shared NFS and injects the ABSOLUTE path under these fields
+#     (its _INPUT_FIELDS: ref_audio -> ref_audio_path). The speech handler only
+#     accepts http(s)/data/file URIs, so to_speech_request folds them in.
+# --------------------------------------------------------------------------- #
+def test_ref_audio_path_folded_into_ref_audio_as_file_uri():
+    req = AudioTaskRequest.model_validate(
+        {"input": "hi", "ref_audio_path": "/nfs-rw/inputs/tts-x/g-ref_audio.wav"}
+    )
+    speech = req.to_speech_request()
+    assert speech.ref_audio == "file:///nfs-rw/inputs/tts-x/g-ref_audio.wav"
+    # async-only path field must not leak onto the speech request
+    assert not hasattr(speech, "ref_audio_path")
+
+
+def test_ref_audio_2_path_folded_into_ref_audio_2_as_file_uri():
+    req = AudioTaskRequest.model_validate(
+        {
+            "input": "对话",
+            "ref_audio_path": "/nfs-rw/a.wav",
+            "ref_audio_2_path": "/nfs-rw/b.wav",
+        }
+    )
+    speech = req.to_speech_request()
+    assert speech.ref_audio == "file:///nfs-rw/a.wav"
+    assert speech.ref_audio_2 == "file:///nfs-rw/b.wav"
+    assert not hasattr(speech, "ref_audio_2_path")
+
+
+def test_explicit_ref_audio_wins_over_facade_path():
+    # A caller that already sent a URL/data/file URI must not be overridden by
+    # the facade-injected path (explicit ref_audio takes precedence).
+    req = AudioTaskRequest.model_validate(
+        {
+            "input": "hi",
+            "ref_audio": "https://example.com/voice.wav",
+            "ref_audio_path": "/nfs-rw/should-be-ignored.wav",
+        }
+    )
+    speech = req.to_speech_request()
+    assert speech.ref_audio == "https://example.com/voice.wav"
+
+
+def test_ref_audio_path_already_uri_passes_through():
+    req = AudioTaskRequest.model_validate(
+        {"input": "hi", "ref_audio_path": "file:///nfs-rw/already.wav"}
+    )
+    speech = req.to_speech_request()
+    assert speech.ref_audio == "file:///nfs-rw/already.wav"
+
+
+def test_no_ref_audio_path_leaves_ref_audio_unset():
+    req = AudioTaskRequest.model_validate({"input": "hi", "voice": "vivian"})
+    speech = req.to_speech_request()
+    assert speech.ref_audio is None
+    assert speech.ref_audio_2 is None
+
+
+# --------------------------------------------------------------------------- #
 # 3. resolve_save_path — four branches.
 # --------------------------------------------------------------------------- #
 def test_resolve_save_path_absolute_verbatim():
