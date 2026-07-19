@@ -1,4 +1,6 @@
-# vLLM-Omni · MOSS-TTSD / MOSS-VoiceGenerator 实验测试报告(对话合成 / 音色设计)
+# vLLM-Omni · MOSS full-家族实验测试报告(对话 / 音色设计 / 音效)
+
+> 覆盖 MOSS-TTSD(对话)、MOSS-VoiceGenerator(音色设计)、MOSS-SoundEffect(音效)—— 三者均靠同一 codec 修复解锁。
 
 > 平台:鲲鹏920 ARM aarch64 + A100 PCIE 40G(sm_80,无 NVLink)· 测试机 0017
 > 镜像:`reputationly/vllm-omni:arm64-a100-latest`(digest 59add8a0 + **codec 修复**,见 [MOSS 家族 codec 修复报告](vLLM-Omni-MOSS-full家族-codec-blocker.md))
@@ -87,6 +89,43 @@ curl -s -X POST localhost:8092/v1/audio/speech -H 'Content-Type: application/jso
 | 用例 | http | 生成 | 声道 | 采样率 | 时长 | 判读 |
 |---|---|---|---|---|---|---|
 | "低沉磁性中年男声"(~24字) | 200 | 6.2s | **mono** | 24000 | 7.60s | ✅ 音色符合描述(人耳确认) |
+
+---
+
+## 3.5 MOSS-SoundEffect —— 文生音效
+
+### 请求格式(0017 card0,1;8B,双卡 `moss_sfx_a100_40g.yaml`)
+
+```bash
+curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input":"",
+  "ambient_sound":"Thunder rumbling and heavy rain pattering on a tin roof.",
+  "response_format":"wav"}' --output out.wav
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `input` | ✅ | **schema 必填占位**(SoundEffect 内容不看它,传 `""` 即可) |
+| `ambient_sound` | ✅ | 声音描述(自然语言);**无 ref_audio** |
+
+### 实测
+
+| 用例 | http | 生成 | 声道 | 采样率 | 时长 | 判读 |
+|---|---|---|---|---|---|---|
+| 英文 "thunder + rain"(temp 1.0) | 200 | 4.73s | mono | 24000 | 10.16s | ⚠️ 噪声多,不像 |
+| 英文(temp 0.6) | 200 | — | mono | 24000 | 10.16s | 好一点,雨雷微弱 |
+| 中文 "雷声隆隆,雨声淅沥"(temp 0.7) | 200 | — | mono | 24000 | 10.16s | 略好,仍不如 AudioX |
+
+- 变体自动识别为 `sound_effect`(路径含 `SoundEffect`);~12.5 tokens/s,`duration_seconds`/`max_new_tokens` 控时长。
+- ⚠️ **坑1(字段)**:内容放 `ambient_sound`,但 `input` 是 OpenAI speech schema 必填,**必须同时带**(可空),否则 400 `body.input Field required`。
+- ⚠️ **坑2(语言/风格)**:官方 README 示例是**中文描述性风格**(`text_1="雷声隆隆,雨声淅沥。"` / `text_2="清晰脚步声在水泥地面回响,节奏稳定。"`)。英文简单词效果差,中文描述性更好。
+- **音质结论**:MOSS-SoundEffect v1(8B **AR/MossTTSDelay**)音效泛化一般、噪声偏多,**明显不如 AudioX**(扩散,44.1k,同一 "heavy rain + thunder" 真实无噪)。
+
+### ⚠️ 选型结论 & 未来 POC
+
+- **文生音效/音乐生产:首选 [AudioX](vLLM-Omni-AudioX-实验测试报告.md)**(已在 vllm-omni 栈跑通、扩散架构、音质好)。MOSS-SoundEffect v1 仅作 MOSS 家族完整性验证记录(能起、codec 修复覆盖、格式对)。
+- **未来选项 —— MOSS-SoundEffect-v2.0**(1.3B **DiT + Flow Matching**,48kHz,最长 30s,Apache 2.0):官方新版,扩散架构,音质预期远超 v1。**但当前 vllm-omni 不支持**(无模型类/deploy;是独立包 `moss_soundeffect_v2`,需隔离环境 Python3.12/torch2.9/transformers4.57,与本镜像不兼容)。
+  → **若日后 AudioX 满足不了音效需求,可对 MOSS-SoundEffect-v2.0 单独做 POC**(独立容器 + 它自己的 env,`MossSoundEffectPipeline.from_pretrained`),不走 vllm-omni 这套。
 
 ---
 
