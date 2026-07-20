@@ -39,7 +39,6 @@ SoulX-Singer SVS (extra_body["extra_args"] dict):
 from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
-
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 
 # Re-export the shared status/response contract so the status/result/cancel

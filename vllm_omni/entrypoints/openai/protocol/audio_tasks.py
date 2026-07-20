@@ -33,7 +33,7 @@ def _local_path_to_file_uri(path: str) -> str:
     ``OmniOpenAIServingSpeech._validate_ref_audio_format``), so convert here.
     Values already carrying a scheme pass through untouched; a non-absolute value
     is returned as-is so the handler surfaces a clear validation error rather than
-    silently mis-resolving it.
+    silently resolving it wrong.
     """
     p = (path or "").strip()
     if not p:

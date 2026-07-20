@@ -3395,9 +3395,7 @@ async def _run_audio_generation_job(
         logger.warning("Audio task %s missing before generation started; skipping", task_id)
         return
 
-    await AUDIO_TASK_STORE.update_fields(
-        task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()}
-    )
+    await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()})
     try:
         speech_request = request.to_speech_request()
         # _generate_audio_bytes is the non-streaming byte path: it returns
@@ -3409,13 +3407,9 @@ async def _run_audio_generation_job(
             raise RuntimeError("Speech handler did not return raw audio bytes")
         await atomic_write_bytes(bytes(audio_bytes), save_result_path)
         logger.info("Audio task %s wrote %d bytes to %s", task_id, len(audio_bytes), save_result_path)
-        await AUDIO_TASK_STORE.update_fields(
-            task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()}
-        )
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()})
     except asyncio.CancelledError:
-        await AUDIO_TASK_STORE.update_fields(
-            task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()}
-        )
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
         raise
     except (EngineGenerateError, EngineDeadError) as exc:
         logger.exception("Audio task %s failed (engine error)", task_id)
@@ -3458,9 +3452,7 @@ async def create_audio_task(request: AudioTaskRequest, raw_request: Request) -> 
     """Submit an asynchronous TTS task (returns immediately; poll for status)."""
     handler = Omnispeech(raw_request)
     if handler is None:
-        raise HTTPException(
-            status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API"
-        )
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API")
 
     if not (request.input or "").strip():
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Empty synthesis text")
@@ -3513,9 +3505,7 @@ async def _run_audio_gen_job(
         logger.warning("Audiogen task %s missing before generation started; skipping", task_id)
         return
 
-    await AUDIO_TASK_STORE.update_fields(
-        task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()}
-    )
+    await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()})
     try:
         # raw_request is unused in the diffusion branch of create_chat_completion,
         # so calling with raw_request=None is safe (the None-guard is only on the
@@ -3534,13 +3524,9 @@ async def _run_audio_gen_job(
         audio_bytes = base64.b64decode(audio_b64)
         await atomic_write_bytes(audio_bytes, save_result_path)
         logger.info("Audiogen task %s wrote %d bytes to %s", task_id, len(audio_bytes), save_result_path)
-        await AUDIO_TASK_STORE.update_fields(
-            task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()}
-        )
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()})
     except asyncio.CancelledError:
-        await AUDIO_TASK_STORE.update_fields(
-            task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()}
-        )
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
         raise
     except (EngineGenerateError, EngineDeadError) as exc:
         logger.exception("Audiogen task %s failed (engine error)", task_id)

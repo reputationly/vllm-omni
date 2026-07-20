@@ -96,9 +96,7 @@ def test_to_speech_request_strips_async_fields_and_disables_stream():
 #     accepts http(s)/data/file URIs, so to_speech_request folds them in.
 # --------------------------------------------------------------------------- #
 def test_ref_audio_path_folded_into_ref_audio_as_file_uri():
-    req = AudioTaskRequest.model_validate(
-        {"input": "hi", "ref_audio_path": "/nfs-rw/inputs/tts-x/g-ref_audio.wav"}
-    )
+    req = AudioTaskRequest.model_validate({"input": "hi", "ref_audio_path": "/nfs-rw/inputs/tts-x/g-ref_audio.wav"})
     speech = req.to_speech_request()
     assert speech.ref_audio == "file:///nfs-rw/inputs/tts-x/g-ref_audio.wav"
     # async-only path field must not leak onto the speech request
@@ -134,9 +132,7 @@ def test_explicit_ref_audio_wins_over_facade_path():
 
 
 def test_ref_audio_path_already_uri_passes_through():
-    req = AudioTaskRequest.model_validate(
-        {"input": "hi", "ref_audio_path": "file:///nfs-rw/already.wav"}
-    )
+    req = AudioTaskRequest.model_validate({"input": "hi", "ref_audio_path": "file:///nfs-rw/already.wav"})
     speech = req.to_speech_request()
     assert speech.ref_audio == "file:///nfs-rw/already.wav"
 

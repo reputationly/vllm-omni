@@ -36,9 +36,7 @@ _TERMINAL = (
 _ACTIVE = (AudioTaskStatus.PENDING, AudioTaskStatus.PROCESSING)
 
 
-def resolve_save_path(
-    save_result_path: str, task_id: str, output_root: str, default_ext: str = ".wav"
-) -> str:
+def resolve_save_path(save_result_path: str, task_id: str, output_root: str, default_ext: str = ".wav") -> str:
     """Resolve the output path (semantics per LightX2V ``file_service``).
 
     Absolute -> used verbatim; relative -> under ``output_root``; empty ->
@@ -109,12 +107,8 @@ class AudioTaskManager:
         task = await self._tasks.get(task_id)
         if task is not None:
             task.cancel()
-        await self._store.update_fields(
-            task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()}
-        )
+        await self._store.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
         return True
 
 
-AUDIO_TASK_MANAGER = AudioTaskManager(
-    max_queue_size=int(os.environ.get("VLLM_OMNI_AUDIO_MAX_QUEUE", "8"))
-)
+AUDIO_TASK_MANAGER = AudioTaskManager(max_queue_size=int(os.environ.get("VLLM_OMNI_AUDIO_MAX_QUEUE", "8")))
