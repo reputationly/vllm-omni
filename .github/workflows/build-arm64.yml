@@ -12,8 +12,13 @@ name: Build vLLM-Omni ARM64 image to ACR
 # 预检结论(IndexTTS-2 实测报告已确认):vllm/vllm-openai:v0.25.0 官方带 arm64,
 #   torch 2.11.0+cu130 与 vllm kernel .so 均含 sm_80(A100 可用)。
 #
-# Secrets(repo Settings -> Secrets,与 gpustack / index-tts fork 同名):
-#   ACR_USERNAME / ACR_PASSWORD
+# Secrets(repo Settings -> Secrets,与 gpustack / index-tts / LightX2V fork 同名):
+#   ACR_USERNAME / ACR_PASSWORD          — 阿里云 ACR(发布 + 双推目标)
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN — Docker Hub(registry build cache + 双推,提速关键)
+#
+# 提速(2026-07-20):① Dockerfile 层序把固化依赖提到 COPY 源码之前 → 改源码只重跑 app 层;
+#   ② build cache 从 GHA(10GB 上限,大镜像放不下→形同冷构建)换成 Docker Hub registry cache
+#   (无上限、跨 run 持久增量)。首次跑仍冷(建 buildcache),之后增量出包应明显变快。
 #
 # Run: GitHub -> Actions -> "Build vLLM-Omni ARM64 image to ACR" -> Run workflow
 #   or: gh workflow run build-arm64.yml --ref main
@@ -33,6 +38,8 @@ on:
 env:
   ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
   ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni
+  # Docker Hub:registry build cache(无 GHA 10GB 上限,跨 run 增量)+ 双推镜像。
+  DOCKERHUB_REPO: arronlee/vllm-omni
 
 jobs:
   build:
@@ -63,6 +70,14 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
+      # base 从 Docker Hub 公开镜像拉不需要登录;这步是为 registry build cache
+      # 的 cache-to 推送 + 镜像双推 Docker Hub。
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push (arm64)
         id: build
         uses: docker/build-push-action@v6
@@ -77,8 +92,11 @@ jobs:
           tags: |
             ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
             ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}
+          # Docker Hub registry cache 替代 GHA(无 10GB 上限,跨 run 持久增量)。
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache,mode=max
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -91,6 +109,7 @@ jobs:
 
             - Floating tag: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}`
             - Immutable tag: `${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}`
+            - Docker Hub: `${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}` / `:${{ steps.tags.outputs.version }}`
             - Digest: `${{ steps.build.outputs.digest }}`
             - Base: `${{ github.event.inputs.base_image }}`
             - Commit: ${{ github.sha }}
