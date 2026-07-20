@@ -36,6 +36,22 @@ def test_audiogen_request_text_alias(key):
     assert req.input == "a dog barking"
 
 
+def test_model_is_optional():
+    """The GPUStack facade strips `model` from the task body (it is a control key —
+    the engine instance serves a single model), mirroring the TTS AudioTaskRequest.
+    AudioGenTaskRequest must validate WITHOUT `model` (create_audio_gen_task
+    backfills it from the served model name before to_chat_request). Regression for
+    the 400 'Field required: model' the facade hit on t2a."""
+    req = AudioGenTaskRequest.model_validate(
+        {"input": "雨点打在窗户上的滴答声", "audiox_task": "t2a", "save_result_path": "/nfs-output/x.wav"}
+    )
+    assert req.model == ""
+    # to_chat_request still maps cleanly; the endpoint fills a real model name.
+    chat = req.to_chat_request()
+    assert chat.messages == [{"role": "user", "content": [{"type": "text", "text": "雨点打在窗户上的滴答声"}]}]
+    assert (chat.model_extra or {})["audiox_task"] == "t2a"
+
+
 # --------------------------------------------------------------------------- #
 # 2. Shared status/response contract is the SAME object as the TTS async API.
 # --------------------------------------------------------------------------- #

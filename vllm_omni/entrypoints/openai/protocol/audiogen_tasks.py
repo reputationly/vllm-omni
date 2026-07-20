@@ -61,7 +61,15 @@ class AudioGenTaskRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    model: str = Field(description="Served model name (AudioX / SoulX-Singer).")
+    # Optional: the GPUStack facade strips `model` from the task body (it is a
+    # control key — the engine instance serves a single model), mirroring the TTS
+    # AudioTaskRequest whose model is likewise not required. create_audio_gen_task
+    # backfills this from the server's served model name before to_chat_request
+    # when absent, so ChatCompletionRequest carries a valid base-model name.
+    model: str = Field(
+        default="",
+        description="Served model name (AudioX / SoulX-Singer); optional, engine backfills when absent.",
+    )
     # Accept input/text/prompt for the generation text (facade / new-api compat).
     input: str = Field(
         validation_alias=AliasChoices("input", "text", "prompt"),

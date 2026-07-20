@@ -3592,6 +3592,17 @@ async def create_audio_gen_task(request: AudioGenTaskRequest, raw_request: Reque
     if not (request.input or "").strip():
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Empty generation text")
 
+    # The GPUStack facade strips `model` from the task body (it is a control key;
+    # the engine instance serves a single model), so `model` may be absent. Fill
+    # it from this server's served model name so to_chat_request builds a
+    # ChatCompletionRequest whose model matches the diffusion server's base model
+    # (mirrors the TTS AudioTaskRequest, whose model is likewise optional).
+    if not (request.model or "").strip():
+        try:
+            request.model = raw_request.app.state.openai_serving_models.base_model_paths[0].name
+        except (AttributeError, IndexError):
+            pass
+
     task_id = request.task_id or f"audiogen_task_{random_uuid()}"
     save_result_path = resolve_save_path(request.save_result_path, task_id, STORAGE_MANAGER.storage_path)
 
