@@ -103,6 +103,20 @@ class AudioTaskRequest(OpenAICreateSpeechRequest):
             "file:// URI when 'ref_audio_2' is not otherwise set."
         ),
     )
+    # IndexTTS-2 emotion reference audio. The facade materializes the caller's
+    # emotion_audio onto shared NFS and injects the absolute path here (its
+    # _INPUT_FIELDS map: emotion_audio -> emo_audio_path). Folded into the
+    # handler's 'emo_audio' field (read by the IndexTTS2 talker as the emotion
+    # conditioning reference, load_reference_audio(..., mode="emotion")) as a
+    # file:// URI — symmetric with ref_audio_path -> ref_audio.
+    emo_audio_path: str | None = Field(
+        default=None,
+        description=(
+            "Absolute filesystem path to the IndexTTS-2 emotion reference audio "
+            "(GPUStack facade materializes emotion_audio onto shared NFS). Folded "
+            "into 'emo_audio' as a file:// URI when 'emo_audio' is not otherwise set."
+        ),
+    )
 
     def to_speech_request(self) -> OpenAICreateSpeechRequest:
         """Build a clean synchronous speech request (async-only fields stripped,
@@ -113,15 +127,29 @@ class AudioTaskRequest(OpenAICreateSpeechRequest):
                 "save_result_path",
                 "ref_audio_path",
                 "ref_audio_2_path",
+                "emo_audio_path",
             }
         )
         # Bridge the facade's materialized NFS paths onto the handler's URI-only
-        # ref_audio / ref_audio_2. An explicit ref_audio in the request wins (a
+        # ref_audio / ref_audio_2. An explicit value in the request wins (a
         # caller that already sent a URL/base64/file URI is never overridden).
         if self.ref_audio_path and not data.get("ref_audio"):
             data["ref_audio"] = _local_path_to_file_uri(self.ref_audio_path)
         if self.ref_audio_2_path and not data.get("ref_audio_2"):
             data["ref_audio_2"] = _local_path_to_file_uri(self.ref_audio_2_path)
+        # IndexTTS-2 emotion reference. Unlike ref_audio, 'emo_audio' is NOT a
+        # field on OpenAICreateSpeechRequest — the IndexTTS2 adapter reads it from
+        # extra_params (see indextts2.py: extras["emo_audio"]). A top-level key
+        # would be dropped by model_validate (extra="ignore"), so fold it into
+        # extra_params. Preserve any existing extra_params; an explicit
+        # extra_params['emo_audio'] from the caller wins.
+        if self.emo_audio_path:
+            extra = data.get("extra_params")
+            if not isinstance(extra, dict):
+                extra = {}
+            if not extra.get("emo_audio"):
+                extra["emo_audio"] = _local_path_to_file_uri(self.emo_audio_path)
+                data["extra_params"] = extra
         data["stream"] = False
         data["stream_format"] = None
         return OpenAICreateSpeechRequest.model_validate(data)
