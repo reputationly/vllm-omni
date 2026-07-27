@@ -54,6 +54,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -100,6 +101,29 @@ def _get_cla_factor(config: PretrainedConfig) -> int:
     if not getattr(config, "use_cla", False):
         return 1
     return getattr(config, "cla_share_factor", 1)
+
+
+_BNB_EXPERT_STATE_RE = re.compile(
+    r"^(?:model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?P<expert>\d+)\.(?P<projection>gate_and_up_proj|down_proj)\."
+    r"weight\.(?P<state>absmax|nested_absmax|nested_quant_map|quant_map|"
+    r"quant_state\.bitsandbytes__(?:nf4|fp4))$"
+)
+
+
+def _reorder_hunyuan_gate_up_absmax(absmax: torch.Tensor) -> torch.Tensor:
+    """Match the checkpoint's fused gate/up scales to vLLM's w13 layout.
+
+    HunyuanImage3 stores ``gate_and_up_proj`` as ``[up, gate]``. The expert
+    weight loader maps the second half to w1 (gate) and the first half to w3
+    (up), so the block scales must undergo the identical half swap.
+    """
+    if absmax.numel() % 2 != 0:
+        raise ValueError(
+            f"HunyuanImage3 gate_and_up_proj NF4 absmax must have an even number of blocks, got {absmax.numel()}"
+        )
+    half = absmax.numel() // 2
+    return torch.cat((absmax[half:], absmax[:half]))
 
 
 def retrieve_timesteps(
@@ -1596,11 +1620,23 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
 
+        gate_quant_config = quant_config
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "bitsandbytes"
+            and any(f"{prefix}.gate".endswith(module_name) for module_name in quant_config.llm_int8_skip_modules)
+        ):
+            # vLLM's BnB skip matcher checks individual path components and
+            # absolute prefixes, so the checkpoint's relative dotted entry
+            # "mlp.gate" does not match "layers.N.mlp.gate". Honor that
+            # checkpoint contract explicitly: the router gate is stored BF16.
+            gate_quant_config = None
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=gate_quant_config,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -2120,6 +2156,132 @@ class HunyuanImage3Model(nn.Module):
             return fused_moe_expert_mapping, expert_weights_remapping
         else:
             return [], {}
+
+    def _collect_local_bnb_expert_state(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        state_tensors: dict[str, dict[str, torch.Tensor]],
+        state_locations: dict[str, tuple[int, int, str]],
+    ) -> bool:
+        """Consume one pre-quantized BnB expert-state tensor.
+
+        The diffusion loader streams raw safetensors directly into this model,
+        unlike vLLM's BitsAndBytesModelLoader. Quantization metadata therefore
+        has to be filtered here; it is not a model parameter. Only the EP-local
+        16/64 experts are retained to keep host/GPU load-time memory bounded.
+        """
+        match = _BNB_EXPERT_STATE_RE.match(name)
+        if match is None:
+            return False
+
+        layer_id = int(match.group("layer"))
+        global_expert_id = int(match.group("expert"))
+        projection = match.group("projection")
+        routed_experts = self.get_submodule(f"layers.{layer_id}.mlp.experts.routed_experts")
+        local_expert_id = routed_experts._map_global_expert_id_to_local_expert_id(global_expert_id)
+        if local_expert_id == -1:
+            return True
+
+        state_suffix = match.group("state")
+        base_name = name[: -len(state_suffix) - 1]
+        if "quant_state.bitsandbytes" in state_suffix:
+            # bitsandbytes requires the serialized QuantState descriptor on CPU.
+            tensor = tensor.cpu().data
+        state_tensors.setdefault(base_name, {})[name] = tensor
+        state_locations[base_name] = (
+            layer_id,
+            local_expert_id,
+            projection,
+        )
+        return True
+
+    def _bind_local_bnb_expert_states(
+        self,
+        state_tensors: dict[str, dict[str, torch.Tensor]],
+        state_locations: dict[str, tuple[int, int, str]],
+        params_dict: dict[str, nn.Parameter],
+    ) -> None:
+        if not state_tensors:
+            return
+
+        from bitsandbytes.functional import (
+            QuantState,
+            dequantize_blockwise,
+        )
+
+        def dequantize_double_quant(state: QuantState) -> QuantState:
+            if not state.nested:
+                return state
+            absmax = dequantize_blockwise(state.absmax, state.state2)
+            state.absmax = (absmax + state.offset).float()
+            state.nested = False
+            state.offset = None
+            state.state2 = None
+            return state
+
+        parsed_states: dict[tuple[int, int, str], QuantState] = {}
+        for base_name, tensors in state_tensors.items():
+            descriptor_names = [
+                name
+                for name in tensors
+                if name.endswith(
+                    (
+                        "bitsandbytes__nf4",
+                        "bitsandbytes__fp4",
+                    )
+                )
+            ]
+            if len(descriptor_names) != 1:
+                raise ValueError(
+                    "Incomplete HunyuanImage3 BitsAndBytes QuantState for "
+                    f"{base_name}: expected one descriptor, found "
+                    f"{descriptor_names}; keys={sorted(tensors)}"
+                )
+            state = QuantState.from_dict(tensors, device=self.device)
+            parsed_states[state_locations[base_name]] = dequantize_double_quant(state)
+
+        layers = sorted({layer_id for layer_id, _, _ in parsed_states})
+        for layer_id in layers:
+            prefix = f"layers.{layer_id}.mlp.experts.routed_experts"
+            w13_param = params_dict[f"{prefix}.w13_weight"]
+            w2_param = params_dict[f"{prefix}.w2_weight"]
+            num_local_experts = w13_param.shape[0]
+
+            gate_up_states = [
+                parsed_states[(layer_id, local_expert_id, "gate_and_up_proj")]
+                for local_expert_id in range(num_local_experts)
+            ]
+            down_states = [
+                parsed_states[(layer_id, local_expert_id, "down_proj")] for local_expert_id in range(num_local_experts)
+            ]
+
+            gate_up_first = gate_up_states[0]
+            down_first = down_states[0]
+            w13_state = QuantState(
+                absmax=torch.cat([_reorder_hunyuan_gate_up_absmax(state.absmax) for state in gate_up_states]),
+                shape=(
+                    num_local_experts * gate_up_first.shape[0],
+                    gate_up_first.shape[1],
+                ),
+                code=gate_up_first.code,
+                blocksize=gate_up_first.blocksize,
+                quant_type=gate_up_first.quant_type,
+                dtype=gate_up_first.dtype,
+            )
+            w2_state = QuantState(
+                absmax=torch.cat([state.absmax for state in down_states]),
+                shape=(
+                    num_local_experts * down_first.shape[0],
+                    down_first.shape[1],
+                ),
+                code=down_first.code,
+                blocksize=down_first.blocksize,
+                quant_type=down_first.quant_type,
+                dtype=down_first.dtype,
+            )
+            set_weight_attrs(w13_param, {"bnb_quant_state": w13_state})
+            set_weight_attrs(w2_param, {"bnb_quant_state": w2_state})
 
     # rename for delay load
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

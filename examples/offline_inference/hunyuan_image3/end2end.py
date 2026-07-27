@@ -156,6 +156,10 @@ def main():
 
     omni_kwargs = {
         "model": args.model,
+        # HunyuanImage-3.0 is a remote-code model. Pass this explicitly rather
+        # than relying only on the deploy YAML: the registry lookup needs to
+        # load the HF config before deploy-level settings are merged.
+        "trust_remote_code": True,
         "vae_use_tiling": args.vae_use_tiling,
         "log_stats": args.log_stats,
         "init_timeout": args.init_timeout,

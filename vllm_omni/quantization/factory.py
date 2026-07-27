@@ -290,6 +290,7 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
     config_cls = get_quantization_config(method)
+    kwargs = _drop_unsupported_kwargs(config_cls, kwargs)
 
     try:
         return config_cls(**kwargs)
@@ -298,6 +299,57 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
         raise TypeError(
             f"Cannot instantiate {config_cls.__name__} with kwargs {kwargs}. Expected signature: {sig}"
         ) from None
+
+
+def _drop_unsupported_kwargs(config_cls: type, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the kwargs ``config_cls.__init__`` actually accepts.
+
+    A checkpoint's ``quantization_config`` is whatever the producing library
+    serialized, not a vLLM constructor signature. Transformers, for example,
+    writes BOTH the public ``load_in_4bit`` and its private backing field
+    ``_load_in_4bit``; passing the dict through verbatim then dies with
+    "Cannot instantiate BitsAndBytesConfig with kwargs {'_load_in_4bit': ...}"
+    even though every meaningful value was present under its public name.
+    (Seen on HunyuanImage-3.0-Instruct-Distil-NF4; see §4.4 of
+    docs/实验报告/vLLM-Omni-HunyuanImage3-A100-NF4-实验与优化复盘.md, whose
+    conclusion was exactly "don't hand checkpoint JSON to a runtime quant config
+    verbatim — parse only the public fields".)
+
+    Classes taking ``**kwargs`` are left alone: they opted into accepting extras.
+
+    Underscore-prefixed keys are dropped quietly as serialization artifacts.
+    Anything else that is dropped is logged at WARNING, because that is a value
+    the checkpoint meant to express and this runtime does not honor.
+    """
+    try:
+        signature = inspect.signature(config_cls.__init__)
+    except (TypeError, ValueError):  # builtins / C-implemented __init__
+        return kwargs
+
+    params = signature.parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+
+    accepted = {name for name in params if name != "self"}
+    kept = {key: value for key, value in kwargs.items() if key in accepted}
+    dropped = sorted(set(kwargs) - set(kept))
+    if dropped:
+        private = [key for key in dropped if key.startswith("_")]
+        unknown = [key for key in dropped if not key.startswith("_")]
+        if private:
+            logger.debug(
+                "%s: ignoring serialization-private checkpoint quant fields %s",
+                config_cls.__name__,
+                private,
+            )
+        if unknown:
+            logger.warning(
+                "%s: ignoring unsupported checkpoint quantization fields %s; this runtime does not "
+                "honor them, so verify the resulting numerics if any of these were load-bearing.",
+                config_cls.__name__,
+                unknown,
+            )
+    return kept
 
 
 def _is_per_component_dict(spec: dict[str, Any]) -> bool:

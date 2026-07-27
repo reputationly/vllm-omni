@@ -2715,8 +2715,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         reference_images: list[Image.Image],
         gen_params: OmniDiffusionSamplingParams,
         tokenizer: Any = None,
+        mask_image: Image.Image | None = None,
     ) -> tuple[OmniTextPrompt, list[Any]]:
-        """Build the shared multistage generation prompt and stage params."""
+        """Build the shared multistage generation prompt and stage params.
+
+        ``mask_image`` must be threaded through explicitly: this rebuilds the
+        engine prompt from scratch, so the mask that
+        ``_prepare_diffusion_image_request`` placed on its own ``gen_prompt`` is
+        discarded on the multistage branch. Omitting it silently produces an
+        UNMASKED edit on every AR+diffusion pipeline.
+        """
         stage_configs = getattr(engine, "stage_configs", None) or []
         default_params_list = get_default_sampling_params_list(engine)
 
@@ -2820,6 +2828,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["vae_generator_seed"] = int(seed)
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
+        if mask_image is not None:
+            # Merge into whatever the image branch produced (which may be None for
+            # a text-to-image request that nonetheless carries a mask).
+            engine_prompt_data = dict(engine_prompt_data or {})
+            engine_prompt_data["mask_image"] = mask_image
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
             # Provide multi_modal_uuids so that newer vLLM versions can
@@ -2907,7 +2920,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt: str,
         extra_body: dict[str, Any] | None = None,
         reference_images: list[str] | None = None,
+        mask_image: str | None = None,
     ) -> tuple[Any, OmniTextPrompt, OmniDiffusionSamplingParams, list[Image.Image]] | ErrorResponse:
+        """Build the engine-level prompt/params for a diffusion image request.
+
+        ``mask_image`` is a base64 PNG for inpainting, kept separate from
+        ``reference_images`` because its role differs: the alpha channel marks
+        the edit region, so it must never be folded into the image list or
+        RGB-normalized. Callers that omit it get the previous behavior exactly.
+        """
         if extra_body is None:
             extra_body = {}
         if reference_images is None:
@@ -2983,6 +3004,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         status_code=400,
                     )
 
+        if mask_image:
+            try:
+                # No .convert(): the mask's alpha channel carries the edit region.
+                mask_pil = Image.open(BytesIO(base64.b64decode(mask_image)))
+            except Exception as e:
+                return self._create_error_response(f"Failed to decode mask image: {e}", status_code=400)
+            # Merge into whatever multi_modal_data the image branch produced, so a
+            # mask can accompany either a single reference image or several.
+            multi_modal_data = dict(gen_prompt.get("multi_modal_data") or {})
+            multi_modal_data["mask_image"] = mask_pil
+            gen_prompt["multi_modal_data"] = multi_modal_data
+
         return engine, gen_prompt, gen_params, pil_images
 
     async def generate_diffusion_images(
@@ -2991,6 +3024,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt: str,
         extra_body: dict[str, Any] | None = None,
         reference_images: list[str] | None = None,
+        mask_image: str | None = None,
         request_id: str | None = None,
         arrival_time: float | None = None,
         stream: bool = False,
@@ -3008,6 +3042,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt=prompt,
             extra_body=extra_body,
             reference_images=reference_images,
+            mask_image=mask_image,
         )
         if isinstance(prepared, ErrorResponse):
             return prepared
@@ -3043,6 +3078,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     reference_images=pil_images,
                     gen_params=gen_params,
                     tokenizer=tokenizer,
+                    # Re-read the decoded mask off gen_prompt: this branch REBUILDS
+                    # the engine prompt, so anything only present there is lost.
+                    mask_image=(gen_prompt.get("multi_modal_data") or {}).get("mask_image"),
                 )
             else:
                 engine_prompt = gen_prompt

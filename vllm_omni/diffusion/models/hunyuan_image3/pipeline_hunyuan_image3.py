@@ -371,7 +371,10 @@ class HunyuanImage3Pipeline(
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
         super().__init__(self.hf_config)
         # update diffusion config
-        self.generation_config = GenerationConfig.from_pretrained(od_config.model)
+        self.generation_config = GenerationConfig.from_pretrained(
+            od_config.model,
+            trust_remote_code=True,
+        )
         self.od_config = od_config
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -459,7 +462,28 @@ class HunyuanImage3Pipeline(
             self,
             skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(weights)
+
+        bnb_state_tensors: dict[str, dict[str, torch.Tensor]] = {}
+        bnb_state_locations: dict[str, tuple[int, int, str]] = {}
+
+        def filtered_weights():
+            for name, tensor in weights:
+                if self.model._collect_local_bnb_expert_state(
+                    name,
+                    tensor,
+                    bnb_state_tensors,
+                    bnb_state_locations,
+                ):
+                    continue
+                yield name, tensor
+
+        loaded_weights = loader.load_weights(filtered_weights())
+        self.model._bind_local_bnb_expert_states(
+            bnb_state_tensors,
+            bnb_state_locations,
+            dict(self.model.named_parameters()),
+        )
+        return loaded_weights
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed

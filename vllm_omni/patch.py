@@ -484,3 +484,68 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+# Register the HunyuanImage-3.0-specific NF4 TP+EP loader early enough for
+# vLLM's get_model_loader() lookup in worker subprocesses.
+from vllm_omni.model_executor.model_loader import (  # noqa: E402, F401
+    hunyuan_image3_bitsandbytes_loader as _hunyuan_image3_bitsandbytes_loader,
+)
+
+
+def _preserve_hunyuan_image3_bnb_load_format() -> None:
+    """Keep the explicit Hunyuan loader through vLLM's BnB auto-detection.
+
+    vLLM 0.25 unconditionally assigns ``load_format = "bitsandbytes"`` in
+    both create_engine_config() and create_load_config() whenever the model
+    quantization method is BitsAndBytes. That is correct for generic models,
+    but it prevents an explicitly registered model-specific BnB loader from
+    ever being selected.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    custom_format = "hunyuan_image3_bitsandbytes"
+    original_create_engine_config = EngineArgs.create_engine_config
+    original_create_load_config = EngineArgs.create_load_config
+
+    if getattr(
+        original_create_engine_config,
+        "_omni_preserves_hy3_bnb_loader",
+        False,
+    ):
+        return
+
+    def create_engine_config_with_hy3_loader(self, *args, **kwargs):
+        requested_format = getattr(self, "load_format", None)
+        if requested_format == custom_format:
+            self._omni_requested_load_format = custom_format
+        try:
+            return original_create_engine_config(self, *args, **kwargs)
+        finally:
+            self.__dict__.pop("_omni_requested_load_format", None)
+
+    def create_load_config_with_hy3_loader(self, *args, **kwargs):
+        requested_format = getattr(
+            self,
+            "_omni_requested_load_format",
+            None,
+        )
+        if requested_format != custom_format:
+            return original_create_load_config(self, *args, **kwargs)
+
+        quantization = self.quantization
+        self.load_format = custom_format
+        # Avoid the generic method's unconditional BnB overwrite. The model
+        # quantization remains BitsAndBytes everywhere else.
+        self.quantization = None
+        try:
+            return original_create_load_config(self, *args, **kwargs)
+        finally:
+            self.quantization = quantization
+            self.load_format = custom_format
+
+    create_engine_config_with_hy3_loader._omni_preserves_hy3_bnb_loader = True
+    EngineArgs.create_engine_config = create_engine_config_with_hy3_loader
+    EngineArgs.create_load_config = create_load_config_with_hy3_loader
+
+
+_preserve_hunyuan_image3_bnb_load_format()

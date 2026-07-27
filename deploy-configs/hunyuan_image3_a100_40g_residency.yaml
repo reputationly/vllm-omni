@@ -1,0 +1,72 @@
+# HunyuanImage-3.0-Instruct-Distil (NF4) — dual-engine residency on 4x A100-40G.
+#
+# Serve with:
+#   vllm serve <model> --omni --residency-config /deploy-configs/hunyuan_image3_a100_40g_residency.yaml
+#
+# WHY TWO ENGINES rather than one two-stage pipeline (report §7.2 / §11.1 of
+# docs/实验报告/vLLM-Omni-HunyuanImage3-A100-NF4-实验与优化复盘.md):
+#
+#   * Both awake does not fit. AR weights 14.93 GiB/rank + DiT weights
+#     15.83 GiB/rank = 30.76, and DiT alone peaks at 29.3 GiB/rank (so ~13.5 of
+#     activations on top of its weights). 30.76 + 13.5 = 44.3 > 40.
+#   * A two-stage pipeline runs AR -> DiT inside ONE generate() call, leaving no
+#     point at which an outside caller could sleep the finished stage.
+#   * The upstream two-stage config also hands KV from AR to DiT
+#     (need_send_cache / need_recv_cache), and level-1 sleep offloads the
+#     kv_cache tag together with the weights — sleeping AR would destroy exactly
+#     what DiT is waiting to receive.
+#
+# So: two independent engines, a TEXT handoff, and at most one awake. Measured
+# in that shape (report §7.2, container hy3-dual-sleep-tp4-ep4-0023, exit 0):
+# peak 35039 / 34619 / 34619 / 34619 MiB, ~5.7 GiB spare; AR wake/sleep
+# 2.67s/0.89s, DiT wake/sleep 1.79s/2.37s; both asleep leaves 44.26 GiB host RAM.
+#
+# ONE DEPLOYMENT, TWO SPEEDS. Which engines wake is decided PER REQUEST by
+# `bot_task`, so a single instance serves both the fast and the quality path
+# (the same shape Bernini uses, where task_type selects a guidance mode):
+#
+#   bot_task omitted / vanilla   AR never wakes. ~12s. The caller supplies the
+#                                prompt; DiT derives the output aspect from the
+#                                reference image, or from an explicit
+#                                target_shape / aspect_ratio for text-to-image.
+#   bot_task=recaption           AR wakes, rewrites the prompt, sleeps; then DiT.
+#   bot_task=think | think_recaption
+#                                Reasoning, and (for think_recaption) a rewrite
+#                                on top. ~110s total on a real prompt
+#                                (report §11.2: AR is ~82% of that budget).
+#
+# Valid bot_task values are exactly: think, recaption, think_recaption, vanilla —
+# or omit the field. NOT "image": that is the upstream HuggingFace spelling for
+# "skip enhancement", and this stack calls the same thing "vanilla". The request
+# layer rejects unknown values at submit rather than waking AR and failing later.
+#
+# Both text-to-image and image-to-image work on either path; the presence of
+# input images is what distinguishes them, not the deployment.
+#
+# BOOT COST: AR init 139.83s + AR sleep 13.15s + DiT init 73.84s + DiT sleep
+# 33.20s ~= 260s before the first request can be served. Health probes must
+# tolerate that.
+#
+# DENSITY: one 80B instance occupies all four cards, so one replica per node
+# (report §11.3). Scale out with more instances, not more replicas per node.
+mode: exclusive
+
+# Level 1 offloads weights to host RAM with a fast DMA restore. Level 2 discards
+# them and wake_up() is not implemented after it, so the engine could never
+# serve a second request (report §7.2: "level-1 是本方案的一部分").
+sleep_level: 1
+
+engines:
+  # Autoregressive stage: multi-image understanding, chain-of-thought and
+  # recaption, and the `<img_size_*><img_ratio_*>` tokens that fix the output
+  # aspect. Woken only when bot_task asks for it.
+  - label: ar
+    role: ar
+    deploy_config: hunyuan_image3_ar_a100_40g.yaml
+
+  # Diffusion stage: the 8-step Distil/MeanFlow denoise plus VAE decode. This is
+  # the terminal engine, so it is also the server's primary engine_client and
+  # every existing image endpoint keeps working against it unchanged.
+  - label: dit
+    role: diffusion
+    deploy_config: hunyuan_image3_dit_a100_40g.yaml

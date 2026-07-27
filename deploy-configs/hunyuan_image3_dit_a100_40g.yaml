@@ -1,0 +1,98 @@
+# HunyuanImage-3.0-Instruct-Distil (NF4) — DiT stage, A100 PCIE 40G x4 (ARM aarch64)
+#
+# Measured configuration, transcribed from report §6.2 / §7.3:
+#   docs/实验报告/vLLM-Omni-HunyuanImage3-A100-NF4-实验与优化复盘.md
+#
+# DiT HALF of the two-engine production shape; sibling is
+# hunyuan_image3_ar_a100_40g.yaml. See that file's header for why the two run as
+# separate engines with a text handoff rather than one KV-reusing pipeline.
+#
+# Delta vs upstream vllm_omni/deploy/hunyuan_image3_dit.yaml:
+#   * safetensors_load_strategy: lazy
+#   * enable_sleep_mode: true           Level-1 residency (report §7.2).
+#   * num_inference_steps: 8            Upstream leaves this to the caller; the
+#     Distil/MeanFlow variant is an 8-step model (report §7.3).
+#   * guidance_scale: 1.0            See the CFG note below for why not 0.
+#
+# NO load_format / diffusion_load_format here, deliberately. The AR engine picks
+# the model-specific NF4 loader by name, but the diffusion side never routes
+# through that registry — setting diffusion_load_format to the AR loader's name
+# makes every rank die with "Unknown load_format: hunyuan_image3_bitsandbytes".
+# The DiT stage instead handles NF4 inside its own pipeline: it wraps the
+# safetensors iterator to collect BitsAndBytes QuantState metadata (which is not
+# an ordinary parameter), keeps only this rank's 16 local experts, rebuilds the
+# double-quant scales and binds them to w13/w2 (report §4.10 / §5.2).
+#
+# enable_expert_parallel was already correct upstream and stays MANDATORY: the
+# NF4 loader rejects TP>1 without EP (report §5.1), because 64 experts / EP4 = 16
+# COMPLETE experts per rank so no packed tensor is sliced (§5.3).
+#
+# Distil/MeanFlow shape — do NOT "restore" traditional CFG. The checkpoint sets
+# cfg_distilled + use_meanflow, meaning guidance is injected as a token and each
+# step runs ONE backbone forward. Report §6.2 explicitly warns against the
+# two-forwards-per-step CFG design; it would double DiT cost for no quality gain.
+# Express that as guidance_scale 1.0, NOT 0. Zero cannot survive the request
+# layer: OmniDiffusionRequest.__post_init__ tests `if sampling_params.guidance_scale`,
+# so a falsey 0 is rewritten to 1.0 with guidance_scale_provided left False, and
+# HunyuanImage3 reads that absent flag as "use my default 5.0"
+# (pipeline_hunyuan_image3.py) — making cfg_factor 2 and running TWO backbone
+# forwards per step, exactly the shape §6.2 forbids. 1.0 is truthy, marks itself
+# provided, and yields cfg_factor 1.
+#
+# Measured on this exact config (report §7.3, hy3-dit8-tp4-ep4-0023, exit 0):
+#   weights            15.8324 GiB/rank, 16.52 GiB/rank post-load
+#   8-step denoise     ~7.5 s   (step 1 ~4.04 s incl. JIT/first-path, then ~0.5-0.7 s)
+#   full hot request   11.5969 s
+#   peak               29339 MiB/rank
+#   init               73.8398 s, then initial sleep 33.1969 s
+#
+# CAVEAT carried from §7.3 verbatim: a consecutive second 8-step request is
+# LIKELY faster, but that repeat measurement has not been done. Do not quote
+# 11.5969 s as a steady-state number — it contains the first-step JIT cost.
+# Report §12.4 requires a two-consecutive-request check in DiT regression.
+#
+# Quality gate (report §7.3 manual inspection + §12.4): 1-step output is blurry
+# BY DESIGN for a Distil model — blurriness at 1 step is not evidence of a bad
+# weight load (§14). Judge only at 8 steps, and check reference identity is kept
+# (subject, clothing colors, background, accessories).
+#
+# Requires --gpus '"device=0,1,2,3"'.
+pipeline: hunyuan_image3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # Correctness baseline (mirrors the AR side); graph/compile unvalidated here.
+    enforce_eager: true
+    devices: "0,1,2,3"
+    distributed_executor_backend: "mp"
+    safetensors_load_strategy: lazy
+    enable_sleep_mode: true
+    # Left off deliberately: the measured 29339 MiB/rank peak was reached WITHOUT
+    # VAE slicing/tiling, so enabling them is untested here and would change the
+    # memory profile the sleep/wake budget is built on.
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      enable_expert_parallel: true
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 1.0
+      seed: 42

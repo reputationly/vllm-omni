@@ -255,6 +255,16 @@ class OmniServeCommand(CLISubcommand):
             "Mutually exclusive with --stage-configs-path.",
         )
         omni_config_group.add_argument(
+            "--residency-config",
+            type=str,
+            default=None,
+            help="Path to a residency config YAML declaring SEVERAL engines that share the "
+            "same GPUs with at most one awake at a time (level-1 sleep at the engine "
+            "boundary). For models whose stages do not all fit awake together but each fit "
+            "alone. The engine with role 'diffusion' becomes the server's primary engine. "
+            "Mutually exclusive with --deploy-config, which describes a single engine.",
+        )
+        omni_config_group.add_argument(
             "--strategy-config",
             type=str,
             default=None,

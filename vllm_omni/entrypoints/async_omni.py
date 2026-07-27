@@ -141,8 +141,15 @@ class AsyncOmni(EngineClient, OmniBase):
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
-        self._sleeping_tags: set[str] = set()
-        self._level2_sleeping: bool = False
+        # Sleep bookkeeping is PER STAGE. sleep()/wake_up() already target stages
+        # (collective_rpc(..., stage_ids=...)), so a single engine-wide set made
+        # partial sleep incoherent: sleeping stage 0 marked the whole engine
+        # asleep, and waking stage 1 cleared stage 0's state as a side effect.
+        # That matters for residency schemes that keep several stages loaded and
+        # wake at most one at a time (see docs/实验报告/
+        # vLLM-Omni-HunyuanImage3-A100-NF4-实验与优化复盘.md §7.2/§11.1).
+        self._sleeping_tags: dict[int, set[str]] = {}
+        self._level2_sleeping: dict[int, bool] = {}
         self.final_output_task: asyncio.Task | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
@@ -316,12 +323,14 @@ class AsyncOmni(EngineClient, OmniBase):
 
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
-        _sleeping_tags = getattr(self, "_sleeping_tags", None)
-        if _sleeping_tags:
+        # A request traverses every stage of the pipeline, so ANY sleeping stage
+        # blocks it — but report which stages, so a caller driving a per-stage
+        # residency scheme can see exactly what to wake.
+        asleep = {sid: sorted(tags) for sid, tags in self._sleeping_stage_tags().items() if tags}
+        if asleep:
             raise RuntimeError(
-                f"Generation rejected: Engine is partially or fully asleep. "
-                f"Currently sleeping tags: {list(_sleeping_tags)}. "
-                f"Please perform a full wake_up before generating."
+                f"Generation rejected: stage(s) asleep: {asleep}. "
+                f"wake_up(stage_ids={sorted(asleep)}) before generating."
             )
 
         # Reject diffusion list-prompt early with a clear API error.
@@ -940,34 +949,44 @@ class AsyncOmni(EngineClient, OmniBase):
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
                     final_acks.append(ack)
-        if not hasattr(self, "_sleeping_tags"):
-            self._sleeping_tags = set()
-        self._sleeping_tags.update([CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value])
-        if level == 2:
-            self._level2_sleeping = True
+        slept_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
+        tag_map = self._sleeping_stage_tags()
+        for sid in stage_ids:
+            tag_map.setdefault(sid, set()).update(slept_tags)
+            if level == 2:
+                self._level2_sleeping[sid] = True
         return final_acks
 
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
         self._final_output_handler()
 
-        if getattr(self, "_level2_sleeping", False):
+        if stage_ids is None:
+            stage_ids = list(range(len(self.engine.stage_clients)))
+
+        level2_stages = sorted(sid for sid in stage_ids if self._level2_sleeping.get(sid))
+        if level2_stages:
             raise NotImplementedError(
-                "wake_up() after sleep(level=2) is not yet implemented: weights were "
-                "discarded from GPU and reloading from disk is not yet supported. "
+                f"wake_up() after sleep(level=2) is not yet implemented (stages {level2_stages}): "
+                "weights were discarded from GPU and reloading from disk is not yet supported. "
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
                 "and supports fast DMA restore."
             )
-        _current_tags = getattr(self, "_sleeping_tags", set())
+        # Union across the requested stages: the wake RPC carries one tag list for
+        # all of them, and a tag not asleep on a given stage is a no-op there.
+        tag_map = self._sleeping_stage_tags()
+        _current_tags: set[str] = set()
+        for sid in stage_ids:
+            _current_tags |= tag_map.get(sid, set())
         if tags is None:
-            requested_tags = list(_current_tags)
+            requested_tags = sorted(_current_tags)
         else:
             requested_tags = [t for t in tags if t in _current_tags]
         if not requested_tags:
-            logger.info(f"[{self._name}] Requested tags {tags} are already warm. Skipping wake_up.")
+            logger.info(
+                f"[{self._name}] Requested tags {tags} are already warm for stages {stage_ids}. Skipping wake_up."
+            )
             return []
 
-        if stage_ids is None:
-            stage_ids = list(range(len(self.engine.stage_clients)))
         total_workers = 0
         for sid in stage_ids:
             client = self.engine.stage_clients[sid]
@@ -991,23 +1010,63 @@ class AsyncOmni(EngineClient, OmniBase):
         current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
 
-        for t in requested_tags:
-            if hasattr(self, "_sleeping_tags"):
-                self._sleeping_tags.discard(t)
-        # Only clear the level-2 flag once all tags are warm, in case partial
-        # wake support (e.g. tags=["kv_cache"] only) is added in the future.
-        if not getattr(self, "_sleeping_tags", None):
-            self._level2_sleeping = False
-        logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
+        # Clear only the woken stages — waking one stage must not mark a sibling
+        # stage warm while its weights are still offloaded to host RAM.
+        for sid in stage_ids:
+            stage_tags = tag_map.get(sid)
+            if stage_tags is None:
+                continue
+            for t in requested_tags:
+                stage_tags.discard(t)
+            # Only clear the level-2 flag once all of that stage's tags are warm,
+            # in case partial wake support (e.g. tags=["kv_cache"]) is added.
+            if not stage_tags:
+                tag_map.pop(sid, None)
+                self._level2_sleeping.pop(sid, None)
+        logger.info(
+            f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM "
+            f"for task {task_id} (stages {stage_ids})."
+        )
         return final_acks
 
+    def _sleeping_stage_tags(self) -> dict[int, set[str]]:
+        """Per-stage sleeping-tag map, migrating any legacy engine-wide set.
+
+        Older builds stored a single ``set[str]``. Instances restored from such a
+        state (or subclasses that assign the old shape) are normalized here by
+        attributing the legacy tags to every stage, which is the conservative
+        reading: the old code could only ever sleep the whole engine.
+        """
+        tags = getattr(self, "_sleeping_tags", None)
+        if isinstance(tags, dict):
+            return tags
+        migrated: dict[int, set[str]] = {}
+        if tags:
+            num_stages = len(getattr(self.engine, "stage_clients", []) or []) or 1
+            for sid in range(num_stages):
+                migrated[sid] = set(tags)
+        self._sleeping_tags = migrated
+        if not isinstance(getattr(self, "_level2_sleeping", None), dict):
+            self._level2_sleeping = {}
+        return migrated
+
+    def sleeping_stage_ids(self) -> list[int]:
+        """Stage ids currently offloaded, for callers coordinating residency."""
+        return sorted(sid for sid, tags in self._sleeping_stage_tags().items() if tags)
+
     async def is_sleeping(self) -> bool:
-        """Return whether all stages are sleeping.
+        """Return whether ALL stages are sleeping.
+
+        Previously this returned True when ANY tag was set anywhere, which
+        contradicted the docstring as soon as per-stage sleep became reachable.
 
         TODO(AsyncOmni): query the orchestrator once all stage backends expose
         a real sleeping-state RPC. For now we track the requested state locally.
         """
-        return bool(getattr(self, "_sleeping_tags", None))
+        num_stages = len(getattr(self.engine, "stage_clients", []) or [])
+        if not num_stages:
+            return False
+        return len(self.sleeping_stage_ids()) == num_stages
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into all stages.

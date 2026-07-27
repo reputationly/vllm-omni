@@ -13,12 +13,14 @@ import os
 import random
 import time
 from argparse import Namespace
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from http import HTTPStatus
 from numbers import Integral
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import httpx
 import numpy as np
@@ -114,6 +116,7 @@ from vllm_omni.entrypoints.openai.protocol.audio_tasks import (
     AudioTaskStatus,
 )
 from vllm_omni.entrypoints.openai.protocol.audiogen_tasks import AudioGenTaskRequest
+from vllm_omni.entrypoints.openai.protocol.image_tasks import ImageTaskRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -131,6 +134,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.residency_runtime import ResidencyBundle, build_residency_bundle
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -145,6 +149,7 @@ from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreami
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
+    clone_sampling_params,
     get_default_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle, atomic_write_bytes
@@ -699,18 +704,38 @@ async def build_async_omni_from_stage_config(
         except Exception as e:
             logger.debug("Pre-loading transformers_modules failed: %s", e)
 
+    residency_bundle: ResidencyBundle | None = None
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
-        async_omni = AsyncOmni(model=model, **kwargs)
+
+        # Server-side only: consumed here to decide the engine topology, and NOT
+        # an AsyncOmni kwarg — leaving it in would hand the engine an argument it
+        # does not accept.
+        residency_path = kwargs.pop("residency_config", None) or getattr(args, "residency_config", None)
+        if residency_path:
+            if kwargs.get("deploy_config"):
+                raise ValueError(
+                    "--residency-config and --deploy-config are mutually exclusive: the residency "
+                    "file names one deploy config per co-located engine."
+                )
+            residency_bundle = await build_residency_bundle(model=model, base_kwargs=kwargs, path=residency_path)
+            async_omni = residency_bundle.primary
+            # omni_init_app_state() receives only the primary engine, so ride
+            # along on it to reach app state without changing that signature.
+            async_omni._omni_residency_bundle = residency_bundle
+        else:
+            async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
 
         yield async_omni
     finally:
-        if async_omni:
+        if residency_bundle is not None:
+            residency_bundle.shutdown()
+        elif async_omni:
             async_omni.shutdown()
 
 
@@ -759,6 +784,9 @@ async def omni_init_app_state(
     state.log_stats = not args.disable_log_stats
     state.args = args
     state.sleeping_stages = set()
+    # Present only under --residency-config; None keeps every single-engine
+    # deployment on exactly the previous code path.
+    state.residency_bundle = getattr(engine_client, "_omni_residency_bundle", None)
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -1169,6 +1197,61 @@ def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None
     return getattr(request.app.state, "openai_serving_audio_generate", None)
 
 
+async def _run_with_terminal_engine_awake(app_state: Any, *, request_id: str, run: Any) -> Any:
+    """Await ``run()`` with the terminal engine awake under residency.
+
+    A plain passthrough when residency is off.
+
+    STREAMING is why this cannot be a bare ``async with``: a streaming call
+    returns an async iterator BEFORE any generation happens, and the engine work
+    occurs while the client consumes it. Releasing the session when the call
+    returns would sleep the engine mid-stream — worse than never wrapping. So the
+    session is held and handed to a wrapper iterator that closes it on
+    exhaustion, client disconnect (``GeneratorExit``) or error, which means an
+    abandoned stream cannot strand the engine awake either.
+
+    Every call site that may stream must go through this rather than the bare
+    context manager.
+    """
+    bundle = getattr(app_state, "residency_bundle", None)
+    if bundle is None:
+        return await run()
+
+    stack = AsyncExitStack()
+    await stack.__aenter__()
+    try:
+        await stack.enter_async_context(_terminal_engine_awake(app_state, request_id=request_id))
+        result = await run()
+    except BaseException:
+        await stack.aclose()
+        raise
+
+    if not isinstance(result, AsyncGenerator) and not (
+        hasattr(result, "__aiter__") and not isinstance(result, ErrorResponse)
+    ):
+        # Non-streaming: generation already finished, release immediately.
+        await stack.aclose()
+        return result
+
+    async def _streaming_with_residency() -> AsyncGenerator:
+        try:
+            async for chunk in result:
+                yield chunk
+        finally:
+            await stack.aclose()
+
+    return _streaming_with_residency()
+
+
+async def _chat_completion_with_residency(handler: Any, request: Any, raw_request: Request) -> Any:
+    """Chat completion with residency-aware (stream-safe) engine wake."""
+    return await _run_with_terminal_engine_awake(
+        raw_request.app.state,
+        request_id=f"chat-{random_uuid()}",
+        run=lambda: handler.create_chat_completion(request, raw_request),
+    )
+
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -1193,7 +1276,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             )
         return base_server.create_error_response(message="The model does not support Chat Completions API")
     try:
-        generator = await handler.create_chat_completion(request, raw_request)
+        generator = await _chat_completion_with_residency(handler, request, raw_request)
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
@@ -1840,13 +1923,15 @@ async def generate_images(
             if request.system_prompt is not None:
                 extra_body["system_prompt"] = request.system_prompt
 
-            generation_result = await chat_handler.generate_diffusion_images(
-                prompt=request.prompt,
-                extra_body=extra_body,
-                request_id=f"img_gen-{random_uuid()}",
-                raw_request=raw_request,
-                arrival_time=request_timestamp,
-            )
+            gen_request_id = f"img_gen-{random_uuid()}"
+            async with _terminal_engine_awake(raw_request.app.state, request_id=gen_request_id):
+                generation_result = await chat_handler.generate_diffusion_images(
+                    prompt=request.prompt,
+                    extra_body=extra_body,
+                    request_id=gen_request_id,
+                    raw_request=raw_request,
+                    arrival_time=request_timestamp,
+                )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
                     status_code=generation_result.error.code if generation_result.error else 400,
@@ -1922,14 +2007,15 @@ async def generate_images(
         logger.debug(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
-        result = await _generate_with_async_omni(
-            engine_client=engine_client,
-            gen_params=gen_params,
-            stage_configs=stage_configs,
-            prompt=prompt,
-            request_id=request_id,
-            arrival_time=request_timestamp,
-        )
+        async with _terminal_engine_awake(raw_request.app.state, request_id=request_id):
+            result = await _generate_with_async_omni(
+                engine_client=engine_client,
+                gen_params=gen_params,
+                stage_configs=stage_configs,
+                prompt=prompt,
+                request_id=request_id,
+                arrival_time=request_timestamp,
+            )
 
         if result is None:
             raise HTTPException(
@@ -2069,7 +2155,7 @@ async def edit_images(
         # Reject oversized multi-image edit requests before fetching or decoding
         # any inputs. This keeps over-limit URL requests from burning network,
         # CPU, and memory on work that will be rejected anyway.
-        max_input_images = _get_max_edit_input_images(raw_request, engine_client)
+        max_input_images = _get_max_edit_input_images(raw_request.app.state, engine_client)
         if max_input_images is not None and len(input_images_list) > max_input_images:
             detail = (
                 "Received multiple input images. Only a single image is supported by this model."
@@ -2265,18 +2351,32 @@ async def edit_images(
                 extra_body["return_stage_metrics"] = return_stage_metrics
 
             prompt_text = prompt.get("prompt", "")
-            generation_result = await chat_handler.generate_diffusion_images(
-                prompt=prompt_text,
-                extra_body=extra_body,
-                reference_images=ref_b64_list,
+            # Forward the mask explicitly. This branch used to build
+            # prompt["multi_modal_data"]["mask_image"] above and then drop it,
+            # because only prompt_text is passed on — so a masked edit silently
+            # ran UNMASKED on any multi-stage pipeline.
+            mask_pil = (prompt.get("multi_modal_data") or {}).get("mask_image")
+            mask_b64 = _encode_images_png_b64([mask_pil])[0] if mask_pil is not None else None
+            # Not a bare `async with`: with stream=true this returns an iterator
+            # before generating, so the session must outlive the call and be
+            # released only when the stream is consumed.
+            generation_result = await _run_with_terminal_engine_awake(
+                raw_request.app.state,
                 request_id=request_id,
-                arrival_time=request_timestamp,
-                stream=stream,
-                model=model_name,
-                output_format=output_format,
-                output_compression=output_compression,
-                size=size_str,
-                raw_request=raw_request,
+                run=lambda: chat_handler.generate_diffusion_images(
+                    prompt=prompt_text,
+                    extra_body=extra_body,
+                    reference_images=ref_b64_list,
+                    mask_image=mask_b64,
+                    request_id=request_id,
+                    arrival_time=request_timestamp,
+                    stream=stream,
+                    model=model_name,
+                    output_format=output_format,
+                    output_compression=output_compression,
+                    size=size_str,
+                    raw_request=raw_request,
+                ),
             )
             if stream and not isinstance(generation_result, ErrorResponse):
                 return StreamingResponse(
@@ -2291,13 +2391,14 @@ async def edit_images(
             images, _, _, cot_output = generation_result
         else:
             # Single-stage diffusion: use the direct path.
-            result = await _generate_with_async_omni(
-                engine_client=engine_client,
-                gen_params=gen_params,
-                stage_configs=stage_configs,
-                prompt=prompt,
-                request_id=request_id,
-            )
+            async with _terminal_engine_awake(raw_request.app.state, request_id=request_id):
+                result = await _generate_with_async_omni(
+                    engine_client=engine_client,
+                    gen_params=gen_params,
+                    stage_configs=stage_configs,
+                    prompt=prompt,
+                    request_id=request_id,
+                )
             images = _extract_images_from_result(result)
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
@@ -2377,16 +2478,23 @@ def _get_engine_and_model(raw_request: Request):
     return engine_client, model_name, normalized_stage_configs
 
 
-def _get_diffusion_od_config(raw_request: Request, engine_client: Any) -> Any:
-    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
+def _get_diffusion_od_config(app_state: Any, engine_client: Any) -> Any:
+    """Resolve the diffusion config from app state.
+
+    Takes ``app.state`` rather than the ``Request`` so background jobs that
+    outlive their HTTP request can call it without retaining the request (see
+    ``_run_image_job``). App state is owned by the application and stays valid
+    for the process lifetime.
+    """
+    diffusion_engine = getattr(app_state, "diffusion_engine", None) or engine_client
     get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
     return (
         get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
     )
 
 
-def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:
-    od_config = _get_diffusion_od_config(raw_request, engine_client)
+def _get_max_edit_input_images(app_state: Any, engine_client: Any) -> int | None:
+    od_config = _get_diffusion_od_config(app_state, engine_client)
     if od_config is None:
         # Preserve the existing compatibility behavior when the diffusion
         # config is not exposed on the serving surface.
@@ -3599,6 +3707,771 @@ async def create_audio_gen_task(request: AudioGenTaskRequest, raw_request: Reque
 
     task = asyncio.create_task(
         _run_audio_gen_job(handler, request, task_id, save_result_path, app_state=raw_request.app.state)
+    )
+    await AUDIO_TASKS.upsert(task_id, task)
+    return ref
+
+
+# ---------------------------------------------------------------------------
+# Async image task API (text-to-image / image editing).
+#
+# Third sibling of the TTS and diffusion-audio async APIs above, sharing their
+# task store / manager / registry so the global status, result, cancel and queue
+# endpoints below serve image tasks unchanged — only submit is new.
+#
+# It exists because the GPUStack facade dispatches strictly by engine kind,
+# POSTing to ``v1/tasks/{kind}/`` (gpustack routes/videos.py), so an image model
+# is only reachable through the facade if the engine exposes /v1/tasks/image/.
+# The synchronous /v1/images/edits endpoint stays the direct-caller surface.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_task_image_path(path: str, allowed_root: str | None) -> str:
+    """Validate one facade-injected input image path.
+
+    SECURITY: unlike the sync endpoints (which take bytes/URLs), this endpoint
+    reads server-side paths. The facade owns ``image_path`` and only ever injects
+    paths under its own NFS root, but this engine's raw OpenAI endpoints are ALSO
+    reachable through the GPUStack model proxy, so a model user can call here
+    directly with a hand-written path. Without a whitelist that is an arbitrary
+    file read of every shared mount and every other tenant's output.
+
+    We reuse vLLM's existing ``--allowed-local-media-path`` rather than inventing
+    a second whitelist, so operators have one knob. Fail closed: when it is unset
+    we refuse path inputs entirely instead of allowing everything.
+    """
+    candidate = (path or "").strip()
+    if candidate.startswith("file://"):
+        candidate = url2pathname(urlparse(candidate).path)
+    if not candidate:
+        raise ValueError("Empty input image path")
+    if not os.path.isabs(candidate):
+        raise ValueError(f"Input image path must be absolute: {candidate!r}")
+    if not allowed_root:
+        raise ValueError(
+            "Refusing to read a local input image because --allowed-local-media-path is not set. "
+            "Set it to the facade's media root (never '/') to enable path inputs."
+        )
+    real_root = os.path.realpath(allowed_root)
+    real_path = os.path.realpath(candidate)
+    # commonpath, not startswith: "/nfs-output-evil" must not pass for root
+    # "/nfs-output". realpath first so a symlink cannot escape the root.
+    try:
+        inside = os.path.commonpath([real_root, real_path]) == real_root
+    except ValueError:  # different drives / mixed absolute-relative
+        inside = False
+    if not inside:
+        raise ValueError(f"Input image path {candidate!r} is outside --allowed-local-media-path {allowed_root!r}")
+    if not os.path.isfile(real_path):
+        raise ValueError(f"Input image not found: {candidate!r}")
+    return real_path
+
+
+def _confine_task_output_path(path: str, allowed_roots: list[str]) -> str:
+    """Reject an image-task output path that escapes the server's write roots.
+
+    SECURITY, symmetric with :func:`_resolve_task_image_path`. ``save_result_path``
+    is caller-controlled, ``resolve_save_path`` keeps an absolute value verbatim,
+    and ``atomic_write_bytes`` creates parent directories and ``os.replace``\\ s the
+    target — so an unconfined path is an arbitrary file write for anyone who can
+    reach this engine directly through the GPUStack model proxy, not just the
+    facade that normally dictates it.
+
+    Relative paths were already resolved under the storage root by the caller, so
+    only absolute ones need checking.
+    """
+    real_path = os.path.realpath(path)
+    for root in allowed_roots:
+        if not root:
+            continue
+        real_root = os.path.realpath(root)
+        try:
+            # commonpath, not startswith: "/nfs-output-evil" must not pass for
+            # root "/nfs-output".
+            if os.path.commonpath([real_root, real_path]) == real_root:
+                return path
+        except ValueError:  # different drives / mixed absolute-relative
+            continue
+    raise ValueError(
+        f"save_result_path {path!r} is outside the permitted output roots {allowed_roots}. "
+        "Use a relative path (resolved under the storage root) or a path under "
+        "--allowed-local-media-path."
+    )
+
+
+def _load_task_images(paths: list[str], allowed_root: str | None, *, normalize_rgb: bool) -> list[Image.Image]:
+    """Load facade-materialized inputs from disk into PIL images."""
+    images: list[Image.Image] = []
+    for raw in paths:
+        resolved = _resolve_task_image_path(raw, allowed_root)
+        try:
+            img = Image.open(resolved)
+            img.load()
+        except Exception as exc:
+            raise ValueError(f"Failed to open input image {raw!r}: {exc}") from exc
+        images.append(img.convert("RGB") if normalize_rgb else img)
+    return images
+
+
+def _encode_images_png_b64(images: list[Image.Image]) -> list[str]:
+    encoded: list[str] = []
+    for img in images:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        encoded.append(base64.b64encode(buf.getvalue()).decode())
+    return encoded
+
+
+@asynccontextmanager
+async def _terminal_engine_awake(app_state: Any, *, request_id: str) -> AsyncIterator[None]:
+    """Hold the residency mutex with the terminal engine awake, if residency is on.
+
+    A no-op for ordinary single-engine servers.
+
+    Under ``--residency-config`` every engine is parked asleep at boot, so ANY
+    route that reaches ``engine_client.generate()`` directly — /v1/images/generations,
+    /v1/images/edits, chat — would otherwise be rejected by AsyncOmni's
+    sleeping-stage guard. Wrapping those call sites keeps them serving instead of
+    failing, at the cost of a wake/sleep per request.
+
+    Note these routes do NOT run the AR phase: they only wake the terminal
+    (diffusion) engine. A ``bot_task`` asking for chain-of-thought therefore has
+    no effect here; use /v1/tasks/image/ for the two-phase path.
+    """
+    bundle = getattr(app_state, "residency_bundle", None)
+    if bundle is None:
+        yield
+        return
+    async with bundle.residency.session(request_id=request_id) as session:
+        async with session.awake(bundle.deployment.terminal.label):
+            yield
+
+
+# Keys that belong in gen_params.extra_args (prompt shaping the DiT reads from
+# there), never as sampling-param attributes.
+_EXTRA_ARGS_ONLY_KEYS = frozenset({"bot_task", "sys_type", "system_prompt", "use_system_prompt"})
+
+# Keys the route has already resolved onto gen_params by hand; re-applying them
+# from extra_body would undo request-level precedence (e.g. the AR bridge's
+# width/height beating the caller's, or a generated seed).
+_ROUTE_RESOLVED_PARAM_KEYS = frozenset(
+    {
+        "width",
+        "height",
+        "seed",
+        "num_outputs_per_prompt",
+        "num_inference_steps",
+        "guidance_scale",
+        "true_cfg_scale",
+        "strength",
+        "negative_prompt",
+        "lora",
+    }
+)
+
+
+async def _generate_task_images(
+    *,
+    request: ImageTaskRequest,
+    app_state: Any,
+    engine_client: Any,
+    model_name: str,
+    stage_configs: list[Any],
+    pil_images: list[Image.Image],
+    mask_image: Image.Image | None,
+    extra_body: dict[str, Any],
+    width: int | None,
+    height: int | None,
+    seed: int,
+    n: int,
+    task_id: str,
+    bridge: dict[str, Any] | None = None,
+) -> list[Image.Image]:
+    """Render the images for one task, on whichever engine shape is deployed."""
+    if width is not None and height is not None:
+        extra_body["width"] = width
+        extra_body["height"] = height
+    size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
+
+    if len(stage_configs) > 1:
+        # Fused multi-stage pipeline (AR + diffusion in one engine, e.g. the
+        # two-stage GLM-Image / HunyuanImage-3.0 topology): route through the
+        # chat handler so the AR stage gets the right max_tokens and target
+        # grid — the same path /v1/images/edits uses.
+        chat_handler = getattr(app_state, "openai_serving_chat", None)
+        if chat_handler is None:
+            raise RuntimeError("openai_serving_chat is not initialized for multi-stage image generation.")
+        result = await chat_handler.generate_diffusion_images(
+            prompt=request.prompt,
+            extra_body=extra_body,
+            reference_images=_encode_images_png_b64(pil_images) or None,
+            mask_image=_encode_images_png_b64([mask_image])[0] if mask_image is not None else None,
+            request_id=f"img_task-{task_id}",
+            stream=False,
+            model=model_name,
+            output_format="png",
+            size=size_str,
+            # None by design: the job outlives its HTTP request. The handler
+            # guards every raw_request use, and the only unguarded one is on the
+            # streaming branch, which stream=False never reaches.
+            raw_request=None,
+        )
+        if isinstance(result, ErrorResponse):
+            raise RuntimeError(getattr(getattr(result, "error", None), "message", None) or str(result))
+        images, _, _, _ = result
+        return list(images)
+
+    # Single diffusion stage. This also covers the terminal engine of an
+    # exclusive-residency deployment, where AR already ran as its own engine and
+    # its results arrived through extra_body.
+    # Seed from the ENGINE's per-stage defaults (the deploy YAML), not a blank
+    # object. _generate_with_async_omni feeds this to
+    # build_stage_sampling_params_list(..., replace_diffusion_params=True), which
+    # REPLACES a diffusion stage's defaults with whatever we hand it rather than
+    # overlaying — so any field left unset here is lost, not inherited. Starting
+    # blank silently drops the shipped 8-step Distil default and lands on the
+    # pipeline's 50-step fallback: a 6x latency blowup for a request that simply
+    # omitted num_inference_steps.
+    stage_defaults = get_default_sampling_params_list(engine_client)
+    if stage_defaults:
+        gen_params = clone_sampling_params(stage_defaults[0])
+    else:
+        gen_params = OmniDiffusionSamplingParams()
+    # Legacy CLI-level defaults (--default-sampling-params JSON) still apply on
+    # top; this is a different source from the deploy YAML above.
+    apply_stage_default_sampling_params(
+        getattr(getattr(app_state, "args", None), "default_sampling_params", None),
+        gen_params,
+        "0",
+    )
+    _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
+    _update_if_not_none(gen_params, "width", width)
+    _update_if_not_none(gen_params, "height", height)
+    _update_if_not_none(gen_params, "seed", seed)
+    for field_name in ("num_inference_steps", "guidance_scale", "true_cfg_scale", "strength"):
+        _update_if_not_none(gen_params, field_name, getattr(request, field_name, None))
+    # A caller-supplied guidance_scale of 0 means "no CFG", but 0 is falsey:
+    # OmniDiffusionRequest.__post_init__ rewrites a falsey guidance_scale to 1.0
+    # and leaves guidance_scale_provided False, after which HunyuanImage3
+    # substitutes 5.0 (pipeline_hunyuan_image3.py) and each step runs TWO backbone
+    # forwards. Flag anything the caller sent explicitly — including 0 — as
+    # provided, so the value survives instead of being read as "unset".
+    if request.guidance_scale is not None and hasattr(gen_params, "guidance_scale_provided"):
+        gen_params.guidance_scale_provided = True
+    # Per-request LoRA needs parsing into lora_request/lora_scale, not a raw
+    # attribute copy — same handling the synchronous edit endpoint applies.
+    lora_body = extra_body.get("lora")
+    if isinstance(lora_body, dict) and lora_body:
+        lora_request, lora_scale = _parse_lora_request(lora_body)
+        _update_if_not_none(gen_params, "lora_request", lora_request)
+        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+
+    # Sweep the remaining diffusion knobs the caller sent that this route does not
+    # name explicitly (generator_device, layers, resolution, num_frames,
+    # guidance_scale_2, and anything added later). The multi-stage path gets these
+    # for free because it hands extra_body to the shared builder; without this the
+    # single-stage branch — which is the residency deployment's terminal engine —
+    # would silently drop them.
+    for key, value in extra_body.items():
+        if value is None or key in _EXTRA_ARGS_ONLY_KEYS or key in _ROUTE_RESOLVED_PARAM_KEYS:
+            continue
+        if hasattr(gen_params, key):
+            setattr(gen_params, key, value)
+
+    extra_args = dict(getattr(gen_params, "extra_args", {}) or {})
+    # Reuse the sync endpoint's mapping rather than copying fields by name: the
+    # DiT pipeline reads extra_args["use_system_prompt"], but callers send
+    # "sys_type". A plain copy loop drops sys_type entirely, and also misses the
+    # bot_task -> sys_type fallback that decides the system prefix when the
+    # caller named only a prompt mode.
+    extra_args.update(
+        _build_hunyuan_edit_extra_args(
+            bot_task=request.bot_task,
+            sys_type=request.sys_type,
+            system_prompt=request.system_prompt,
+        )
+    )
+    # Values already resolved upstream win — notably the AR bridge's
+    # use_system_prompt, which is the prefix AR actually conditioned on.
+    for key in ("use_system_prompt", "system_prompt", "bot_task"):
+        if extra_body.get(key) is not None:
+            extra_args[key] = extra_body[key]
+    if extra_args:
+        gen_params.extra_args = extra_args
+
+    prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
+    if request.negative_prompt is not None:
+        prompt["negative_prompt"] = request.negative_prompt
+    multi_modal: dict[str, Any] = {}
+    if pil_images:
+        multi_modal["image"] = pil_images
+    if mask_image is not None:
+        multi_modal["mask_image"] = mask_image
+    if multi_modal:
+        prompt["multi_modal_data"] = multi_modal
+
+    if bridge:
+        # ar2diffusion() returns the diffusion stage's PROMPT DICT, not loose
+        # kwargs, and the pipeline reads the chain-of-thought from
+        # prompt["extra"]["ar_generated_text"] (pipeline_hunyuan_image3.py).
+        # Routing it through gen_params.extra_args instead silently drops it: the
+        # AR phase runs, costs its full latency, and the image comes out
+        # byte-identical to one generated without AR at all.
+        bridge_extra = bridge.get("extra")
+        if isinstance(bridge_extra, dict) and bridge_extra:
+            prompt["extra"] = {**(prompt.get("extra") or {}), **bridge_extra}
+        # These live at the TOP level of the bridge's dict; forwarding them keeps
+        # the DiT's system prefix identical to the one AR conditioned on.
+        for key in ("use_system_prompt", "system_prompt"):
+            if bridge.get(key) is not None:
+                prompt[key] = bridge[key]
+
+    gen_result = await _generate_with_async_omni(
+        engine_client=engine_client,
+        gen_params=gen_params,
+        stage_configs=stage_configs,
+        prompt=prompt,
+        request_id=f"img_task-{task_id}",
+    )
+    return _extract_images_from_result(gen_result)
+
+
+async def _run_ar_phase(
+    ar_engine: Any,
+    request: ImageTaskRequest,
+    *,
+    pil_images: list[Image.Image],
+    width: int | None,
+    height: int | None,
+    request_id: str,
+) -> dict[str, Any] | None:
+    """Run the autoregressive phase and bridge its output to diffusion inputs.
+
+    Returns the ``ar2diffusion`` dict (target size from the AR-predicted
+    ``<img_size_*><img_ratio_*>`` tail, the truncated chain-of-thought, and the
+    forwarded system-prompt settings), or None when AR produced nothing.
+
+    The bridge is the SAME function the fused two-stage pipeline registers as its
+    ``custom_process_input_func`` (see the HunyuanImage3 pipeline topology), so
+    the standalone AR->DiT handoff cannot drift from the fused one. The
+    DiT-only pipeline deliberately declares no bridge, which is why the caller
+    has to invoke it here.
+    """
+    from vllm import SamplingParams
+
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        build_prompt_tokens,
+        resolve_stop_token_ids,
+    )
+    from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import ar2diffusion
+
+    get_tokenizer = getattr(ar_engine, "get_tokenizer", None)
+    tokenizer = await get_tokenizer() if callable(get_tokenizer) else None
+    if tokenizer is None:
+        raise RuntimeError("AR engine exposes no tokenizer; cannot build the HunyuanImage3 prompt.")
+
+    task = "it2i" if pil_images else "t2i"
+    built = build_prompt_tokens(
+        request.prompt,
+        tokenizer,
+        task=task,
+        bot_task=request.bot_task,
+        sys_type=request.sys_type,
+        custom_system_prompt=request.system_prompt,
+        num_images=max(1, len(pil_images)),
+    )
+    stop_token_ids = resolve_stop_token_ids(task=task, bot_task=request.bot_task, tokenizer=tokenizer)
+
+    ar_prompt: dict[str, Any] = {"prompt_token_ids": list(built.token_ids)}
+    if pil_images:
+        ar_prompt["multi_modal_data"] = {"image": pil_images}
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1024,
+        stop_token_ids=stop_token_ids,
+        detokenize=True,
+        skip_special_tokens=False,
+        include_stop_str_in_output=True,
+    )
+
+    ar_output = None
+    async for output in ar_engine.generate(ar_prompt, sampling_params, request_id=f"{request_id}-ar"):
+        ar_output = output
+    if ar_output is None:
+        return None
+
+    # The bridge reads the ORIGINAL request prompt for text/size/system-prompt
+    # fallbacks, so hand it the same shape the fused orchestrator would.
+    original_prompt: dict[str, Any] = {"prompt": request.prompt}
+    if height is not None:
+        original_prompt["height"] = height
+    if width is not None:
+        original_prompt["width"] = width
+    if request.sys_type is not None:
+        original_prompt["use_system_prompt"] = request.sys_type
+    if request.system_prompt is not None:
+        original_prompt["system_prompt"] = request.system_prompt
+    if pil_images:
+        original_prompt["multi_modal_data"] = {"image": pil_images}
+
+    return ar2diffusion([ar_output], prompt=original_prompt, requires_multimodal_data=bool(pil_images))
+
+
+async def _run_image_job(
+    request: ImageTaskRequest,
+    task_id: str,
+    save_result_path: str,
+    *,
+    app_state: Any,
+    engine_client: Any,
+    model_name: str,
+    stage_configs: list[Any],
+    width: int | None,
+    height: int | None,
+) -> None:
+    """Background image job.
+
+    Deliberately takes ``app_state`` and pre-resolved engine handles instead of
+    the ``Request``: this coroutine outlives the HTTP response that created it,
+    and a Starlette ``Request`` is only valid for its own ASGI cycle. Retaining
+    one would keep the finished request's scope (and body) alive for the whole
+    job — minutes, for a slow image model — and would leave a trap for any future
+    code that awaits on it (``is_disconnected()``, re-reading the body) inside a
+    connection that is already gone. The TTS/audiogen jobs avoid this the same
+    way, passing ``raw_request=None`` down to the handler.
+    """
+    job = await AUDIO_TASK_STORE.get(task_id)
+    if job is None:
+        logger.warning("Image task %s missing before generation started; skipping", task_id)
+        return
+
+    await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()})
+    try:
+        # Normalize inputs to RGB only when the caller opts into Hunyuan-aware
+        # behavior, mirroring /v1/images/edits: RGBA/P inputs otherwise diverge
+        # from the offline path and can shift AR recaption before DiT runs.
+        normalize_rgb = request.bot_task is not None or request.sys_type is not None
+        # Resolve the whitelist from the CLI args FIRST: a pure-diffusion server
+        # (single diffusion stage) has no vllm_config, so engine_client.model_config
+        # either does not exist or does not carry allowed_local_media_path, and
+        # reading only from there makes every path input fail closed even when the
+        # operator did pass the flag.
+        allowed_root = getattr(getattr(app_state, "args", None), "allowed_local_media_path", "") or ""
+        if not allowed_root:
+            model_config = getattr(engine_client, "model_config", None)
+            allowed_root = getattr(model_config, "allowed_local_media_path", "") or ""
+        input_paths = request.input_image_paths()
+        # Count first, decode second. The route already rejected an over-limit
+        # request at submit; this is defence in depth for any other caller, and
+        # keeping the order means a rejected request never pays for opening and
+        # decoding files it will not use.
+        max_input_images = _get_max_edit_input_images(app_state, engine_client)
+        if max_input_images is not None and len(input_paths) > max_input_images:
+            raise ValueError(
+                f"Received {len(input_paths)} input images; at most {max_input_images} are supported by this model."
+            )
+        pil_images = await asyncio.to_thread(_load_task_images, input_paths, allowed_root, normalize_rgb=normalize_rgb)
+
+        # The mask's alpha channel carries the edit region, so it must never be
+        # RGB-normalized (same rule as /v1/images/edits).
+        mask_path = request.mask_image_path()
+        mask_image = None
+        if mask_path:
+            loaded_mask = await asyncio.to_thread(_load_task_images, [mask_path], allowed_root, normalize_rgb=False)
+            mask_image = loaded_mask[0]
+
+        # An auto-sized edit has no width/height at submit, so the size check
+        # there was a no-op: the OUTPUT size is the first input image's size,
+        # which is only knowable once the file is read (the pipeline fills
+        # sampling_params.width/height from it). Re-run the guard now — before any
+        # GPU work — or a caller can bypass --max-generated-image-size simply by
+        # feeding a very large reference image. The synchronous edit endpoint
+        # closes the same hole by deriving the size from pil_images[0] first.
+        if width is None and height is None and pil_images:
+            auto_width, auto_height = pil_images[0].size
+            try:
+                _check_max_generated_image_size(getattr(app_state, "args", None), auto_width, auto_height)
+            except HTTPException as exc:
+                raise ValueError(exc.detail) from exc
+
+        # width/height otherwise came from submit, already size-checked; do not
+        # recompute here, so the validated value is the one actually used.
+        seed = request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
+        n = request.n or 1
+
+        extra_body = request.diffusion_extra_body()
+        extra_body["seed"] = seed
+        extra_body["num_outputs_per_prompt"] = n
+
+        # Exclusive-residency deployments hold AR and diffusion as separate
+        # engines and wake at most one at a time. The AR phase runs only when the
+        # requested bot_task actually asks for chain-of-thought / recaption, so a
+        # single deployment serves both the fast path (AR never woken) and the
+        # quality path — decided per request, not per deployment.
+        bundle: ResidencyBundle | None = getattr(app_state, "residency_bundle", None)
+        bridged: dict[str, Any] | None = None
+        async with AsyncExitStack() as residency_stack:
+            if bundle is not None:
+                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import requires_ar_generation
+
+                # One session spans BOTH phases, so the mutex is held for the
+                # whole request and no other request can wake an engine midway.
+                session = await residency_stack.enter_async_context(bundle.residency.session(request_id=task_id))
+                ar_label = bundle.label_of("ar")
+                if ar_label is not None and requires_ar_generation(request.bot_task):
+                    async with session.awake(ar_label) as ar_group:
+                        bridged = await _run_ar_phase(
+                            ar_group.engine,
+                            request,
+                            pil_images=pil_images,
+                            width=width,
+                            height=height,
+                            request_id=f"img_task-{task_id}",
+                        )
+                    if bridged:
+                        # AR's <img_ratio_*> is the canonical target shape: it
+                        # beats the request-side size, which the serving layer
+                        # fills from the first reference image's bucket and so
+                        # collapses non-square targets to square on multi-image
+                        # requests.
+                        width = bridged.get("width", width)
+                        height = bridged.get("height", height)
+                        # The AR stage OVERRIDES the size validated at submit:
+                        # reso_group[ratio_idx] comes from the model's own
+                        # <img_size_*><img_ratio_*> tokens and can be larger than
+                        # anything the caller asked for (1024 is a common
+                        # prediction). Without re-checking, the quality path lets
+                        # a request that passed the cap at submit generate above
+                        # it. This is the last point where the size is known
+                        # before the diffusion engine wakes.
+                        try:
+                            _check_max_generated_image_size(getattr(app_state, "args", None), width, height)
+                        except HTTPException as exc:
+                            raise ValueError(f"AR-predicted output size rejected: {exc.detail}") from exc
+                        # The rest of the bridge output (the CoT under "extra",
+                        # the system-prompt settings) is applied to the diffusion
+                        # PROMPT, not to extra_body — see _generate_task_images.
+                        for key in ("use_system_prompt", "system_prompt"):
+                            if key in bridged:
+                                extra_body[key] = bridged[key]
+                # AR is asleep again by now (awake() sleeps on the way out), so
+                # the diffusion engine can take the whole card.
+                await residency_stack.enter_async_context(session.awake(bundle.deployment.terminal.label))
+
+            images = await _generate_task_images(
+                request=request,
+                app_state=app_state,
+                engine_client=engine_client,
+                model_name=model_name,
+                stage_configs=stage_configs,
+                pil_images=pil_images,
+                mask_image=mask_image,
+                extra_body=extra_body,
+                width=width,
+                height=height,
+                seed=seed,
+                n=n,
+                task_id=task_id,
+                bridge=bridged,
+            )
+
+        if not images:
+            raise RuntimeError("Image generation returned no images")
+        # The facade dictates ONE output path per task (its _output_ext gives
+        # ".png"), so extra images from n>1 have nowhere to go. Write the first
+        # and say so rather than silently dropping them.
+        if len(images) > 1:
+            logger.warning(
+                "Image task %s produced %d images but save_result_path holds one; writing the first.",
+                task_id,
+                len(images),
+            )
+        buf = io.BytesIO()
+        images[0].save(buf, format="PNG")
+        await atomic_write_bytes(buf.getvalue(), save_result_path)
+        logger.info("Image task %s wrote %s", task_id, save_result_path)
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()})
+    except asyncio.CancelledError:
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
+        raise
+    except (EngineGenerateError, EngineDeadError) as exc:
+        logger.exception("Image task %s failed (engine error)", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        if isinstance(exc, EngineDeadError):
+            terminate_if_errored(server=app_state.server, engine=app_state.engine_client)
+    except Exception as exc:
+        logger.exception("Image task %s failed", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+@router.post(
+    "/v1/tasks/image/",
+    responses={
+        HTTPStatus.OK.value: {"model": AudioTaskResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def create_image_task(request: ImageTaskRequest, raw_request: Request) -> AudioTaskResponse:
+    """Submit an asynchronous image generation / editing task.
+
+    Returns immediately with a PENDING record; poll the shared global status /
+    result / cancel endpoints (keyed by task_id) exactly like the TTS and
+    diffusion-audio async APIs.
+    """
+    if not (request.prompt or "").strip():
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Empty prompt")
+
+    # Resolve the engine handles HERE, while the request is still alive: a
+    # misrouted model then fails at submit with a proper status instead of
+    # minutes later inside the job, and the job never needs the Request itself.
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    app_state = raw_request.app.state
+
+    # The facade strips `model` (control key), so absent means "this server's
+    # model". A DIFFERENT name is a misrouted request: /v1/images/edits rejects
+    # it, and silently serving it here would return an image from a model the
+    # caller did not ask for.
+    if not (request.model or "").strip():
+        request.model = model_name
+    elif request.model != model_name:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{request.model}' but server is running '{model_name}'.",
+        )
+
+    # Resolve the output size at SUBMIT time, for two reasons: the caller gets a
+    # real 400 instead of a task that fails minutes later, and the rejection
+    # happens BEFORE reserve() takes a queue slot and the job burns GPU. The
+    # synchronous image endpoints run the same check.
+    # Layered-model geometry, validated exactly as /v1/images/edits does.
+    if request.resolution is not None and request.resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid resolution {request.resolution}. Supported resolutions: {SUPPORTED_LAYERED_RESOLUTIONS}.",
+        )
+    try:
+        validate_layered_layers(request.layers)
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    if request.resolution is not None and (request.target_shape or request.aspect_ratio):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                "Cannot specify both 'resolution' and an explicit size. Use 'resolution' alone, "
+                "or use 'target_shape'/'aspect_ratio' without 'resolution'."
+            ),
+        )
+
+    app_state_args = getattr(app_state, "args", None)
+    max_pixels = getattr(app_state_args, "max_generated_image_size", None)
+    width, height = request.output_size(max_pixels=max_pixels)
+    # Pass `resolution` through: the size check has a resolution-only branch
+    # (output is resolution x resolution), so omitting it lets a resolution-only
+    # request slip past --max-generated-image-size entirely.
+    _check_max_generated_image_size(app_state_args, width, height, request.resolution)
+
+    # Validate bot_task at SUBMIT time. An unrecognized value would otherwise
+    # survive all the way into the job: requires_ar_generation() answers True for
+    # anything it does not know, so a residency deployment WAKES the AR engine
+    # first and only then dies inside build_prompt_tokens with "Unknown bot_task",
+    # far from the cause and after paying a wake. Fail here with the valid set
+    # instead. (Note "image" is an upstream-HF spelling, not one of ours — the
+    # equivalent here is "vanilla".)
+    if request.bot_task is not None:
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import available_bot_tasks
+
+        valid_bot_tasks = available_bot_tasks()
+        if request.bot_task not in valid_bot_tasks:
+            named = [value for value in valid_bot_tasks if value is not None]
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    f"Unknown bot_task {request.bot_task!r}. Valid values: {named} "
+                    "(or omit the field). Use 'vanilla' for the no-AR fast path."
+                ),
+            )
+
+    # A mask without a base image is not an edit; catch it here rather than
+    # letting the pipeline receive a mask it has nothing to apply to.
+    input_paths = request.input_image_paths()
+    if request.mask_image_path() and not input_paths:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="image_mask_path requires at least one input image.",
+        )
+
+    # Reject an over-limit image count HERE: before the job opens and decodes
+    # every referenced file, and before reserve() takes a queue slot. The
+    # synchronous edit endpoint rejects on count for the same reason. Doing it at
+    # submit also turns a task that would have been recorded FAILED minutes later
+    # into a plain 400 for the caller.
+    max_input_images = _get_max_edit_input_images(app_state, engine_client)
+    if max_input_images is not None and len(input_paths) > max_input_images:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                "Received multiple input images. Only a single image is supported by this model."
+                if max_input_images == 1
+                else (
+                    f"Received {len(input_paths)} input images. "
+                    f"At most {max_input_images} images are supported by this model."
+                )
+            ),
+        )
+
+    task_id = request.task_id or f"image_task_{random_uuid()}"
+    save_result_path = resolve_save_path(request.save_result_path, task_id, STORAGE_MANAGER.storage_path, ".png")
+    # Confine the write target. The facade dictates a path under its own NFS
+    # output root (which the GPUStack backend also passes as
+    # --allowed-local-media-path), so both roots are legitimate; anything else is
+    # a direct caller trying to write outside them.
+    try:
+        save_result_path = _confine_task_output_path(
+            save_result_path,
+            [
+                STORAGE_MANAGER.storage_path,
+                getattr(app_state_args, "allowed_local_media_path", "") or "",
+            ],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+
+    try:
+        ref = await AUDIO_TASK_MANAGER.reserve(task_id, save_result_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail=str(exc)) from exc
+
+    task = asyncio.create_task(
+        _run_image_job(
+            request,
+            task_id,
+            save_result_path,
+            app_state=app_state,
+            engine_client=engine_client,
+            model_name=model_name,
+            stage_configs=stage_configs,
+            width=width,
+            height=height,
+        )
     )
     await AUDIO_TASKS.upsert(task_id, task)
     return ref

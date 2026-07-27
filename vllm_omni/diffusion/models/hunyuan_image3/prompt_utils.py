@@ -135,6 +135,27 @@ def available_bot_tasks() -> list[str | None]:
     return [None, *rest]
 
 
+def requires_ar_generation(bot_task: str | None) -> bool:
+    """Whether this ``bot_task`` needs the autoregressive stage to run.
+
+    A preset's trigger tag (``<think>`` / ``<recaption>``) is what makes the AR
+    stage emit chain-of-thought or a rewritten caption; presets without one go
+    straight to denoising. Callers that host AR and diffusion as separate,
+    exclusively-resident engines use this to decide whether to wake AR at all —
+    skipping it is the difference between roughly 12s and 110s per request
+    (report §11.2), so the answer must come from the preset table rather than a
+    duplicated list that can drift.
+
+    Unknown values return True: the safe direction is running AR needlessly
+    rather than silently dropping a caller's requested reasoning. ``resolve_sys_type``
+    raises on unknown values anyway, so this only affects the ordering of errors.
+    """
+    preset = _BOT_TASK_PRESETS.get(bot_task)
+    if preset is None:
+        return True
+    return preset[1] is not None
+
+
 def resolve_sys_type(bot_task: str | None) -> str:
     """Default system-prompt type for a given ``bot_task``."""
     if bot_task not in _BOT_TASK_PRESETS:

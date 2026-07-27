@@ -1,0 +1,102 @@
+# HunyuanImage-3.0-Instruct-Distil (NF4) — AR stage, A100 PCIE 40G x4 (ARM aarch64)
+#
+# Measured configuration, transcribed from report §6.1:
+#   docs/实验报告/vLLM-Omni-HunyuanImage3-A100-NF4-实验与优化复盘.md
+#
+# This is the AR HALF of the two-engine production shape. Its sibling is
+# hunyuan_image3_dit_a100_40g.yaml. The two are SEPARATE engines that hand off
+# TEXT (the cot + `<img_size_*><img_ratio_*>` token sequence), NOT KV cache.
+#
+# Why two engines instead of one two-stage pipeline with KV reuse: the upstream
+# vllm_omni/deploy/hunyuan_image_3_moe.yaml wires stage 0 -> stage 1 with
+# omni_kv_config.need_send_cache / need_recv_cache. Level-1 sleep offloads the
+# WEIGHTS and KV_CACHE tags together (AsyncOmni.sleep sets both), so sleeping the
+# AR stage to make room for DiT would drop exactly the KV that DiT is waiting to
+# receive. Text handoff has no such coupling, which is why report §7.1/§7.2 used
+# AR-only + DiT-only engines and why the upstream AR yaml documents itself as
+# "use this when AR and DiT are deployed as independent services".
+#
+# Delta vs upstream vllm_omni/deploy/hunyuan_image3_ar.yaml — three lines that
+# the upstream file is missing and without which this will NOT start:
+#   * enable_expert_parallel: true      MANDATORY. The HunyuanImage3 NF4 loader
+#     REJECTS TP>1 with EP disabled (report §5.1). 64 experts / EP4 = 16 COMPLETE
+#     experts per rank, so no NF4 packed tensor is ever sliced; slicing packed
+#     nibbles would require nibble + blocksize + absmax + nested-quant-state +
+#     gate/up layout alignment to hold simultaneously (§5.3).
+#   * load_format: hunyuan_image3_bitsandbytes    vLLM 0.25 rewrites load_format
+#     to the generic "bitsandbytes" in create_engine_config() /
+#     create_load_config() whenever the checkpoint quant method is BitsAndBytes,
+#     so the registered model-specific loader is never selected (report §4.7).
+#     vllm_omni/patch.py preserves an explicit request; this file must make it.
+#   * safetensors_load_strategy: lazy   Avoids four ranks each pre-reading full
+#     NFS shards at once. Report §13 P1 flags the lazy/NFS access pattern as
+#     still needing a dedicated profile.
+#
+# Level-1 sleep is load-bearing, not an optimization: report §7.2 measured
+# ~1067 MiB/card residual after AR sleep, which is what lets the DiT engine wake
+# into the same four cards. Level 2 is NOT interchangeable — it discards weights
+# and AsyncOmni.wake_up() raises NotImplementedError after a level-2 sleep.
+#
+# Measured on this exact config (report §7.1):
+#   weights            14.93 GiB/rank
+#   KV pool            7.56 GiB/rank = 247,808 tokens (32 KiB/token/rank, §8)
+#   three-image think+recaption   653 tokens / 90.3208 s = 7.23 tok/s
+#   peak               30745 / 30769 / 30747 / 30773 MiB
+#   init               139.8275 s, then initial sleep 13.1526 s
+#
+# PCIe, no NVLink: vLLM disables custom allreduce for >2 PCIe GPUs and falls back
+# to PYNCCL/NCCL. Report §6.3 and §14 both warn that "custom allreduce disabled"
+# in the log is the expected path, NOT an init failure. Do not force NVLink paths.
+#
+# Requires --gpus '"device=0,1,2,3"'. GPUStack injects NVIDIA_VISIBLE_DEVICES and
+# the NVIDIA runtime remaps to container-local 0..3, so devices stays "0,1,2,3".
+pipeline: hunyuan_image3_ar
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    # Marks this as the tokenizer-owning stage. AsyncOmni._get_comprehension_stage_index()
+    # would fall back to stage 0 anyway for a single-stage engine, but the residency
+    # orchestrator calls get_tokenizer() on this engine to build the HunyuanImage3
+    # prompt token sequence, so state that dependency rather than relying on the
+    # fallback. Mirrors the fused two-stage config, which sets it for the same reason.
+    is_comprehension: true
+    # Capacity-first baseline (report §6.1 note). NOT a throughput optimum, but
+    # the cross-engine mutex serializes requests anyway, so raising it buys
+    # nothing until the two-engine residency model changes.
+    max_num_seqs: 1
+    # 0.75 still yields the measured 7.56 GiB/rank KV pool. Raising it eats the
+    # headroom that the sleeping sibling engine needs.
+    gpu_memory_utilization: 0.75
+    trust_remote_code: true
+    # Correctness baseline (report §6.1). CUDA graph / torch.compile on this NF4
+    # MoE path is unvalidated — do not flip this off as a casual speedup.
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 32768
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    enable_expert_parallel: true
+    load_format: hunyuan_image3_bitsandbytes
+    safetensors_load_strategy: lazy
+    enable_sleep_mode: true
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 0.95
+      top_k: 1024
+      # Report §7.1 measured 653 tokens for a full three-image think+recaption.
+      # 1024 leaves margin without inviting runaway CoT. Raising this raises
+      # end-to-end latency almost 1:1 — §11.2 puts AR at 82% of the 109.65s
+      # budget, and §13 P2 lists AR token reduction as the top perf lever.
+      max_tokens: 1024
+      detokenize: true
+      # The DiT engine parses `</recaption><answer><boi><img_size_*><img_ratio_*>`
+      # out of this stage's text output, so special tokens must survive
+      # detokenization and the stop string must be included.
+      skip_special_tokens: false
+      include_stop_str_in_output: true

@@ -1018,10 +1018,44 @@ class OmniDiffusionConfig:
         self.tf_model_config = tf_config
         self._propagate_quantization_from_tf_config(tf_config)
 
+    @staticmethod
+    def _resolve_pipeline_class_name(name: str) -> str | None:
+        """Map a registry key (often an HF architecture) to its pipeline class.
+
+        ``_DIFFUSION_MODELS`` entries are ``(package, module, pipeline_class)``,
+        so the third element is the name the metadata table is keyed by.
+        Imported lazily and defensively: this runs during config construction,
+        and a registry problem must not break model loading over a capability
+        hint.
+        """
+        try:
+            from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+            entry = _DIFFUSION_MODELS.get(name)
+        except Exception:  # pragma: no cover - registry shape changed
+            return None
+        if isinstance(entry, tuple | list) and len(entry) >= 3:
+            return entry[2]
+        return None
+
     def update_multimodal_support(self) -> None:
         # Resolve serving-visible multimodal behavior from shared metadata
         # instead of importing concrete pipeline modules into the config layer.
+        #
+        # model_class_name is not always a PIPELINE class name. Models whose
+        # config.json is transformers-style (no ``_class_name``) fall through to
+        # the generic branch above, which stores the ARCHITECTURE instead — e.g.
+        # HunyuanImage-3.0 stores "HunyuanImage3ForCausalMM" while the metadata
+        # table is keyed by "HunyuanImage3Pipeline". Looking up only the stored
+        # name then silently reports "no multimodal support", and the serving
+        # layer caps such a model at ONE input image — which for HunyuanImage3
+        # rejects its multi-image fusion, the very capability the deploy configs
+        # exist for. Fall back to the registry's architecture -> pipeline mapping.
         metadata = get_diffusion_model_metadata(self.model_class_name)
+        if not metadata.supports_multimodal_inputs and self.model_class_name:
+            pipeline_class_name = self._resolve_pipeline_class_name(self.model_class_name)
+            if pipeline_class_name and pipeline_class_name != self.model_class_name:
+                metadata = get_diffusion_model_metadata(pipeline_class_name)
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
@@ -1177,6 +1211,15 @@ class OmniDiffusionConfig:
                         or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
                         self.model_class_name = architecture
+                    # Every other branch above refreshes multimodal support after
+                    # settling model_class_name; this one did not, so any model
+                    # resolved by architecture kept the dataclass default
+                    # (supports_multimodal_inputs=False). The serving layer reads
+                    # that as "one input image maximum", which silently rejected
+                    # HunyuanImage-3.0's multi-image fusion — the capability its
+                    # deploy configs exist for and that the A100 report validates
+                    # with three reference images.
+                    self.update_multimodal_support()
                 else:
                     raise
 
