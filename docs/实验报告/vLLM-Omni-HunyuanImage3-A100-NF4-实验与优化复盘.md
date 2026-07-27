@@ -1170,4 +1170,3 @@ vLLM-Omni
 最终结论：
 
 > 4×A100 PCIe 40GB、ARM aarch64、256GB RAM、无 NVLink 的单节点，可以把 HunyuanImage-3.0-Instruct-Distil NF4 跑到可部署水平。真正突破点不是 FP4，也不是简单减 KV，而是利用 TP4+EP4 保持每个 NF4 专家完整、使用 vLLM fused MoE，并在 AR/DiT 阶段边界做整引擎 sleep/wake。
-
