@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -20,6 +21,8 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
+    _numpy_owns_its_memory,
+    _reown_foreign_numpy,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -32,6 +35,19 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+def test_reown_foreign_numpy_copies_only_large_borrowed_buffers():
+    large = torch.arange(200_000, dtype=torch.float32).numpy()
+    assert not _numpy_owns_its_memory(large)
+
+    owned = _reown_foreign_numpy({"video": large})["video"]
+    assert owned is not large
+    assert _numpy_owns_its_memory(owned)
+    np.testing.assert_array_equal(owned, large)
+
+    small = torch.arange(8, dtype=torch.float32).numpy()
+    assert _reown_foreign_numpy(small) is small
 
 
 @dataclass

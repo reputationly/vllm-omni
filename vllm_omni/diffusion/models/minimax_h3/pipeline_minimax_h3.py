@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from itertools import groupby
@@ -104,6 +105,7 @@ MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
+MINIMAX_H3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE"
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "21:9": 21.0 / 9.0,
     "16:9": 16.0 / 9.0,
@@ -127,15 +129,32 @@ MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
 }
 
 
+def _local_minimax_h3_partition(path: Path) -> str | None:
+    """Read a local partition from its release metadata, not its directory name."""
+    index_path = path / "model_index.json"
+    if not path.is_dir() or not index_path.is_file():
+        return None
+    try:
+        model_index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    partition = str((model_index.get("_minimax_h3") or {}).get("partition", "")).lower()
+    if partition in {"fl2va", "ref2va"}:
+        return partition
+    if path.name in {"FL2VA", "Ref2VA"}:
+        return path.name.lower()
+    return None
+
+
 def _minimax_h3_partition_for_task(
     task_type: str | None,
     model: str | None = None,
 ) -> str:
     task = str(task_type or "auto").lower()
     if task == "auto" and model is not None:
-        path = Path(model)
-        if path.is_dir() and path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
-            return path.name.lower()
+        local_partition = _local_minimax_h3_partition(Path(model))
+        if local_partition is not None:
+            return local_partition
     if task in {"auto", "combined"}:
         return "combined"
     if task in {"t2va", "fl2va"}:
@@ -167,6 +186,20 @@ def _resolve_minimax_h3_model_root(
             require_all=True,
         )
     )
+
+
+def _resolve_minimax_h3_partition_path(
+    model: str,
+    revision: str | None,
+    partition: str,
+) -> tuple[Path, Path]:
+    """Return ``(repository root, selected partition path)`` for local or HF models."""
+    local_path = Path(model)
+    if local_path.is_dir() and _local_minimax_h3_partition(local_path) == partition:
+        return local_path.parent, local_path
+    model_root = _resolve_minimax_h3_model_root(model, revision, partition)
+    name = "Ref2VA" if partition == "ref2va" else "FL2VA"
+    return model_root, model_root / name
 
 
 def _resolve_component_quant_config(quant_config, component: str):
@@ -573,12 +606,11 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
-        model_root = _resolve_minimax_h3_model_root(
+        model_root, model_path = _resolve_minimax_h3_partition_path(
             str(od_config.model),
             od_config.revision,
             self.partition,
         )
-        model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
         release = model_index.get("_minimax_h3") or {}
         partition = str(release.get("partition", "")).lower()
@@ -1548,6 +1580,7 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._offload_dit_before_vae()
         with self._component_on_device(self.video_vae):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
@@ -1559,6 +1592,41 @@ class MiniMaxH3Pipeline(
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio
+
+    def _offload_dit_before_vae(self) -> None:
+        """Release model-level-offloaded DiTs before full-resolution VAE decode."""
+        if not bool(getattr(self.od_config, "enable_cpu_offload", False)):
+            return
+        if os.getenv(MINIMAX_H3_OFFLOAD_DIT_BEFORE_VAE_ENV, "0") != "1":
+            return
+
+        dit_modules = [getattr(self, name) for name in self._dit_modules]
+        if not any(
+            parameter.device.type == current_omni_platform.device_type
+            for module in dit_modules
+            for parameter in module.parameters()
+        ):
+            return
+
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+        current_omni_platform.synchronize()
+        started = time.perf_counter()
+        free_before = current_omni_platform.get_free_memory()
+        for module in dit_modules:
+            SequentialOffloadHook._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=False,
+                pin_memory=bool(getattr(self.od_config, "pin_cpu_memory", True)),
+            )
+        current_omni_platform.empty_cache()
+        free_after = current_omni_platform.get_free_memory()
+        logger.info(
+            "MiniMax H3 pre-VAE DiT offload: %.3f s, freed %.2f GiB",
+            time.perf_counter() - started,
+            (free_after - free_before) / 1024**3,
+        )
 
     @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:

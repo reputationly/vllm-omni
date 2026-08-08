@@ -12,7 +12,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
@@ -44,10 +44,26 @@ def test_int8_config_with_custom_params():
         "int8",
         activation_scheme="dynamic",
         ignored_layers=["proj_out"],
+        ignored_layers_match="substring",
     )
     assert config is not None
     assert config.activation_scheme == "dynamic"
     assert "proj_out" in config.ignored_layers
+    assert config.ignored_layers_match == "substring"
+
+
+def test_int8_config_rejects_invalid_ignored_layers_match():
+    with pytest.raises(ValueError, match="Unsupported ignored_layers_match"):
+        build_quant_config("int8", ignored_layers_match="prefix")
+
+
+def test_int8_weight_only_config_creation():
+    config = build_quant_config(
+        "int8",
+        is_checkpoint_int8_serialized=True,
+        activation_scheme="weight_only",
+    )
+    assert config.activation_scheme == "weight_only"
 
 
 def test_supported_methods():
@@ -125,6 +141,11 @@ def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
     method = config.get_quant_method(layer, prefix)
     assert isinstance(method, UnquantizedLinearMethod)
 
+    config.ignored_layers = ["text_model"]
+    config.ignored_layers_match = "substring"
+    method = config.get_quant_method(layer, "pipeline.text_model.blocks.0.mlp")
+    assert isinstance(method, UnquantizedLinearMethod)
+
 
 def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test for get_quant_method method for NPU"""
@@ -145,6 +166,21 @@ def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyP
     config.ignored_layers = [prefix]
     method = config.get_quant_method(layer, prefix)
     assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_get_cuda_serialized_weight_only_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod
+
+    config = build_quant_config(
+        "int8",
+        is_checkpoint_int8_serialized=True,
+        activation_scheme="weight_only",
+    )
+    layer = mocker.Mock(spec=LinearBase)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+
+    assert isinstance(config.get_quant_method(layer, "test_layer"), Int8WeightOnlyLinearMethod)
 
 
 def test_fused_layer_can_be_ignored_by_its_prefix(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
@@ -297,7 +333,7 @@ class TestInt8LinearMethod:
 
         assert method.quant_config == mock_quant_config
         init_int8_linear_kernel.assert_called_once_with(
-            is_channelwise=False, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
+            is_channelwise=True, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
         )
         assert method.int8_linear == patch_deps
 
@@ -322,6 +358,39 @@ class TestInt8LinearMethod:
 
         patch_deps.apply_weights.assert_called_once_with(layer, x, bias)
         assert isinstance(output, torch.Tensor)
+
+
+class TestInt8WeightOnlyLinearMethod:
+    def test_process_weights_validates_serialized_layout(self, mocker):
+        from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod
+
+        method = Int8WeightOnlyLinearMethod(mocker.Mock())
+        layer = Module()
+        layer.weight = Parameter(torch.ones((8, 4), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones((8, 1), dtype=torch.float32), requires_grad=False)
+
+        method.process_weights_after_loading(layer)
+        assert layer.weight.shape == (8, 4)
+        assert layer.weight_scale.shape == (8, 1)
+
+    def test_apply_keeps_activations_bf16(self, mocker):
+        from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod
+
+        invoke = mocker.patch("vllm_omni.diffusion.layers.mot.ops.mot_gemm.invoke_mot_gemm")
+        method = Int8WeightOnlyLinearMethod(mocker.Mock())
+        layer = Module()
+        layer.weight = Parameter(torch.ones((8, 4), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones((8, 1), dtype=torch.float32), requires_grad=False)
+        layer.output_size_per_partition = 8
+        x = torch.randn((2, 3, 4), dtype=torch.bfloat16)
+
+        output = method.apply(layer, x)
+
+        assert output.shape == (2, 3, 8)
+        assert output.dtype == torch.bfloat16
+        assert invoke.call_args.kwargs["A"].dtype == torch.bfloat16
+        assert invoke.call_args.kwargs["B_text"].dtype == torch.int8
+        assert invoke.call_args.kwargs["use_int8_w8a16"] is True
 
 
 class TestInt8OnlineLinearMethod:
@@ -355,6 +424,7 @@ class TestInt8OnlineLinearMethod:
         mock_deps["quant"].assert_called_once_with(layer.weight, scale=None)
 
 
+@pytest.mark.npu
 @npu_available
 class TestNPUInt8LinearMethod:
     qweight_mock = torch.randn((128, 64)).to(dtype=torch.int8)
@@ -491,6 +561,7 @@ class TestNPUInt8Smoke:
         assert output.dtype == torch.float16
 
 
+@pytest.mark.cuda
 @cuda_available
 class TestCudaInt8Smoke:
     """Smoke tests using real CUDA kernels, only on CUDA"""
@@ -558,3 +629,36 @@ class TestCudaInt8Smoke:
 
         assert output.shape == (2, 16, 128)
         assert output.dtype == torch.float16
+
+    def test_real_cuda_int8_weight_only_apply_forward(self):
+        """W8A16 keeps BF16 activations and matches dequantized BF16 linear."""
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config, Int8WeightOnlyLinearMethod
+
+        torch.manual_seed(17)
+        output_size, input_size = 128, 64
+        weight = torch.randn(output_size, input_size, dtype=torch.bfloat16, device="cuda")
+        weight_fp32 = weight.float()
+        scale = weight_fp32.abs().amax(dim=1, keepdim=True) / 127.0
+        qweight = torch.round(weight_fp32 / scale).clamp_(-127, 127).to(torch.int8)
+
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+        layer.output_size_per_partition = output_size
+        x = torch.randn(2, 16, input_size, dtype=torch.bfloat16, device="cuda")
+        bias = torch.randn(output_size, dtype=torch.bfloat16, device="cuda")
+
+        method = Int8WeightOnlyLinearMethod(
+            DiffusionInt8Config(
+                is_checkpoint_int8_serialized=True,
+                activation_scheme="weight_only",
+            )
+        )
+        method.process_weights_after_loading(layer)
+        output = method.apply(layer, x, bias)
+        reference_weight = (qweight.float() * scale).to(torch.bfloat16)
+        reference = torch.nn.functional.linear(x, reference_weight, bias)
+
+        assert output.shape == reference.shape
+        assert output.dtype == torch.bfloat16
+        torch.testing.assert_close(output, reference, atol=0.125, rtol=0.02)

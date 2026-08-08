@@ -47,14 +47,20 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
         quant_type: str = "nf4",
         compress_statistics: bool = True,
         ignored_layers: list[str] | None = None,
+        ignored_layers_match: str = "exact",
     ) -> None:
         super().__init__()
 
         if quant_type not in ("nf4", "fp4"):
             raise ValueError(f"Unsupported quant_type {quant_type!r}; expected 'nf4' or 'fp4'")
+        if ignored_layers_match not in ("exact", "substring"):
+            raise ValueError(
+                f"Unsupported ignored_layers_match {ignored_layers_match!r}; expected 'exact' or 'substring'"
+            )
         self.quant_type = quant_type
         self.compress_statistics = compress_statistics
         self.ignored_layers = ignored_layers or []
+        self.ignored_layers_match = ignored_layers_match
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -81,6 +87,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
         quant_type = cls.get_from_keys_or(config, ["quant_type"], "nf4")
         compress_statistics = cls.get_from_keys_or(config, ["compress_statistics"], True)
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers_match = cls.get_from_keys_or(config, ["ignored_layers_match"], "exact")
 
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
@@ -88,6 +95,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
             quant_type=quant_type,
             compress_statistics=compress_statistics,
             ignored_layers=ignored_layers,
+            ignored_layers_match=ignored_layers_match,
         )
 
     def get_quant_method(
@@ -96,10 +104,19 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
         if isinstance(layer, LinearBase):
+            # ``is_layer_skipped`` defaults to whole-prefix equality, which is
+            # what offline checkpoints need: their ``modules_to_not_convert``
+            # lists every layer path in full. Naming a subtree instead --
+            # ``["text_model"]`` to keep the whole text encoder in BF16, or
+            # ``["o_proj", "down_proj"]`` to keep the accuracy-sensitive
+            # projections of every block -- requires the substring matcher.
+            # Opt-in, because switching the default would silently widen the
+            # skip set for every checkpoint that ships an exact list.
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                skip_with_substr=self.ignored_layers_match == "substring",
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_cuda():

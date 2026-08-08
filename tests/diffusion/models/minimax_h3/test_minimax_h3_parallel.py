@@ -25,6 +25,45 @@ def test_grouped_qkv_checkpoint_reorder():
     assert reordered[:, 0].tolist() == [0, 3, 1, 4, 2, 5]
 
 
+def test_qkv_checkpoint_loader_reorders_serialized_channel_scales():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def parameter_with_loader(name: str, shape: tuple[int, ...]) -> nn.Parameter:
+        parameter = nn.Parameter(torch.empty(shape), requires_grad=False)
+
+        def loader(_param, value):
+            captured[name] = value.clone()
+
+        parameter.weight_loader = loader
+        return parameter
+
+    model = object.__new__(MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = SimpleNamespace(num_attention_heads=2, attention_head_dim=1)
+    block = nn.Module()
+    block.attn = nn.Module()
+    block.attn.qkv_proj = nn.Module()
+    block.attn.qkv_proj.register_parameter("weight", parameter_with_loader("weight", (6, 2)))
+    block.attn.qkv_proj.register_parameter("weight_scale", parameter_with_loader("scale", (6, 1)))
+    model.blocks = nn.ModuleList([block])
+
+    grouped_weight = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    grouped_scale = torch.arange(6, dtype=torch.float32).reshape(6, 1)
+    model.load_weights(
+        [
+            ("blocks.0.attn.qkv_proj.weight", grouped_weight),
+            ("blocks.0.attn.qkv_proj.weight_scale", grouped_scale),
+        ]
+    )
+
+    assert captured["weight"][:, 0].tolist() == [0, 6, 2, 8, 4, 10]
+    assert captured["scale"][:, 0].tolist() == [0, 3, 1, 4, 2, 5]
+
+
 def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
     from cache_dit import ForwardPattern
 

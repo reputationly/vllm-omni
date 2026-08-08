@@ -47,8 +47,10 @@ else:
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
-# Dynamic quantization is supported first.
-ACTIVATION_SCHEMES = ["dynamic"]
+# ``dynamic`` is W8A8: activations are quantized per token at runtime.
+# ``weight_only`` is W8A16: activations stay BF16/FP16 and only serialized
+# weights are Int8. The latter currently uses the CUDA Triton GEMM path.
+ACTIVATION_SCHEMES = ["dynamic", "weight_only"]
 
 # Ascend's npu_quant_matmul (QuantBatchMatmulV3) refuses a weight whose last
 # dimension exceeds this, and it fails at the first forward rather than at load
@@ -133,6 +135,7 @@ class DiffusionInt8Config(QuantizationConfig):
         is_checkpoint_int8_serialized: bool = False,
         activation_scheme: str = "dynamic",
         ignored_layers: list[str] | None = None,
+        ignored_layers_match: str = "exact",
     ) -> None:
         super().__init__()
 
@@ -140,8 +143,13 @@ class DiffusionInt8Config(QuantizationConfig):
 
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
+        if ignored_layers_match not in ("exact", "substring"):
+            raise ValueError(
+                f"Unsupported ignored_layers_match {ignored_layers_match!r}; expected 'exact' or 'substring'"
+            )
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.ignored_layers_match = ignored_layers_match
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -170,6 +178,7 @@ class DiffusionInt8Config(QuantizationConfig):
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys_or(config, ["activation_scheme"], "dynamic")
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers_match = cls.get_from_keys_or(config, ["ignored_layers_match"], "exact")
 
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
@@ -177,6 +186,7 @@ class DiffusionInt8Config(QuantizationConfig):
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
+            ignored_layers_match=ignored_layers_match,
         )
 
     def get_quant_method(
@@ -189,6 +199,7 @@ class DiffusionInt8Config(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                skip_with_substr=self.ignored_layers_match == "substring",
             ):
                 return UnquantizedLinearMethod()
             if not self.is_checkpoint_int8_serialized:
@@ -201,8 +212,13 @@ class DiffusionInt8Config(QuantizationConfig):
                 return online_method
             else:
                 if current_omni_platform.is_cuda():
-                    offline_method = Int8LinearMethod(self)
+                    if self.activation_scheme == "weight_only":
+                        offline_method = Int8WeightOnlyLinearMethod(self)
+                    else:
+                        offline_method = Int8LinearMethod(self)
                 elif current_omni_platform.is_npu():
+                    if self.activation_scheme == "weight_only":
+                        raise NotImplementedError("Int8 weight-only (W8A16) is currently supported only on CUDA.")
                     offline_method = NPUInt8LinearMethod(self)
                 else:
                     raise NotImplementedError("The current platform is not supported int8 offline quant.")
@@ -390,7 +406,10 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         super().__init__(quant_config)
 
         self.int8_linear = init_int8_linear_kernel(
-            is_channelwise=False,
+            # Serialized diffusion checkpoints store one scale per output
+            # channel. Treating fused QKV/MLP scales as per-tensor silently
+            # expands only 3/2 scalar scales across whole projections.
+            is_channelwise=True,
             is_static_input_scheme=False,
             input_symmetric=True,
             module_name=self.__class__.__name__,
@@ -406,6 +425,60 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.int8_linear.apply_weights(layer, x, bias)
+
+
+class Int8WeightOnlyLinearMethod(BaseInt8LinearMethod):
+    """CUDA W8A16 method for serialized per-output-channel Int8 weights."""
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if layer.weight.dtype != torch.int8:
+            raise TypeError(f"W8A16 requires Int8 weights, got {layer.weight.dtype}.")
+        if layer.weight_scale.dtype != torch.float32:
+            raise TypeError(f"W8A16 requires float32 weight scales, got {layer.weight_scale.dtype}.")
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(f"W8A16 requires BF16/FP16 activations, got {x.dtype}.")
+
+        from vllm_omni.diffusion.layers.mot.ops.mot_gemm import invoke_mot_gemm
+
+        original_shape = x.shape
+        x_2d = x.reshape(-1, original_shape[-1])
+        output_size = layer.output_size_per_partition
+        output = torch.empty((x_2d.shape[0], output_size), dtype=x.dtype, device=x.device)
+
+        # Reuse the tested MoT W8A16 kernel with one logical expert. A future
+        # routing-free wrapper can replace this correctness-first bridge.
+        text_indices = torch.arange(x_2d.shape[0], dtype=torch.int64, device=x.device)
+        vae_indices = torch.empty(0, dtype=torch.int64, device=x.device)
+        weight_kn = layer.weight.data.t()
+        scale = layer.weight_scale.data
+        invoke_mot_gemm(
+            A=x_2d,
+            B_text=weight_kn,
+            B_vae=weight_kn,
+            C=output,
+            bias_text=bias,
+            bias_vae=bias,
+            text_indices=text_indices,
+            vae_indices=vae_indices,
+            A_scale=None,
+            B_text_scale=scale,
+            B_vae_scale=scale,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=True,
+            use_int4_w4a16=False,
+            A_per_channel_quant=False,
+            B_per_channel_quant=True,
+        )
+
+        return output.reshape(*original_shape[:-1], output_size)
 
 
 class NPUInt8LinearMethod(BaseInt8LinearMethod):

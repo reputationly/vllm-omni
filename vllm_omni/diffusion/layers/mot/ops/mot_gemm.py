@@ -640,8 +640,10 @@ def mot_unified_gemm_kernel(
             STRIDE_BK_IS_1=STRIDE_BK_IS_1,
             STRIDE_BN_IS_1=STRIDE_BN_IS_1,
         )
-    elif QUANT_TYPE == 2 or QUANT_TYPE == 3:  # Weight Only
-        bits = 8 if QUANT_TYPE == 2 else 4
+    elif QUANT_TYPE == 2:  # W8A16 weight only
+        # Pass a literal constexpr.  Assigning ``bits`` through a local
+        # conditional makes current Triton treat it as a runtime scalar and
+        # fails the static assertion in ``_core_weight_only_gemm``.
         c = _core_weight_only_gemm(
             a_ptr,
             cur_b_ptr,
@@ -662,7 +664,35 @@ def mot_unified_gemm_kernel(
             BLOCK_SIZE_N,
             ACCUMULATOR_DTYPE,
             COMPUTE_DTYPE,
-            WEIGHT_BITS=bits,
+            WEIGHT_BITS=8,
+            EVEN_K=EVEN_K,
+            EVEN_N=EVEN_N,
+            STRIDE_AK_IS_1=STRIDE_AK_IS_1,
+            STRIDE_BK_IS_1=STRIDE_BK_IS_1,
+            STRIDE_BN_IS_1=STRIDE_BN_IS_1,
+        )
+    elif QUANT_TYPE == 3:  # Reserved W4A16 branch
+        c = _core_weight_only_gemm(
+            a_ptr,
+            cur_b_ptr,
+            real_row_idxs,
+            m_mask,
+            offs_n,
+            n_mask,
+            offs_k,
+            stride_am,
+            stride_ak,
+            cur_stride_bk,
+            cur_stride_bn,
+            cur_scale_b_ptr,
+            stride_scale_b,
+            K,
+            BLOCK_SIZE_K,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            ACCUMULATOR_DTYPE,
+            COMPUTE_DTYPE,
+            WEIGHT_BITS=4,
             EVEN_K=EVEN_K,
             EVEN_N=EVEN_N,
             STRIDE_AK_IS_1=STRIDE_AK_IS_1,

@@ -191,8 +191,12 @@ def get_mot_shapes(
     hidden_size: int = text_config.hidden_size
     num_attention_heads: int = text_config.num_attention_heads
     num_kv_heads: int = getattr(text_config, "num_key_value_heads", num_attention_heads)
-    head_dim: int = getattr(text_config, "head_dim", hidden_size // num_attention_heads)
-    intermediate_size: int = text_config.intermediate_size
+    head_dim: int = getattr(
+        text_config,
+        "head_dim",
+        getattr(text_config, "attention_head_dim", hidden_size // num_attention_heads),
+    )
+    intermediate_size: int = getattr(text_config, "intermediate_size", None) or getattr(text_config, "ffn_hidden_size")
 
     # ---- Compute per-TP shapes ----
 

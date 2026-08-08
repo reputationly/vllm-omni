@@ -167,12 +167,27 @@ def test_startup_auto_task_uses_explicit_local_partition(tmp_path):
     for directory, partition, tasks in (
         ("FL2VA", "fl2va", ["t2va", "fl2va"]),
         ("Ref2VA", "ref2va", ["ref2va"]),
+        ("MiniMax-H3-FL2VA-INT8", "fl2va", ["t2va", "fl2va"]),
     ):
         model_path = tmp_path / directory
         _write_partition_index(model_path, partition=partition, tasks=tasks)
         assert _minimax_h3_partition_for_task(None, str(model_path)) == partition
         assert _minimax_h3_partition_for_task("auto", str(model_path)) == partition
         assert _minimax_h3_partition_for_task("combined", str(model_path)) == "combined"
+
+
+def test_renamed_local_partition_is_used_directly(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_minimax_h3_partition_path,
+    )
+
+    model_path = tmp_path / "MiniMax-H3-FL2VA-INT8"
+    _write_partition_index(model_path, partition="fl2va", tasks=["t2va", "fl2va"])
+
+    model_root, selected_path = _resolve_minimax_h3_partition_path(str(model_path), None, "fl2va")
+
+    assert model_root == tmp_path
+    assert selected_path == model_path
 
 
 def test_startup_task_rejects_unsupported_value():
@@ -1046,6 +1061,58 @@ def test_video_vae_encode_uses_configured_parallel_tiling():
     assert video_vae.model.encode_calls == [("frames", True)]
     assert rows.shape == (2, 4)
     assert shape == (2, 2, 2)
+
+
+def test_video_vae_revert_frames_uses_bounded_chunks(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    calls: list[int] = []
+
+    class Processor:
+        def revert_tensor(self, value):
+            calls.append(int(value.shape[2]))
+            return value + 0.25
+
+    video_vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(video_vae)
+    video_vae.model = SimpleNamespace(processor=Processor())
+    monkeypatch.setenv("VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK", "2")
+    decoded = torch.arange(20, dtype=torch.float32).reshape(1, 1, 5, 2, 2)
+
+    frames = video_vae._revert_frames(decoded)
+
+    assert calls == [2, 2, 1]
+    assert frames.device.type == "cpu"
+    torch.testing.assert_close(frames, decoded + 0.25)
+
+
+def test_pre_vae_offload_releases_all_resident_dits(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(enable_cpu_offload=True, pin_cpu_memory=False)
+    pipeline._dit_modules = ["transformer", "transformers_ref"]
+    pipeline.transformer = torch.nn.Linear(2, 2, bias=False)
+    pipeline.transformers_ref = torch.nn.Linear(2, 2, bias=False)
+    moved: list[torch.nn.Module] = []
+
+    monkeypatch.setenv("VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE", "1")
+    monkeypatch.setattr(pipeline_module.current_omni_platform, "device_type", "cpu")
+    monkeypatch.setattr(pipeline_module.current_omni_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(pipeline_module.current_omni_platform, "empty_cache", lambda: None)
+    monkeypatch.setattr(pipeline_module.current_omni_platform, "get_free_memory", lambda: 1024**3)
+    monkeypatch.setattr(
+        SequentialOffloadHook,
+        "_move_params",
+        lambda module, *_args, **_kwargs: moved.append(module),
+    )
+
+    pipeline._offload_dit_before_vae()
+
+    assert moved == [pipeline.transformer, pipeline.transformers_ref]
 
 
 def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):

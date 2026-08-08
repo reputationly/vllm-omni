@@ -105,12 +105,9 @@ class TestMoveParamsPinMemory:
         )
         assert not tracker["called"], "pin_memory should not be called for DTensor"
 
-    def test_regular_tensor_calls_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
-        """Regular tensor should call pin_memory when moving to CPU."""
+    def test_regular_tensor_uses_pinned_landing_buffer(self, accelerator_device):
+        """A device-created tensor should land in a pinned reusable buffer."""
         module = _create_simple_module().to(accelerator_device)
-        tracker, mock_pin = _track_pin_memory_calls()
-
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
         hook = SequentialOffloadHook(
             offload_targets=[],
             device=accelerator_device,
@@ -123,7 +120,31 @@ class TestMoveParamsPinMemory:
             non_blocking=False,
             pin_memory=True,
         )
-        assert tracker["called"], "pin_memory should be called for regular tensors"
+        assert all(owner.is_pinned() for owner in (*module.parameters(), *module.buffers()))
+
+    def test_existing_cpu_home_is_reused_on_swap_out(self, accelerator_device):
+        """Read-only weights should return to their original CPU storage."""
+        module = _create_simple_module()
+        owners = (*module.parameters(), *module.buffers())
+        cpu_home_ptrs = {id(owner): owner.data.data_ptr() for owner in owners}
+        hook = SequentialOffloadHook(
+            offload_targets=[],
+            device=accelerator_device,
+            pin_memory=True,
+            use_hsdp=False,
+        )
+
+        hook._move_params(module, accelerator_device, non_blocking=False)
+        hook._move_params(
+            module,
+            torch.device("cpu"),
+            non_blocking=False,
+            pin_memory=True,
+        )
+
+        for owner in owners:
+            assert owner.data.data_ptr() == cpu_home_ptrs[id(owner)]
+            assert not hasattr(owner, hook._CPU_SHADOW_ATTR)
 
     def test_pin_memory_skipped_when_disabled(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
         """pin_memory should not be called when pin_memory=False."""

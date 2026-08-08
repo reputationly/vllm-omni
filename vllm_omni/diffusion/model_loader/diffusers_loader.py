@@ -102,6 +102,37 @@ def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> typ
     )
 
 
+# Methods whose configs describe an already-quantized checkpoint. Loading these
+# weights on an accelerator before CPU offload is wasted work and can OOM.
+_STATIC_QUANT_METHODS = frozenset(
+    {
+        "auto-round",
+        "inc",
+        "gptq",
+        "gptq-marlin",
+        "awq",
+        "awq-marlin",
+        "compressed-tensors",
+        "modelopt",
+    }
+)
+
+
+def _is_checkpoint_quantized(quant_cfg: object) -> bool:
+    """Whether ``quant_cfg`` represents weights already packed on disk."""
+    if getattr(quant_cfg, "is_checkpoint_quantized", False):
+        return True
+    if getattr(quant_cfg, "data_type", None) == "mx_fp":
+        return True
+    for key, value in vars(quant_cfg).items():
+        if value and key.startswith("is_checkpoint_") and key.endswith("_serialized"):
+            return True
+    get_name = getattr(quant_cfg, "get_name", None)
+    if callable(get_name):
+        return str(get_name()).lower().replace("_", "-") in _STATIC_QUANT_METHODS
+    return False
+
+
 class DiffusersPipelineLoader:
     """Model loader that can load diffusers pipeline components from disk."""
 
@@ -341,9 +372,7 @@ class DiffusersPipelineLoader:
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
+            is_offline = _is_checkpoint_quantized(quant_cfg)
             if not is_offline:
                 load_device = device.type
                 offload_after_quant = True

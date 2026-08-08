@@ -988,9 +988,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if name.endswith(".attn.qkv_proj.weight"):
+            if name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
                 # Transform checkpoint layout before entering vLLM's loader so
-                # online FP8 can keep ``online_process_loader`` outermost.
+                # online FP8 can keep ``online_process_loader`` outermost. A
+                # serialized per-channel INT8 scale has the same row layout as
+                # its weight and must be reordered in lockstep.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
                     loaded_weight,
                     num_query_groups=self.arch.num_attention_heads,

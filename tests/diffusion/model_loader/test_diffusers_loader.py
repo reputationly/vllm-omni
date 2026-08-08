@@ -15,7 +15,10 @@ from vllm.config.load import LoadConfig
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.diffusers_loader import (
+    DiffusersPipelineLoader,
+    _is_checkpoint_quantized,
+)
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.registry import initialize_model
 
@@ -108,6 +111,41 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
 
     with pytest.raises(ValueError, match="vae.weight"):
         loader.load_weights(model)
+
+
+def test_checkpoint_quantized_detection_accepts_static_and_serialized_methods():
+    class Config:
+        def __init__(self, name: str, **kwargs):
+            self._name = name
+            self.__dict__.update(kwargs)
+
+        def get_name(self):
+            return self._name
+
+    assert _is_checkpoint_quantized(Config("bitsandbytes")) is False
+    assert _is_checkpoint_quantized(Config("int8")) is False
+    assert _is_checkpoint_quantized(Config("auto-round")) is True
+    assert _is_checkpoint_quantized(Config("gptq", is_checkpoint_gptq_serialized=True)) is True
+    assert _is_checkpoint_quantized(Config("auto-round", data_type="mx_fp")) is True
+
+
+def test_online_quant_cpu_offload_request_uses_latest_upstream_protocol():
+    class _OnlineQuantMethod:
+        supports_offload_after_quant = True
+
+        def __init__(self):
+            self.enabled = False
+
+        def enable_offload_after_quant(self):
+            self.enabled = True
+
+    model = nn.Module()
+    model.proj = nn.Linear(2, 2, bias=False)
+    method = _OnlineQuantMethod()
+    model.proj.quant_method = method
+
+    assert DiffusersPipelineLoader._request_offload_after_quant(model) == 1
+    assert method.enabled
 
 
 class _ConfigAwareModel(nn.Module):

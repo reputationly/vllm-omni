@@ -1,0 +1,78 @@
+{
+  "1792_5376": {
+    "_comment": "model=MiniMax-H3|tp=4|op=O_PROJ|A100-PCIE-40GB",
+    "6912": {
+      "BLOCK_SIZE_M": 256,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "109312": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 32,
+      "GROUP_SIZE_M": 4,
+      "num_warps": 4,
+      "num_stages": 3
+    }
+  },
+  "3584_5376": {
+    "_comment": "model=MiniMax-H3|tp=4|op=FFN_DOWN_PROJ|A100-PCIE-40GB",
+    "6912": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 32,
+      "GROUP_SIZE_M": 4,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "109312": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 32,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 3
+    }
+  },
+  "5376_5376": {
+    "_comment": "model=MiniMax-H3|tp=4|op=QKV_PROJ|A100-PCIE-40GB",
+    "6912": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 64,
+      "GROUP_SIZE_M": 4,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "109312": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 32,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 3
+    }
+  },
+  "5376_7168": {
+    "_comment": "model=MiniMax-H3|tp=4|op=FFN_GATE_UP_PROJ|A100-PCIE-40GB",
+    "6912": {
+      "BLOCK_SIZE_M": 256,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "109312": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 32,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 3
+    }
+  }
+}

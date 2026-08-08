@@ -8,11 +8,13 @@ rows stay pinned to their noised step-0 anchors.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
@@ -22,6 +24,8 @@ from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
 )
 
+logger = init_logger(__name__)
+
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
@@ -29,6 +33,26 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+
+_LOG_STEP_MEMORY = os.getenv("VLLM_OMNI_H3_LOG_STEP_MEMORY", "0") == "1"
+
+
+def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tensor) -> None:
+    if not _LOG_STEP_MEMORY or not torch.cuda.is_available():
+        return
+    free, total = torch.cuda.mem_get_info()
+    gib = 1024**3
+    logger.info(
+        "H3 denoise step %d: rows video=%d audio=%d | driver free %.2f/%.2f GiB | "
+        "torch allocated %.2f GiB reserved %.2f GiB",
+        step,
+        int(video_rows.shape[0]),
+        int(audio_rows.shape[0]),
+        free / gib,
+        total / gib,
+        torch.cuda.memory_allocated() / gib,
+        torch.cuda.memory_reserved() / gib,
+    )
 
 
 class MiniMaxH3DenoiseBranch:
@@ -222,6 +246,7 @@ def minimax_h3_denoise_loop(
                 imgvid_cond_timestep=imgvid_cond_t,
                 audio_ref_cond_timestep=audio_ref_cond_t,
             )
+            _log_step_memory(step, video_rows, audio_rows)
             with torch.inference_mode():
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import os
 import queue
 import threading
 import time
@@ -55,13 +56,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+# Bounds only the finished-result handoff, not generation. Large video payloads
+# can exceed the old hard-coded 30 seconds on a memory-pressured host.
+_ASYNC_OUTPUT_TIMEOUT = float(os.getenv("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S", "300"))
 
 __all__ = [
     "DiffusionEngine",
     "DiffusionExecutionMode",
     "_RpcTask",
+    "_borrowing_ancestor",
     "_move_tensor_tree_to_cpu",
+    "_numpy_owns_its_memory",
+    "_reown_foreign_numpy",
     "get_dummy_run_num_frames",
     "image_color_format",
     "supports_audio_output",
@@ -135,6 +141,64 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
         return [_move_tensor_tree_to_cpu(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_move_tensor_tree_to_cpu(item) for item in value)
+    return value
+
+
+_REOWN_MIN_BYTES = 512 * 1024
+
+
+def _numpy_owns_its_memory(array: np.ndarray) -> bool:
+    """Whether ``array``'s buffer came from numpy rather than being borrowed."""
+    root: object = array
+    while isinstance(root, np.ndarray) and root.base is not None:
+        root = root.base
+    return isinstance(root, np.ndarray)
+
+
+def _borrowing_ancestor(array: np.ndarray) -> np.ndarray:
+    """Return the array in a view chain that directly holds foreign memory."""
+    parent = array
+    while isinstance(parent.base, np.ndarray):
+        parent = parent.base
+    return parent
+
+
+def _foreign_buffer(array: np.ndarray):
+    if _numpy_owns_its_memory(array):
+        return None
+    parent = _borrowing_ancestor(array)
+    return parent if parent.nbytes >= _REOWN_MIN_BYTES else None
+
+
+def _owned_copy(array: np.ndarray) -> np.ndarray:
+    """Make a C-contiguous numpy-owned copy without a slow strided gather."""
+    if array.flags.c_contiguous:
+        return np.array(array, copy=True)
+    try:
+        owned = np.empty(array.shape, dtype=array.dtype)
+        torch.from_numpy(owned).copy_(torch.from_numpy(array))
+    except (TypeError, RuntimeError, ValueError):
+        return np.array(array, copy=True, order="C")
+    return owned
+
+
+def _reown_foreign_numpy(value: object) -> object:
+    """Copy large numpy views that borrow another allocator's memory.
+
+    Diffusion post-processing runs on the engine thread while the API thread
+    releases the result. On mimalloc builds, freeing a large torch-backed numpy
+    view from that foreign thread can retain a dedicated huge segment for the
+    process lifetime. Re-owning it here keeps the foreign buffer's allocation
+    and release on the engine thread and gives downstream a numpy-owned buffer.
+    """
+    if isinstance(value, np.ndarray):
+        return value if _foreign_buffer(value) is None else _owned_copy(value)
+    if isinstance(value, dict):
+        return {key: _reown_foreign_numpy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_reown_foreign_numpy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_reown_foreign_numpy(item) for item in value)
     return value
 
 
@@ -401,6 +465,7 @@ class DiffusionEngine:
         else:
             outputs = output_data
 
+        outputs = _reown_foreign_numpy(outputs)
         postprocess_output = normalize_diffusion_postprocess_output(outputs)
 
         return format_diffusion_outputs(

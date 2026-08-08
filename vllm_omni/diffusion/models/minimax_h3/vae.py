@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,23 @@ from .packed_tokens import minimax_h3_patchify_video_latent
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+# Bound post-decode denormalization memory independently of clip length.
+MINIMAX_H3_REVERT_FRAME_CHUNK = 16
+MINIMAX_H3_REVERT_FRAME_CHUNK_ENV = "VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK"
+
+
+def _revert_frame_chunk() -> int:
+    raw = os.getenv(MINIMAX_H3_REVERT_FRAME_CHUNK_ENV)
+    if raw is None:
+        return MINIMAX_H3_REVERT_FRAME_CHUNK
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{MINIMAX_H3_REVERT_FRAME_CHUNK_ENV} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{MINIMAX_H3_REVERT_FRAME_CHUNK_ENV} must be >= 1, got {value}")
+    return value
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -294,12 +312,40 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             dtype=latent.dtype,
         ).view(1, channels, 1, 1, 1)
         decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+        return self._revert_frames(decoded)
+
+    @staticmethod
+    def _as_video_5d(frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
-        return frames.float()
+        return frames
+
+    @torch.inference_mode()
+    def _revert_frames(self, decoded: torch.Tensor) -> torch.Tensor:
+        """Denormalize decoded frames in bounded chunks directly into host memory."""
+        if decoded.ndim != 5:
+            return self._as_video_5d(self.model.processor.revert_tensor(decoded)).float().cpu()
+
+        total = int(decoded.shape[2])
+        if total == 0:
+            raise ValueError(f"unexpected decoded video shape {tuple(decoded.shape)}")
+
+        frames: torch.Tensor | None = None
+        chunk = _revert_frame_chunk()
+        for start in range(0, total, chunk):
+            part = self._as_video_5d(self.model.processor.revert_tensor(decoded[:, :, start : start + chunk])).float()
+            if frames is None:
+                frames = torch.empty(
+                    (part.shape[0], part.shape[1], total, part.shape[3], part.shape[4]),
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+            frames[:, :, start : start + part.shape[2]].copy_(part)
+            del part
+        assert frames is not None
+        return frames
 
 
 class MiniMaxH3AudioVAE(nn.Module):
