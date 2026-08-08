@@ -24,6 +24,8 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import logging
 
+from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
+
 try:
     from transformers import AutoVideoProcessor
 except ImportError:
@@ -479,23 +481,10 @@ class MingFlashOmniProcessor(ProcessorMixin):
         return list(dict.fromkeys(names))
 
 
-# transformers >= 5.5 requires the config *class* (not a model_type string) as the
-# first arg to register — it does ``key.__module__`` internally, so passing a string
-# raises ``AttributeError: 'str' object has no attribute '__module__'`` at import time
-# and crashes ANY model whose import chain touches this module (e.g. AudioX via
-# ``transformers_utils/processors/__init__``). Match the gr00t fix
-# (``AutoProcessor.register(Gr00tN1d7Config, ...)``). Wrapped defensively so a future
-# transformers API change can't crash unrelated model imports again.
-try:
-    from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniConfig
-
-    AutoFeatureExtractor.register(MingFlashOmniConfig, MingWhisperFeatureExtractor)
-    AutoProcessor.register(MingFlashOmniConfig, MingFlashOmniProcessor)
-except Exception as _ming_reg_err:  # pragma: no cover - defensive
-    import logging
-
-    logging.getLogger(__name__).warning(
-        "Ming processor auto-registration skipped (%s); Ming models may not auto-resolve "
-        "their processor, but unrelated model imports are unaffected.",
-        _ming_reg_err,
-    )
+# transformers >= 5.x requires the config *class* (not a string) as the first
+# arg to AutoFeatureExtractor/AutoProcessor.register — it does `key.__module__`
+# internally. Passing "MingWhisperFeatureExtractor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# Same API change as minicpmo_4_5_omni_llm.py / processing_gr00t_n1d7.py.
+AutoFeatureExtractor.register(BailingMM2Config, MingWhisperFeatureExtractor, exist_ok=True)
+AutoProcessor.register(BailingMM2Config, MingFlashOmniProcessor, exist_ok=True)

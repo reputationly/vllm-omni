@@ -24,7 +24,9 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
     extract_language_from_request,
+    extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
 
@@ -622,15 +624,11 @@ def thinker2talker_token_only(
 
     After the communication-layer refactor, this function only allocates a
     placeholder ``prompt_token_ids`` of the correct length so the scheduler can
-    reserve KV-cache slots. It does **not** forward bulk tensors or voice
-    metadata.
+    reserve KV-cache slots. It does **not** forward bulk tensors.
 
-    Bulk talker conditioning (embed / hidden_states / ids) and per-request
-    voice metadata (``speaker`` / ``language``) are packed by Stage-0
-    ``thinker2talker_full_payload`` via ``extract_speaker_from_request`` /
-    ``extract_language_from_request``, sent over the connector, and merged into
-    the Talker worker's ``model_intermediate_buffer`` on recv. The orchestrator
-    path therefore sets ``additional_information=None``.
+    Bulk talker conditioning is sent through the connector. Speaker and
+    language are also copied from the original prompt so they survive when
+    Stage-0 request metadata is unavailable to the connector payload.
 
     ``prompt`` / ``requires_multimodal_data`` are kept for call-site signature
     compatibility with other orchestrator input processors; they are unused.
@@ -655,10 +653,17 @@ def thinker2talker_token_only(
         thinker_input_ids = prompt_token_ids
         info_for_len = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
         prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
+        # Keep this fallback until the connector reliably preserves voice metadata.
+        additional_information = to_dict(
+            OmniPayloadStruct(
+                speaker=extract_speaker_from_prompt(prompt, index=i),
+                language=extract_language_from_prompt(prompt, index=i),
+            )
+        )
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
-                additional_information=None,
+                additional_information=additional_information or None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
@@ -680,19 +685,32 @@ def talker2code2wav_async_chunk(
     """
     Multimodal output version.
     """
-    if not isinstance(multimodal_output, Mapping):
-        return None
-    talker_codes = multimodal_output.get("codes", {})
-    if not isinstance(talker_codes, dict):
-        return None
-    code_predictor_codes = talker_codes.get("audio")
-    if code_predictor_codes is None:
-        return None
+    request_id = request.external_req_id
+    code_predictor_codes = None
+    if isinstance(multimodal_output, Mapping):
+        talker_codes = multimodal_output.get("codes", {})
+        if isinstance(talker_codes, dict):
+            code_predictor_codes = talker_codes.get("audio")
 
-    if code_predictor_codes.numel() == 0:
-        return None
+    sampling_params = getattr(request, "sampling_params", None)
+    stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
+    stop_token_id = getattr(sampling_params, "stop_token_id", None)
+    if stop_token_id is not None:
+        stop_token_ids.add(stop_token_id)
 
-    if not code_predictor_codes.any():
+    append_codes = (
+        isinstance(code_predictor_codes, torch.Tensor)
+        and code_predictor_codes.numel() > 0
+        and bool(code_predictor_codes.any())
+    )
+    if append_codes:
+        first_codebook = int(code_predictor_codes[0, 0].item())
+        if first_codebook in stop_token_ids:
+            logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
+            append_codes = False
+    if append_codes:
+        transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
+    elif not is_finished:
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -702,20 +720,10 @@ def talker2code2wav_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    sampling_params = getattr(request, "sampling_params", None)
-    stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
-    stop_token_id = getattr(sampling_params, "stop_token_id", None)
-    if stop_token_id is not None:
-        stop_token_ids.add(stop_token_id)
-    first_codebook = int(code_predictor_codes[0, 0].item())
-    if first_codebook in stop_token_ids:
-        logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
-        return None
-
-    request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
-    transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    if length <= 0:
+        return None
 
     if configured_initial_chunk_size > 0:
         if chunk_id == 0:
@@ -725,6 +733,9 @@ def talker2code2wav_async_chunk(
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:
+        return None
+
+    if is_finished and not append_codes and chunk_length == 0:
         return None
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config
