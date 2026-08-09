@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import gc
 import multiprocessing as mp
 import queue
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -836,6 +838,34 @@ class TestWorkerProcRpcRankStatus:
             )
 
         assert excinfo.value is original
+
+    def test_execute_rpc_drops_nonreply_rank_result_immediately(self):
+        proc = self._make_worker_proc()
+        proc.gpu_id = 1
+        references = []
+
+        def make_output(*_args, **_kwargs):
+            output = torch.ones(16)
+            references.append(weakref.ref(output))
+            return output
+
+        proc.worker.execute_method = Mock(side_effect=make_output)
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "forward",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+                "collect_rank_status": False,
+            }
+        )
+
+        gc.collect()
+        assert result is None
+        assert should_reply is False
+        assert references[0]() is None
 
 
 # ───────── error handling: EngineDeadError propagation through layers ─────

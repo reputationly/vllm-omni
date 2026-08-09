@@ -70,13 +70,24 @@ def _tensor_to_shm(
     The shared memory segment remains alive after this call (the local fd is
     closed, but the segment persists until ``_tensor_from_shm`` unlinks it).
 
-    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` with
-    ``pin_memory=True`` on that stream instead of the synchronous ``.cpu()``
-    path.  The caller must synchronize *d2h_stream* after all tensors are
-    packed.
+    If *d2h_stream* is provided for a device tensor, the D2H copy uses
+    ``copy_()`` with ``pin_memory=True`` on that stream instead of the
+    synchronous ``.cpu()`` path.  An existing CPU tensor skips the redundant
+    pinned staging allocation, but still waits for the stream before its
+    storage is read in case an asynchronous producer is filling it.
     """
     original_dtype = tensor.dtype
-    if d2h_stream is not None:
+    # Some pipelines (notably MiniMax H3's bounded video-VAE revert path)
+    # already return large CPU tensors.  The async-output thread still passes
+    # its D2H stream here, but staging an existing CPU tensor through a second
+    # pinned CPU allocation only adds a full-size host copy before SHM packing.
+    # Reserve pinned staging for actual device-to-host transfers.
+    if d2h_stream is not None and tensor.device.type == "cpu":
+        d2h_stream.synchronize()
+        tensor = tensor.detach().contiguous()
+        if original_dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float32)
+    elif d2h_stream is not None:
         # Non-blocking D2H: copy on side stream to pinned CPU memory.
         old_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(d2h_stream)

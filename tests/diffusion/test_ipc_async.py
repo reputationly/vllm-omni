@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for IPC async D2H stream packing."""
 
+from unittest.mock import MagicMock
+
+import numpy as np
 import pytest
 import torch
 
@@ -10,6 +13,7 @@ from vllm_omni.diffusion.ipc import (
     _pack_diffusion_fields,
     _pack_tensor_if_large,
     _pack_value_if_large,
+    _tensor_to_shm,
     pack_diffusion_output_shm,
 )
 
@@ -33,6 +37,38 @@ class TestPackTensorIfLargeWithD2hStream:
         result = _pack_tensor_if_large(large_tensor, d2h_stream=None)
         assert isinstance(result, dict)
         assert result.get("__tensor_shm__") is True
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_cpu_tensor_skips_pinned_staging_with_stream(self, monkeypatch, dtype):
+        import vllm_omni.diffusion.ipc as ipc
+
+        source = torch.arange(12, dtype=torch.float32).reshape(3, 4).T.to(dtype)
+        captured = {}
+        empty_calls = []
+        real_empty = torch.empty
+
+        def fake_array_to_shm(array):
+            captured["array"] = array.copy()
+            return {"name": "mock", "shape": list(array.shape), "numpy_dtype": str(array.dtype)}
+
+        def tracking_empty(*args, **kwargs):
+            empty_calls.append(kwargs.copy())
+            return real_empty(*args, **kwargs)
+
+        monkeypatch.setattr(ipc, "_array_to_shm", fake_array_to_shm)
+        monkeypatch.setattr(torch, "empty", tracking_empty)
+        d2h = MagicMock()
+
+        result = _tensor_to_shm(source, d2h_stream=d2h)
+
+        assert result["torch_dtype"] == str(dtype)
+        expected = source.float().contiguous().numpy()
+        assert captured["array"].flags.c_contiguous
+        assert captured["array"].dtype == np.float32
+        np.testing.assert_array_equal(captured["array"], expected)
+        assert not any(kwargs.get("pin_memory") is True for kwargs in empty_calls)
+        d2h.wait_event.assert_not_called()
+        d2h.synchronize.assert_called_once_with()
 
     def test_pack_value_if_large_passes_stream_to_tensor_pack(self, mocker):
         """_pack_value_if_large propagates d2h_stream to _pack_tensor_if_large."""

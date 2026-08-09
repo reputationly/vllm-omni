@@ -76,6 +76,8 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
         extra_args={"task": "t2va", "aspect_ratio": "16:9"},
     )
     assert output.output == pipeline.decode.return_value
+    assert output.output[0] is pipeline.decode.return_value[0]
+    assert output.output[1] is pipeline.decode.return_value[1]
 
 
 def test_pipeline_import_registry_and_component_discovery():
@@ -98,6 +100,42 @@ def test_pipeline_import_registry_and_component_discovery():
     assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformers_ref"]
     assert MiniMaxH3Pipeline._encoder_modules == ["text_encoder"]
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_minimax_h3_postprocess_writes_owned_bitwise_equivalent_video(dtype):
+    from vllm_omni.diffusion.diffusion_engine import (
+        _numpy_owns_its_memory,
+        _reown_foreign_numpy,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+
+    video = (
+        torch.linspace(-0.5, 1.5, 2 * 3 * 17 * 2 * 3, dtype=torch.float32)
+        .reshape(2, 3, 17, 3, 2)
+        .transpose(-1, -2)
+        .to(dtype)
+    )
+    assert not video.is_contiguous()
+    video[0, 0, 0, 0, 0] = float("nan")
+    video[0, 0, 0, 0, 1] = float("inf")
+    video[0, 0, 0, 0, 2] = float("-inf")
+    video[0, 0, 0, 1, 0] = -0.0
+    audio = torch.arange(24, dtype=torch.float32).reshape(1, 2, 12)
+    oracle = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
+
+    result = _minimax_h3_post_process((video, audio))
+
+    assert len(result["video"]) == 2
+    for expected, actual in zip(oracle, result["video"], strict=True):
+        assert actual.dtype == np.float32
+        assert actual.flags.c_contiguous
+        assert _numpy_owns_its_memory(actual)
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        assert _reown_foreign_numpy(actual) is actual
+    np.testing.assert_array_equal(result["audio"], audio.numpy())
 
 
 def _write_partition_index(path, *, partition, tasks):

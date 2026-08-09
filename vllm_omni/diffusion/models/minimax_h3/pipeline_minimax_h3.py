@@ -220,7 +220,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "latent":
         return output
     if output_type == "np":
-        video = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
+        video = _minimax_h3_video_to_owned_numpy(video)
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
@@ -229,6 +229,38 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
         "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
         "fps": MINIMAX_H3_FPS,
     }
+
+
+def _minimax_h3_video_to_owned_numpy(video: torch.Tensor) -> np.ndarray:
+    """Convert NCTHW video to an owned, contiguous float32 NTHWC array.
+
+    H3's VAE revert path normally supplies a multi-GiB CPU float32 tensor.
+    Building ``permute().clamp().numpy()`` first leaves NumPy borrowing a
+    torch allocation, so the engine's allocator-safety pass must copy the
+    entire video again.  Write the clamp result directly into the final
+    NumPy-owned buffer instead.  Frame chunking bounds temporary iterator
+    state without changing the normalized float32 output contract.
+    """
+
+    source = video.detach().float().cpu()
+    if source.ndim != 5:
+        raise ValueError(f"MiniMax H3 video output must be NCTHW, got {tuple(source.shape)}")
+    batch, channels, frames, height, width = (int(value) for value in source.shape)
+    output = np.empty(
+        (batch, frames, height, width, channels),
+        dtype=np.float32,
+        order="C",
+    )
+    output_tensor = torch.from_numpy(output)
+    source_nthwc = source.permute(0, 2, 3, 4, 1)
+    frame_chunk = 16
+    for start in range(0, frames, frame_chunk):
+        end = min(start + frame_chunk, frames)
+        # Keep clamp's exact value semantics, including the sign bit of -0.0.
+        # The ``out=`` form changes -0.0 to +0.0 on some torch builds.
+        clamped = source_nthwc[:, start:end].clamp(0, 1)
+        output_tensor[:, start:end].copy_(clamped)
+    return output
 
 
 def get_minimax_h3_post_process_func(
@@ -1861,8 +1893,11 @@ class MiniMaxH3Pipeline(
             video, audio = self.decode(video_latent, audio_latent, height=height, width=width)
             videos.append(video)
             audios.append(audio)
-        video = torch.cat(videos, dim=0)
-        audio = torch.cat(audios, dim=0)
+        # ``num_outputs_per_prompt`` is normally one.  Avoid copying the
+        # complete decoded CPU result merely to concatenate a one-item list;
+        # for 768p/15s that copy is 4.18 GiB on every rank.
+        video = videos[0].contiguous() if len(videos) == 1 else torch.cat(videos, dim=0)
+        audio = audios[0].contiguous() if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

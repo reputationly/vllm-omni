@@ -1061,9 +1061,14 @@ class WorkerProc:
 
         if rpc_exception is not None:
             raise rpc_exception
+        # Non-reply ranks still execute collectives and the full forward, but
+        # their result is not observable by the caller.  Do not retain a large
+        # CPU output in the busy-loop frame until the next RPC finishes.
+        if not should_reply:
+            return None, False
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
-        return result, should_reply
+        return result, True
 
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
