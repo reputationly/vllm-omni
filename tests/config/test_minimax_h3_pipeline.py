@@ -30,6 +30,7 @@ _MODEL_INDEX = {"_class_name": "MiniMaxH3Pipeline"}
 # The production checkpoint path. Normalized it becomes "minimaxh3fl2vaint8",
 # which *contains* "minimaxh3" — hence the key is not spelled "minimax_h3".
 _PROD_MODEL_PATH = "/nfs-data/models/MiniMax-H3-FL2VA-INT8"
+_REF2VA_MODEL_PATH = "/nfs-data/models/MiniMax-H3/Ref2VA"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -131,6 +132,8 @@ def test_deploy_yaml_pipeline_field_selects_h3():
     [
         (Path(get_deploy_config_path("minimax_h3_dit.yaml")), 1, 1),
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_a100_40g.yaml", 4, 4),
+        (_REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_bf16_a100_40g.yaml", 4, 4),
+        (_REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_w8a8_a100_40g.yaml", 4, 4),
     ],
 )
 def test_shipped_deploy_configs_merge_to_four_cards(
@@ -138,9 +141,6 @@ def test_shipped_deploy_configs_merge_to_four_cards(
     text_encoder_tp_size: int,
     vae_patch_parallel_size: int,
 ):
-    if not deploy_path.is_file():  # pragma: no cover - defensive
-        pytest.skip(f"{deploy_path} not present")
-
     deploy = load_deploy_config(deploy_path)
     assert deploy.pipeline == _PIPELINE_KEY
     assert deploy.trust_remote_code is True
@@ -166,9 +166,6 @@ def test_shipped_deploy_configs_merge_to_four_cards(
 
 def test_a100_profile_carries_measured_memory_settings():
     deploy_path = _REPO_ROOT / "deploy-configs" / "minimax_h3_a100_40g.yaml"
-    if not deploy_path.is_file():  # pragma: no cover - defensive
-        pytest.skip(f"{deploy_path} not present")
-
     deploy = load_deploy_config(deploy_path)
     (stage,) = deploy.stages
     assert stage.devices == "0,1,2,3"
@@ -181,3 +178,49 @@ def test_a100_profile_carries_measured_memory_settings():
     assert stage.diffusion_attention_backend == "FLASH_ATTN"
     assert stage.diffusion_compile_granularity == "regional"
     assert stage.default_sampling_params == {"num_inference_steps": 20}
+
+
+def test_ref2va_a100_profile_pins_partition_and_bf16_runtime():
+    deploy_path = _REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_bf16_a100_40g.yaml"
+    deploy = load_deploy_config(deploy_path)
+    (stage,) = deploy.stages
+    (merged_stage,) = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+
+    assert deploy.pipeline == _PIPELINE_KEY
+    assert deploy.quantization is None
+    assert stage.engine_extras["task_type"] == "ref2va"
+    assert merged_stage.yaml_engine_args["task_type"] == "ref2va"
+    assert merged_stage.yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 4
+    assert stage.enable_cpu_offload is True
+    assert stage.vae_use_tiling is True
+    assert stage.max_num_seqs == 1
+
+    with (
+        patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+        patch(
+            "vllm_omni.config.config_factory.get_hf_file_to_dict",
+            side_effect=_h3_checkpoint_files,
+        ),
+    ):
+        pipeline = StageConfigFactory.get_pipeline_config(
+            model=_REF2VA_MODEL_PATH,
+            trust_remote_code=True,
+            user_deploy_config=deploy,
+        )
+
+    assert pipeline is not None
+    assert pipeline.model_type == _PIPELINE_KEY
+
+
+def test_ref2va_w8a8_profile_uses_checkpoint_quantization_only():
+    deploy_path = _REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_w8a8_a100_40g.yaml"
+    deploy = load_deploy_config(deploy_path)
+    (stage,) = deploy.stages
+    (merged_stage,) = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+
+    # The serialized transformer/config.json is authoritative.  A deploy-time
+    # quantization flag would select the online path and re-quantize it.
+    assert deploy.quantization is None
+    assert stage.diffusion_quantization_config is None
+    assert merged_stage.yaml_engine_args["task_type"] == "ref2va"
+    assert merged_stage.yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 4

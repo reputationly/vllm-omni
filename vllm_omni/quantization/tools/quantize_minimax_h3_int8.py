@@ -197,8 +197,15 @@ def main() -> int:
 
     with open(os.path.join(dst_tf, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
+    # The source index's total_size describes the BF16 payload.  Keeping that
+    # stale value makes storage audits and download planners overstate the
+    # serialized INT8 checkpoint by tens of GiB even though the loader itself
+    # only consumes weight_map.  Preserve other metadata, but publish the real
+    # byte count of every tensor written above.
+    index_metadata = dict(index.get("metadata", {}))
+    index_metadata["total_size"] = total_dst
     with open(os.path.join(dst_tf, "model.safetensors.index.json"), "w", encoding="utf-8") as fh:
-        json.dump({"metadata": index.get("metadata", {}), "weight_map": new_weight_map}, fh, indent=2)
+        json.dump({"metadata": index_metadata, "weight_map": new_weight_map}, fh, indent=2)
 
     for extra in os.listdir(src_tf):
         if extra.endswith(".safetensors") or extra in ("config.json", "model.safetensors.index.json"):
@@ -222,7 +229,21 @@ def main() -> int:
     # quantize these already-Int8 tensors again.  The loader picks the method up
     # from transformer/config.json, which is also what marks the checkpoint as
     # serialized and therefore loadable straight onto the host under offload.
-    print(f"serve with:  vllm serve {args.dst} --omni   (no --quantization flag)")
+    deploy_cfg = "/deploy-configs/minimax_h3_a100_40g.yaml"
+    model_index_path = os.path.join(args.src, "model_index.json")
+    if os.path.isfile(model_index_path):
+        try:
+            with open(model_index_path, encoding="utf-8") as fh:
+                model_index = json.load(fh)
+            partition = model_index.get("_minimax_h3", {}).get("partition")
+            if partition == "ref2va":
+                deploy_cfg = "/deploy-configs/minimax_h3_ref2va_w8a8_a100_40g.yaml"
+            elif partition == "fl2va":
+                deploy_cfg = "/deploy-configs/minimax_h3_a100_40g.yaml"
+        except (json.JSONDecodeError, OSError):
+            # Keep a best-effort hint so users still get an actionable command.
+            pass
+    print(f"serve with: vllm serve {args.dst} --omni --deploy-config {deploy_cfg} (no --quantization flag)")
     return 0
 
 

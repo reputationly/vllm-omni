@@ -1,6 +1,7 @@
 # MiniMax-H3 GPUStack 生产部署档（4×A100-PCIE-40G）
 
-> 2026-08-09 定稿（#51）。这是 H3 上线的**权威配置**，与它冲突的历史命令一律以本文为准。
+> 2026-08-09 定稿（#51，Ref2VA 补充验证同日完成）。这是 H3 上线的**权威配置**，
+> 与它冲突的历史命令一律以本文为准。
 > 背景、踩坑过程、选型依据见 `MiniMax-H3-A100-40G-全局方案.md` 与
 > `vLLM-Omni-MiniMax-H3-踩坑总账与选型依据.md`，本文只写"怎么起、能跑多少、边界在哪"。
 
@@ -8,9 +9,16 @@
 
 ## 1. 一句话
 
-`/nfs-data/models/MiniMax-H3-FL2VA-INT8` + **tp4 + CPU offload + VAE tile 并行**，
-单机 4 卡 A100-40G 起一个副本，**同一时刻只服务一个请求**。
-生产档 **20 步 / flow_shift 12**，480p 端到端约 **70–72 s**。
+H3 按 DiT 分区部署成两个独立实例，每个实例独占一台 4×A100-40G，固定
+**tp4 + CPU offload + VAE tile 并行 + 并发 1**：
+
+| GPUStack 模型实例 | 权重 | 服务能力 | 部署档 |
+|---|---|---|---|
+| FL2VA | `/nfs-data/models/MiniMax-H3-FL2VA-INT8` | T2VA、首/尾帧 FL2VA | `minimax_h3_a100_40g.yaml` |
+| Ref2VA | `/nfs-data/models/MiniMax-H3-Ref2VA-INT8` | 图片、视频及附加音频参考 | `minimax_h3_ref2va_w8a8_a100_40g.yaml` |
+
+不要在同一进程或同一节点同时加载两个分区。GPUStack 可以在实例外排队，但引擎内部不合批，
+`max_num_seqs=1` 是硬约束。§2–§6 先说明 FL2VA；Ref2VA 的独立权重、实测和输入边界见 §7。
 
 ---
 
@@ -223,7 +231,106 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
   落地：`vllm_omni/model_executor/models/minimax_h3/pipeline.py`、
   `vllm_omni/deploy/minimax_h3_dit.yaml`、`deploy-configs/minimax_h3_a100_40g.yaml`、
   `tests/config/test_minimax_h3_pipeline.py`（6 条，含"裸路径仍解析不到 pipeline"回归）。
-  **仍未做真机对照**：YAML 形态与 §3 命令形态的产物一致性没跑过，上线前先跑一次同 seed 对照。
+  最新不可变镜像 `63187912` 已用镜像内 `/deploy-configs/minimax_h3_a100_40g.yaml`
+  完成 4 卡真机冒烟：运行日志确认 TP4/text-encoder TP4/VAE patch4/regional compile，
+  832×480、5.1667 秒、20 步请求 HTTP 200 且完整音视频可解码。历史同 seed 样本缺少完整
+  prompt/运行态元数据，不能宣称与旧 CLI 产物逐字节一致，但 YAML 的功能和资源路径已通过。
 - #23 宿主内存超账治理——137 GB 常驻在独占机器上够用。**部署原则是一机一模型**，
   所以这条不是扩容约束，只有在影响自身稳定性时才值得动。
 - #37 768p 同 seed 产物不确定。
+
+---
+
+## 7. Ref2VA 独立实例
+
+### 7.1 权重与启动
+
+Ref2VA 与 FL2VA 是两个不同的 DiT 分区，不能拿 FL2VA INT8 权重冒充。当前两档为：
+
+| 档位 | 权重 | Deploy config | 用途 |
+|---|---|---|---|
+| BF16 oracle | `/nfs-data/models/MiniMax-H3/Ref2VA` | `deploy-configs/minimax_h3_ref2va_bf16_a100_40g.yaml` | 质量基线、量化验收 |
+| W8A8 生产候选 | `/nfs-data/models/MiniMax-H3-Ref2VA-INT8` | `deploy-configs/minimax_h3_ref2va_w8a8_a100_40g.yaml` | A100 生产 |
+
+这两个 Ref2VA YAML 是本轮新增文件；`63187912` 镜像本身只带旧 FL2VA 档。本轮真机通过宿主
+挂载运行并验证其 merge 结果；必须在包含这两个新文件的下一版不可变镜像中，才能使用下文
+`/deploy-configs/...` 的镜像内路径。
+
+W8A8 checkpoint 由仓内
+`vllm_omni/quantization/tools/quantize_minimax_h3_int8.py` 从官方 Ref2VA BF16 分区离线生成。
+它包含 13 个 transformer shard、200 个 INT8 主 block 权重和 200 个 FP32
+per-output-channel scale；AdaLN、final layer、patch/condition embedder、token refiner 和共享
+text encoder/VAE 保持 BF16。`transformer/config.json` 已声明 serialized INT8 + dynamic
+activation，因此启动时**不要**再传 `--quantization`。
+
+启动所需的六个 `VLLM_OMNI_*` 环境变量和 2400 秒初始化超时与 §3.2 相同，只替换权重和
+deploy config。例如 W8A8：
+
+```bash
+exec vllm serve /nfs-data/models/MiniMax-H3-Ref2VA-INT8 --omni \
+  --host 0.0.0.0 --port 8091 \
+  --deploy-config /deploy-configs/minimax_h3_ref2va_w8a8_a100_40g.yaml \
+  --init-timeout 2400 --stage-init-timeout 2400
+```
+
+运行日志必须同时出现 `partition=ref2va`、serialized INT8/Cutlass W8A8、TP4 和
+text-encoder TP4；少一项都不能视为生产启动通过。
+
+### 7.2 BF16 / W8A8 同请求结果
+
+最新通用镜像 `63187912` 上使用同一真实咖啡店参考图、同一官方六段式 Ref2VA prompt、
+seed 42026、832×480、请求 5 秒（实际 124 帧/5.1667 秒）、20 步完成热态对照。该段对照为跨宿主观测，
+仅反映同参数两档差异，不应按单一“同宿主收益”口径复用。
+
+| 单图 Ref2VA warm2 | BF16 | W8A8 |
+|---|---:|---:|
+| HTTP | 164.115 s | **147.886 s** |
+| prompt encode | 21.107 s | **14.500 s** |
+| diffuse | 131.257 s | **122.060 s** |
+| decode | 2.710 s | 2.740 s |
+| GPU 峰值（`nvidia-smi`） | 30797 MiB（30.075 GiB）/卡 | **26861 MiB（26.231 GiB）/卡** |
+
+W8A8 在跨宿主观测下总耗时快约 9.9%，单图请求峰值少 3936 MiB（3.844 GiB）/卡。逐帧
+PSNR `45.965 dB`、SSIM `0.990228`，并排抽帧几乎一致；两档尾段出现相同的轻微水平纹理和
+嘴部张开，属于共同基线现象，不是 INT8 新增缺陷。音轨均为接近静音的 room tone，谱余弦
+`0.9877`。
+
+带一段参考视频时，W8A8/BF16 HTTP 为 `347.554/361.911 s`，W8A8 在当前观测里约快 4%；但两者 GPU
+峰值都约 33.1 GiB/卡，几乎不省。原因是长视频条件的激活和注意力工作区成为峰值主项，不能
+把单图的显存收益外推到所有 Ref2VA 请求。BF16 与 W8A8 在不同节点上的 host cgroup/page
+cache 口径不同，当前不下“INT8 更省宿主内存”的结论；最终容量以同宿主复测为准。
+
+单视频 W8A8/BF16 的 PSNR/SSIM 为 `46.526 dB / 0.990746`，身份、机位、背景和动作轨迹
+高度一致。图片+音频时 W8A8/BF16 HTTP 为 `168.629/178.338 s`，W8A8 在当前观测中快约 5.4%，
+峰值少 4452 MiB（4.348 GiB）/卡；PSNR/SSIM 为 `35.922 dB / 0.962526`，身份和口型主轨迹一致，细微
+嘴型/末段姿态存在量化漂移但未见身份崩坏。W8A8/BF16 的原始 `nvidia-smi` 峰值为
+`26877/31329 MiB`，W8A8 少 4452 MiB（4.348 GiB）/卡。其音频谱余弦 `0.9565`、波形相关 `0.7305`；
+自动指标不能可靠判断轻微同声叠音，仍需肉耳验收。
+
+### 7.3 已验证输入矩阵与生产边界
+
+`7.2` 的 W8A8 指标仅覆盖了单图/单视频/图片+音频；其余矩阵项为 BF16 链路结果，不应外推为
+W8A8 全量产线已验。
+
+| 输入 | 结果 | 生产结论 |
+|---|---|---|
+| 单图 | 通过 | 默认低成本 Ref2VA 档 |
+| 双图 | 通过；人物、场景、物件和动作均被采用 | 可开放，主参考关系必须写进 prompt |
+| 单视频 | 通过 | 约 6 分钟/5 秒 BF16 视频，需独立超时档 |
+| 图片 + 视频 | 通过；人物身份成功迁移到参考视频场景/动作 | 可开放 |
+| 图片 + 音频 | 媒体/ASR 技术通过，语音听感未验收 | 音频只作音色/内容参考；叠声历史问题未关闭 |
+| 视频 + 音频 | 媒体/ASR 技术通过，语音听感未验收 | 成本和显存按视频参考档估算；叠声历史问题未关闭 |
+| 图片 + 视频 + 音频 | 媒体/ASR 技术通过；6 秒请求约 515.7 s、36631 MiB（35.772 GiB）/卡 | 高成本/高显存；语音听感验收前不开放 |
+| 音频 only | **HTTP 400** | 不支持；Ref2VA 至少要一张图或一段视频 |
+| 双视频 | API/显存通过，融合质量不稳定 | 显著顺序敏感；第一参考更易主导关键物件/动作，不作为生产承诺 |
+
+代码允许最多 9 图、3 视频、3 个独立音频且总数最多 12，但这只是输入契约，不等于 A100-40G
+容量或融合质量保证。当前 2 段视频的 BF16 实测已达约 37.56 GiB/卡，只剩约 1.9 GiB。
+反序控制组确认第一参考对关键物件/动作有强优先权；第二参考仍可能贡献人物或背景，但全部参考
+的服从不可靠。生产先限制为**最多 1 段视频**，多图也只承诺已验证的 2 张；若实验性开放
+多视频，必须把主参考放第一位。音频可作为附加参考，不能单独启动 Ref2VA。
+
+参考音频回归中，左右声道和 mono 的 Whisper 转写均只出现一次目标对白，没有源音频原句、
+重复句或压缩重放；语速和粗粒度口型正常。但此前同类 Ref2VA 样本已由用户肉耳确认存在重音/
+双人叠声，中文语音质量未通过；本轮 ASR 不能排除同内容同音色的轻微重声。图片+音频、
+视频+音频和三模态只能记为媒体/内容技术通过，在用户对本轮生成 WAV 肉耳验收前不能标成生产通过。

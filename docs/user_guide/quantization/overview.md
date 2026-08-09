@@ -42,7 +42,7 @@ otherwise.
 | Method | Guide | Mode | Example models | Status |
 |--------|-------|------|----------------|--------|
 | FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
-| Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
+| Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image, Z-Image, MiniMax H3; Wan2.2 is not validated | MiniMax H3 uses its offline partition quantizer and keeps sensitive layers in BF16 |
 | ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |
 | MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8 or offline pre-quantized | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B | Ascend NPU only; validated for Wan2.2 |
 | MXFP4 W4A4 | [MXFP4](mxfp4.md) | `mxfp4`: online single-scale only; `mxfp4_dualscale`: online or offline dual-scale (offline recommended) | Wan2.2-T2V-A14B, I2V-A14B | Ascend NPU only; validated for Wan2.2 A14B cascade models; TI2V-5B not supported; offline `mxfp4_dualscale` uses calibrated `mul_scale` for best accuracy |

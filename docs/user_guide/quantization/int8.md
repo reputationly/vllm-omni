@@ -24,13 +24,14 @@ guide.
 
 ## Model Type Support
 
-### Diffusion Model (Qwen-Image, Wan2.2)
+### Diffusion Model
 
 | Model | HF models | CUDA | Ascend NPU | Mode | Recommendation |
 |-------|-----------|:----:|:----------:|------|----------------|
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Online W8A8 | All layers |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Online W8A8 | Validate before enabling in docs |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | Online W8A8 | All layers |
+| MiniMax H3 | `MiniMaxAI/MiniMax-H3` FL2VA or Ref2VA partition | Yes | Not validated | Offline serialized W8A8 | Quantize the four main `blocks.*` projections; keep sensitive layers and shared components in BF16 |
 
 Other diffusion models may work if their transformer uses supported linear
 layers, but they are not validated in this guide.
@@ -80,6 +81,33 @@ python text_to_image.py --model <your-model> --quantization int8
 python text_to_image.py --model <your-model> --quantization int8 --ignored-layers "img_mlp"
 vllm serve <your-model> --omni --quantization int8
 ```
+
+MiniMax H3 uses an offline serialized checkpoint rather than the generic
+online CLI path:
+
+```bash
+python3 vllm_omni/quantization/tools/quantize_minimax_h3_int8.py \
+  --src /path/to/MiniMax-H3/Ref2VA \
+  --dst /path/to/MiniMax-H3-Ref2VA-INT8
+
+# H3 is a deploy-only pipeline key, so the partition-specific profile is
+# required. The checkpoint config selects serialized Int8 automatically.
+vllm serve /path/to/MiniMax-H3-Ref2VA-INT8 --omni \
+  --deploy-config deploy-configs/minimax_h3_ref2va_w8a8_a100_40g.yaml \
+  --init-timeout 2400 --stage-init-timeout 2400  # no --quantization flag
+```
+
+The tool also accepts the official `FL2VA` partition. It writes symmetric
+per-output-channel Int8 weights and FP32 scales for the four large projections
+in every main DiT block. AdaLN, output/patch/condition projections, token
+refiner, text encoder, and VAEs remain in their source dtype. FL2VA and Ref2VA
+are separate partitions and must be quantized and served as separate
+checkpoints.
+
+The A100 production profile also requires the H3 timeout and offload
+environment variables documented in
+`docs/实验报告/MiniMax-H3-GPUStack-生产部署档.md`; the short command above only
+illustrates checkpoint and deploy-profile selection.
 
 ## Parameters
 
