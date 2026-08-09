@@ -115,13 +115,21 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 |---|---|---|
 | `duration` | **[4, 15] s**（fps 固定 24） | HTTP 400 `OmniClientError` |
 | 帧数 | `n % 17 == 5` | 自动对齐，不报错 |
-| `aspect_ratio`（t2va） | **必填具名值**，`adaptive`/`auto` 不接受 | HTTP 400 |
+| `aspect_ratio`（t2va） | **没传 `width`/`height` 时必填**具名值，`adaptive`/`auto` 不接受；传了宽高就可省 | HTTP 400 |
+| `num_frames` | 必须走**顶层表单字段**，塞进 `extra_params` 无效（`serving_video.py:177`） | 静默回落成默认 209 帧 |
 | `num_inference_steps` | 生产档 20 | 8 步/shift 5 画面是坏的，已目视否决 |
+| `enable_frame_interpolation` | **H3 不支持**，传了也不生效 | 静默空转，产物字节不变（#59） |
 | 并发 | **1** | H3 一次只服务一个请求，网关要串行排队 |
 
-**已知缺陷**：帧数对齐发生在时长范围校验**之后**，所以一个落在 15 s 以内的请求可能被对齐到
-15 s 以外，然后在下游炸成 HTTP 500（362 帧就是这个场景）。网关限流（#52）要在入口按
-对齐**后**的帧数判，不能按用户传的原值判。
+**已知缺陷两条**：
+
+1. **参数非法返回 500 而不是 400**。`OmniClientError` 在 worker 里抛出后，状态码在
+   RPC 回传时丢了（`diffusion_worker.py:1031-1041` 没写 `status_code`），最终落进
+   `api_server.py:3714` 的通用 `except Exception`。实测 `num_frames=719` → HTTP 500，
+   body 是 `Video generation failed: MiniMax H3 output duration must be in [4, 15] seconds`。
+   网关据此无法区分用户错误与服务故障。见 #58。
+2. **帧数对齐发生在时长校验之后**。`n % 17 == 5` 的对齐在 `[4,15] s` 检查**之后**执行，
+   所以一个 15.0 s 的合法请求会被对齐到 362 帧 = 15.083 s 再往下走。见 #52。
 
 ---
 
