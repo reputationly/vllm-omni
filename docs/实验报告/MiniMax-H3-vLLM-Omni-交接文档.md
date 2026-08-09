@@ -418,7 +418,7 @@ BF16 空载 140.5 GB < NF4 空载 160.4 GB。权重更小的反而占更多宿�
 | 33 | 拆解 24467 MiB/卡 空载常驻显存构成（目前的估计：BF16 编码器 TP 分片 ~16 GB + VAE/CUDA ctx/NCCL ~8 GB，**未逐项验证**） |
 | 36 | 三堵假墙的默认值还没改到代码里 |
 | 37 | 输出不确定性 —— 已收窄成"按请求序位可复现；NF4 跨序位漂移，BF16 不漂" |
-| 42 | 全局默认 `compress_statistics=false`。**注意：早先记录的越界机制（nested absmax 触发 gemv_4bit 越界）已被证伪，那段描述要重写** |
+| 42 | **已做**（2026-08-09）：全局默认 `compress_statistics=false`。证伪依据补齐了——bnb 0.50.0 `functional.py:1311-1313` 在 Python 侧就把 nested absmax 还原成满尺寸 fp32 再进 kernel，不存在越界读；`sequential_backend.py:208-215` 也正确搬了 nested state，不是设备残留。真因转 #56 |
 | 44 | NF4 文本编码器换入换出后失效（首请求后全 500，`v must be finite`）。定位在 `sequential_backend.py:168-215` 的 `_move_params`；bnb 的 `QuantState.to()` **就地修改并返回 `None`** |
 | 47 | DiT 组 NCCL 通信子惰性创建失败。**换 tp4 之后不复现**，但根因还在。建议修法：启动时趁卡还空，用一次 dummy broadcast 把通信子预热出来（约十几行） |
 | 48 | usp4 宿主内存墙 —— 与 #47 是同一件事，见 §4.1 |

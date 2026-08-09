@@ -45,7 +45,24 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
     def __init__(
         self,
         quant_type: str = "nf4",
-        compress_statistics: bool = True,
+        # Nested absmax quantization (double quantization) is off by default
+        # because it has been observed to destroy the output of wide
+        # projections.  On MiniMax H3, quantizing with ``True`` makes
+        # ``blocks.0.adaln_proj`` (96768 outputs) return values around 1e30
+        # while ``F.linear`` on the dequantized weight returns 1.95, and the
+        # request fails with "v must be finite"; flipping this flag to
+        # ``False`` and changing nothing else makes the same model produce
+        # correct output.  Narrower layers in the same model
+        # (``final_layer.adaln_proj``, 10752 outputs) are unaffected.
+        # The underlying defect has not been isolated -- it is not a device
+        # mismatch (the offloader moves the nested state, see
+        # ``sequential_backend._move_params``) and it is not an out-of-bounds
+        # read in the fused kernel (``bnb.functional.gemv_4bit`` dequantizes
+        # the nested absmax to a full-size fp32 tensor in Python before the
+        # kernel ever sees it).  Until it is, the nesting is not worth its
+        # price: it saves ~0.4% of the quantized weight bytes.  Pass
+        # ``compress_statistics=true`` explicitly to opt in.
+        compress_statistics: bool = False,
         ignored_layers: list[str] | None = None,
         ignored_layers_match: str = "exact",
     ) -> None:
@@ -85,7 +102,9 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "DiffusionBitsAndBytesConfig":
         quant_type = cls.get_from_keys_or(config, ["quant_type"], "nf4")
-        compress_statistics = cls.get_from_keys_or(config, ["compress_statistics"], True)
+        # Default off -- see ``__init__``.  A checkpoint that ships
+        # ``compress_statistics: true`` in its quant config still gets it.
+        compress_statistics = cls.get_from_keys_or(config, ["compress_statistics"], False)
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         ignored_layers_match = cls.get_from_keys_or(config, ["ignored_layers_match"], "exact")
 

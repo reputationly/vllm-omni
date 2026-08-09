@@ -60,7 +60,7 @@ vllm_omni/quantization/bitsandbytes_config.py                  +17
 | #19 | 文本编码器无法量化：它的线性层不是 `LinearBase`，量化配置根本匹配不上 | 读 `get_quant_method` 分派逻辑 | 补结构缺口 | **进行中** |
 | — | 补完 #19 后**没有开关能只量化 DiT 不量化编码器**——两者共用 `--diffusion-quantization-config` | 实测四种 `ignored_layers` 写法全部无效，回读 `is_layer_skipped` 默认是**整串相等**匹配 | 新增 `ignored_layers_match: "substring"`（opt-in，不改默认，+17 行） | **本轮新增，已解** |
 | #44 | NF4 编码器换出再换入后失效，第 2 个请求起全 500（`v must be finite`） | 首请求正常、次请求必挂 | 未修。怀疑 `sequential_backend._move_params`：bnb 的 `QuantState.to()` 是原地改并返回 `None` | **未解** |
-| #42 | `compress_statistics=true` 触发 bnb 的 nested absmax 问题 | — | 全局关掉（目前靠命令行显式传 `false`） | **未解**（默认值没改，上游 issue 没提） |
+| #42 | `compress_statistics=true` 把宽投影（96768 输出）的结果毁成 1e30，窄的（10752）没事 | probe6 单变量 A/B：只翻这个 flag，500 → 200 | 默认值改 `false`（`__init__` + `from_config` 双路径 + 断言测试 + 文档） | **已解（止血）**。机制未定——原记的"融合 kernel 越界读"**已被 bnb 0.50.0 源码证伪**（`functional.py:1311-1313`，nested absmax 在 Python 侧就还原成满尺寸 fp32 才进 kernel）。上游 issue 不提，等 #56 定死真因 |
 | #5 | 离线量化 checkpoint 被误判为 online | — | — | **未解** |
 | #7 | DLO 往返丢失 cutlass 列主序 layout | — | — | **未解** |
 

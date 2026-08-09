@@ -12,11 +12,14 @@ from pytest_mock import MockerFixture
 from torch.nn import Module, Parameter
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+# Everything outside ``TestCudaBnBSmoke`` mocks bitsandbytes out and runs on
+# CPU; that class carries its own ``hardware_test`` mark for the GPU runner.
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
 
@@ -46,6 +49,22 @@ def test_bitsandbytes_config_creation():
     config = build_quant_config("bitsandbytes")
     assert config is not None
     assert config.get_name() == "bitsandbytes"
+
+
+def test_bitsandbytes_compress_statistics_defaults_off():
+    """Nested absmax must stay opt-in on both construction paths.
+
+    It has been observed to turn the output of wide projections into 1e30 --
+    see ``DiffusionBitsAndBytesConfig.__init__``. Flipping this default back
+    would silently re-enable that on every checkpoint that does not pin the
+    flag, so it is asserted rather than left to review.
+    """
+    from vllm_omni.quantization.bitsandbytes_config import DiffusionBitsAndBytesConfig
+
+    assert build_quant_config("bitsandbytes").compress_statistics is False
+    assert DiffusionBitsAndBytesConfig.from_config({}).compress_statistics is False
+    # An explicit opt-in still wins.
+    assert DiffusionBitsAndBytesConfig.from_config({"compress_statistics": True}).compress_statistics is True
 
 
 def test_bitsandbytes_config_with_custom_params():
@@ -198,6 +217,7 @@ def quant_config():
     )
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @cuda_available
 @bitsandbytes_available
 class TestCudaBnBSmoke:

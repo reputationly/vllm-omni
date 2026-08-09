@@ -403,6 +403,24 @@ batch=1 会走 bnb 的融合 `gemv_4bit`；若该路径把这个 uint8 缓冲按
 大概率还落在分配器凑整的同一块里，所以看着是好的。BF16 编码器那台"正常"，
 是因为越界读到的那片显存恰好是干净的——**它一直在踩，只是没踩到东西**。
 
+> ⚠️ **2026-08-09 更正：上面这段越界假说是错的，已被源码证伪。**
+> 机器上装的 bitsandbytes 0.50.0，`functional.py:1311-1313`：
+> ```python
+> absmax = state.absmax
+> if state.nested:
+>     absmax = dequantize_blockwise(absmax, state.state2) + state.offset
+> ```
+> nested `absmax` 在 **Python 侧**就被还原成满尺寸 fp32 张量了，
+> 传给 `torch.ops.bitsandbytes.gemv_4bit` 的是这个还原后的张量，
+> kernel 根本见不到 uint8 缓冲，不存在"按 fp32 读 uint8"这回事。
+> 顺带也排除了设备残留：`sequential_backend.py:208-215` 正确调了
+> `QuantState.to()`（该方法会搬 `offset`/`state2.absmax`/`state2.code`，
+> 且已兼容它就地修改返回 `None` 的坑）。
+>
+> **下面 probe6 的表格仍然作数**——它测的是 `true`/`false` 的因果，
+> 那个因果是实打实的；错的只是对"为什么"的解释。
+> 真因未定，见 #56。
+
 **probe6（2026-08-08，0024）验完了，假说成立。** 只把
 `compress_statistics` 改成 `false`（`absmax` 存 fp32、不再嵌套），
 **一行代码没动**，NF4 编码器直接出片：
@@ -416,19 +434,22 @@ batch=1 会走 bnb 的融合 `gemv_4bit`；若该路径把这个 uint8 缓冲按
 | `blocks.0.adaln_proj` 输出 | 2.0e32 / 2.3e30 / 2.5e34 / 4.2e25 | **1.67 / 1.69 / 1.72**（参考 1.95） |
 | `final_layer.adaln_proj` | 0.5898（本来就好） | 0.617–0.625 |
 
-**根因定稿**：bitsandbytes 的 batch-1 融合 `gemv_4bit` 路径处理不了
-`compress_statistics=true` 的嵌套 `absmax`。输出规模越大越致命
-（96768 那层必炸，10752 那层侥幸），与文本编码器是否量化无关——
-**BF16 编码器那台一直在越界读，只是读到的那片显存恰好是干净的**。
+**结论（2026-08-09 修订）**：`compress_statistics=true` 会毁掉宽投影的输出，
+输出规模越大越致命（96768 那层必炸，10752 那层没事），与文本编码器是否量化无关。
+**这条因果是实测定死的；机制没定死**——原写的"融合 kernel 越界读"已被 bnb 0.50.0
+源码证伪（见上方 ⚠️ 更正框）。
 
-三条后续动作：
+三条后续动作（2026-08-09 状态）：
 
-1. **`compress_statistics` 全局改成 `false`**，不只是编码器。DiT 一直在踩这个坑，
-   只是没踩到东西；这不是"目前没出问题所以可以留着"的事。
-   代价：`absmax` 从 uint8 变 fp32，每 4 个数多 3 字节，DiT 上量级是几十 MB。
+1. **`compress_statistics` 全局改成 `false`**，不只是编码器。理由不是
+   "DiT 一直在越界踩"（那个说法随假说一起作废），而是：机制不明就框不住影响范围，
+   而它换来的只有 ~0.4% 量化权重字节。**已做**（`bitsandbytes_config.py` 的
+   `__init__` 与 `from_config` 双路径 + 默认值断言测试）。
 2. `--diffusion-quantization-config` 的默认值要跟着改，并写清楚为什么
-   （否则下一个人照抄官方示例又会打开它）。
-3. 上游 bnb 该报的 issue：`gemv_4bit` + nested absmax + 大 `out_features`。
+   （否则下一个人照抄官方示例又会打开它）。**已做**
+   （`docs/user_guide/quantization/bitsandbytes.md` 参数表 + warning 框）。
+3. 上游 bnb issue：**本轮不提**。按已被证伪的机制去提就是提假 bug。
+   先按 #56 用 bnb 裸接口做最小复现把真因定死，再提。
 
 *还没定的选型*：全量化（2.84 GiB/rank，relL2 1.46%）还是保 `o_proj`+`down_proj`
 不量化（5.86 GiB/rank，relL2 0.73%）。现在能真跑了，用出片质量来定，不再靠 relL2 猜。
@@ -860,6 +881,11 @@ NFS 上放好了各档产物，看效果直接取，别再重跑：
 
 ### 9.1 起服务的命令（照抄）
 
+> ⚠️ 这条是 **usp4 时期的历史命令**，留作追溯。生产用 tp4，权威配置见
+> `docs/deploy/minimax-h3-gpustack.md`（#51），不要照抄这一条。
+> `compress_statistics` 已于 2026-08-09 从示例里删掉——默认就是 `false`，
+> 写 `true` 会让宽投影输出炸成 1e30（见 §上文 ⚠️ 更正框）。
+
 ```bash
 export PYTHONPATH=/work/vllm-omni-h3
 export VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0        # 假墙 1，置 0 关闭
@@ -867,7 +893,7 @@ export VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S=14400  # 假墙 2
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400      # 假墙 3，注意无 _S 后缀
 vllm serve /nfs-data/models/MiniMax-H3/FL2VA --omni --host 0.0.0.0 --port 8091 \
   --trust-remote-code --num-gpus 4 --usp 4 --ring 1 --enable-cpu-offload \
-  --diffusion-quantization-config '{"method":"bitsandbytes","quant_type":"nf4","compress_statistics":true}' \
+  --diffusion-quantization-config '{"method":"bitsandbytes","quant_type":"nf4"}' \
   --text-encoder-tp-size 4 --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
   --enforce-eager --diffusion-attention-backend FLASH_ATTN \
   --safetensors-load-strategy lazy --disable-multithread-weight-load \

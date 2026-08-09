@@ -91,10 +91,29 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --quantization bitsandbytes
 |-----------|------|---------|-------------|
 | `method` | str | - | Quantization method (`"bitsandbytes"`) |
 | `quant_type` | str | `"nf4"` | 4-bit data type: `"nf4"` (recommended) or `"fp4"` |
-| `compress_statistics` | bool | `True` | Double-quantize block scaling statistics for better accuracy |
+| `compress_statistics` | bool | `False` | Double-quantize block scaling statistics. Saves ~0.4% of the quantized weight bytes, but see the warning below |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16/FP16 |
 
 ## Validation and Notes
+
+!!! warning "`compress_statistics` defaults to `False`"
+
+    Nested absmax quantization has been observed to destroy the output of wide
+    projections. On MiniMax-H3, `compress_statistics: true` makes
+    `blocks.0.adaln_proj` (96768 outputs) return values around `1e30` — the
+    request fails with `v must be finite` — while `F.linear` on the dequantized
+    weight of the same layer returns `1.95`. Setting the flag to `false` and
+    changing nothing else makes the model produce correct output. Narrower
+    layers in the same model (`final_layer.adaln_proj`, 10752 outputs) are
+    unaffected.
+
+    The defect has not been isolated. It is *not* a device mismatch (the
+    sequential offloader moves the nested state) and it is *not* an
+    out-of-bounds read in the fused kernel (`bnb.functional.gemv_4bit`
+    dequantizes the nested absmax to a full-size fp32 tensor in Python before
+    the kernel sees it). Until it is understood, the ~0.4% of quantized weight
+    bytes the nesting saves is not worth the risk. Enable it only after
+    checking output on your own model.
 
 On Z-Image-Turbo (single GPU, 1024×1024, 50 steps), BitsAndBytes W4 typically
 reduces peak VRAM from roughly 24.5 GiB (BF16) to roughly 17 GiB. Compare output
