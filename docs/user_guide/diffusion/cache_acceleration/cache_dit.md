@@ -160,7 +160,9 @@ For offline inference, set the same field on the sampling parameters:
 OmniDiffusionSamplingParams(
     quality="high",
     num_inference_steps=50,
-    extra_args={"task": "t2va", "duration": 5.0, "audio_flow_shift": 3.0},
+    # t2va has no input image to derive the frame shape from, so an explicit
+    # named aspect_ratio is required -- the request is rejected without it.
+    extra_args={"task": "t2va", "aspect_ratio": "16:9", "duration": 5.0, "audio_flow_shift": 3.0},
 )
 ```
 

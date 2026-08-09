@@ -122,6 +122,9 @@ def test_minimax_h3_t2va_fp8_single_gpu_smoke():
                 output_type="np",
                 extra_args={
                     "task": "t2va",
+                    # Required for t2va: there is no input image to derive the
+                    # frame shape from, and "adaptive"/"auto" are rejected.
+                    "aspect_ratio": "16:9",
                     "flow_shift": 12.0,
                     "audio_flow_shift": 3.0,
                 },

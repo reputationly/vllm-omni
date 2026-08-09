@@ -417,6 +417,21 @@ def load_stage_configs_from_model(
         # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
+    # ``stages is None`` means the model resolved to no PipelineConfig, so the
+    # deploy YAML — which is merged against a pipeline topology — had nothing to
+    # merge into and was dropped on the floor. Every field the operator wrote
+    # (parallel sizes, offload, VAE tiling) silently reverts to defaults, and on
+    # a large model that surfaces ~20 minutes later as an unexplained OOM.
+    # Refuse instead: an explicit --deploy-config must either apply or fail.
+    if deploy_config_path is not None:
+        raise ValueError(
+            f"--deploy-config {deploy_config_path!r} cannot be applied to model {model!r}: "
+            "the model does not resolve to a registered pipeline (vllm_omni/config/"
+            "pipeline_registry.py::OMNI_PIPELINES), and deploy configs are merged "
+            "against a pipeline topology. Register a PipelineConfig for this model, "
+            "or drop --deploy-config and pass the equivalent settings as CLI flags."
+        )
+
     # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
     # applied here (it overlays onto registry-merged stages), so warn rather than
     # silently dropping the operator's --strategy-config.
