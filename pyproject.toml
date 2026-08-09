@@ -310,6 +310,9 @@ extend-ignore-identifiers-re = [
     ".*[Nn][Dd]3.*",
     ".*updator.*",
     "byt5.*",
+    # Git/md5 hash prefixes quoted in the experiment reports (e.g. `8ba96e36`).
+    # Hex digits routinely spell fragments like "ba" that typos reads as words.
+    "^[0-9a-f]{7,64}$",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -330,3 +333,10 @@ byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.
 seeked = "seeked"
+# `pkill -f "vllm serve"` matches the killing script's own command line, so the
+# ops notes split the literal as "vllm ser""ve". Without this, typos rewrites
+# the fragment to "set" and the documented command silently matches nothing.
+ser = "ser"
+# NED = Normalized Edit Distance, the standard OCR accuracy metric reported
+# alongside Word Accuracy in the ERNIE-Image poster experiments.
+NED = "NED"
