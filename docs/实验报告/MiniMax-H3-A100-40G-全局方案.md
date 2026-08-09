@@ -430,16 +430,39 @@ batch=1 会走 bnb 的融合 `gemv_4bit`；若该路径把这个 uint8 缓冲按
    （否则下一个人照抄官方示例又会打开它）。
 3. 上游 bnb 该报的 issue：`gemv_4bit` + nested absmax + 大 `out_features`。
 
-*选型仍未定*：全量化（2.84 GiB/rank，relL2 1.46%）还是保 `o_proj`+`down_proj`
-不量化（5.86 GiB/rank，relL2 0.73%）。现在能真跑了，用出片质量来定，不再靠 relL2 猜。
-
 *还没定的选型*：全量化（2.84 GiB/rank，relL2 1.46%）还是保 `o_proj`+`down_proj`
-不量化（5.86 GiB/rank，relL2 0.73%）。选后者要解决 CLI 难看的问题——
-`is_layer_skipped` 默认 `skip_with_substr=False`，得把 100 个精确前缀塞进
-`--diffusion-quantization-config`，或者在编码器里烘一个有文档的默认值。
+不量化（5.86 GiB/rank，relL2 0.73%）。现在能真跑了，用出片质量来定，不再靠 relL2 猜。
+选后者要解决 CLI 难看的问题——`is_layer_skipped` 默认 `skip_with_substr=False`，
+得把 100 个精确前缀塞进 `--diffusion-quantization-config`，或者在编码器里烘一个
+有文档的默认值。
 
-*收尾债*：三处临时探针（`encoder.py`、`denoise_loop.py`、`minimax_h3_transformer.py`）
-在修复落地后必须删掉。
+### P1-1 结项状态（2026-08-09）：**未合入主仓，已放弃当前实现，待重做**
+
+上面 probe6 拿到的 200 是**首请求**。之后触发编码器换出/换入，第二个请求起全 500
+（**#44**），这条一直没解决。所以 c7 正式仓合入时**没有带上这套结构**，这是有意的
+取舍，不是漏合。
+
+主仓现状（2026-08-09 逐类核实）：`encoder.py` 里
+`MiniMaxH3Qwen3VLQKVParallelLinear` / `MergedColumnParallelLinear` /
+`RowParallelLinear` / `VocabParallelEmbedding` **全部仍是裸 `nn.Module`**，
+不继承 `LinearBase`、不接 `quant_config` → `get_quant_method` 的
+`isinstance(layer, LinearBase)` 门控返回 `None` → **编码器在主仓无法被量化**，
+50 层解码器仍是 BF16，**12.8 GiB/rank**。因此本节所有 NF4 编码器读数
+（空载 15675 MiB/卡、`home-hit` 4.31 GB/rank）**在主仓都不成立**，
+主仓的对应读数是 24419 MiB/卡 / 12.82 GB/rank。
+
+参考实现（约 153 行，含为什么要继承 `LinearBase`、为什么 `disable_tp=True`、
+编码器 group 与全局 TP group 不是一回事、qkv/gate_up 解融合的理由）保留在
+`vllm-omni-h3` 的归档 patch 里，是这个坑唯一的书面记录。**重做的前置是先解决 #44**
+——结构补回去而换入换出仍失效的话，也只能跑一个请求。
+
+同时**订正一处账目**：下面「收尾债」写的是"修复落地后必须删掉探针"，实际执行顺序
+反了——探针已经删干净（c7 核对过 `_adaln_probe` / `_adaln_probe5` /
+`self._probe_prefix` / `VLLM_OMNI_ENCODER_PROBE` 均不存在），而 P1-1 没落地。
+探针不再恢复，重做时按当时需要重新加。
+
+*收尾债（已完成）*：三处临时探针（`encoder.py`、`denoise_loop.py`、
+`minimax_h3_transformer.py`）已删除。
 
 **P1-2：离线 NF4 checkpoint + 修 #5**
 
@@ -450,7 +473,12 @@ bf16 从不出现，`load_device` 不再需要 CPU 中转。
 
 收益：加载 9 分钟 → ~1 分钟；A 与 C 解耦，`--enable-cpu-offload` 变成纯运行期开关。
 
+> **#5 已修（2026-08-09 核实）**：`diffusers_loader.py:469` 的 `_has_online_quant`
+> 改成认 upstream 的 `uses_meta_device` 真信号，整段 meta 设备处理门控在它之下，
+> 离线量化 checkpoint 走的是原本已验证的路径。P1-2 的这个前置依赖已解除。
+
 **P1-1 和 P1-2 都做完**，才能真正摘掉 `--enable-cpu-offload`。
+**P1-1 已放弃当前实现（见上），所以现阶段 `--enable-cpu-offload` 摘不掉。**
 
 **P1-3：常驻判定的判据换掉**
 
