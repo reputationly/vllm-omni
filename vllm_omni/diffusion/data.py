@@ -1448,6 +1448,10 @@ class AsyncDiffusionOutput:
     result: Any | None = None
     output: DiffusionOutput | None = None
     error: str | None = None
+    # Client-error metadata travels alongside ``error`` so a 4xx raised inside
+    # a worker survives the process boundary instead of degrading to a 500.
+    error_status_code: int | None = None
+    error_type: str | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

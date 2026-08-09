@@ -113,7 +113,7 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 
 | 参数 | 约束 | 违反时 |
 |---|---|---|
-| `duration` | **[4, 15] s**（fps 固定 24） | HTTP 400 `OmniClientError` |
+| `duration` | **[4, 15] s**（fps 固定 24） | HTTP 400，0.02–0.06 s 内返回，不占生成槽位 |
 | 帧数 | `n % 17 == 5` | 自动对齐，不报错 |
 | `aspect_ratio`（t2va） | **没传 `width`/`height` 时必填**具名值，`adaptive`/`auto` 不接受；传了宽高就可省 | HTTP 400 |
 | `num_frames` | 必须走**顶层表单字段**，塞进 `extra_params` 无效（`serving_video.py:177`） | 静默回落成默认 209 帧 |
@@ -121,22 +121,32 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 | `enable_frame_interpolation` | **H3 不支持**，传了也不生效 | 静默空转，产物字节不变（#59） |
 | 并发 | **1** | H3 一次只服务一个请求，网关要串行排队 |
 
-**已知缺陷两条**：
+**参数非法的返回码（2026-08-09 已修，#58）**：以前 `OmniClientError` 在 worker 里抛出后，
+状态码在跨进程回传时丢了（三跳都只带 `str(exc)`），最终落进 `api_server.py` 的通用
+`except Exception`，一律 500。现在 400 能原样穿回来，0024 实测：
 
-1. **参数非法返回 500 而不是 400**。`OmniClientError` 在 worker 里抛出后，状态码在
-   RPC 回传时丢了（`diffusion_worker.py:1031-1041` 没写 `status_code`），最终落进
-   `api_server.py:3714` 的通用 `except Exception`。实测 `num_frames=719` → HTTP 500，
-   body 是 `Video generation failed: MiniMax H3 output duration must be in [4, 15] seconds`。
-   网关据此无法区分用户错误与服务故障。见 #58。
-2. **帧数对齐发生在时长校验之后**。`n % 17 == 5` 的对齐在 `[4,15] s` 检查**之后**执行，
-   所以一个 15.0 s 的合法请求会被对齐到 362 帧 = 15.083 s 再往下走。见 #52。
+| 用例 | 返回 | body |
+|---|---|---|
+| `num_frames=719`（29.958 s） | **400** / 0.062 s | `MiniMax H3 output duration must be in [4, 15] seconds, got 29.958` |
+| `duration=2` | **400** / 0.042 s | `... got 2.0` |
+| `fps=30` | **400** / 0.016 s | `MiniMax H3 output fps is fixed at 24` |
+| 生产档合法请求 | 200 / 89.1 s（冷启首请求，含 regional 编译；稳态 70–72 s） | — |
+
+**仍在的行为，不算缺陷但要知道**：帧数对齐 `n % 17 == 5` 是**只向上取**的，且发生在
+`[4,15] s` 检查之后，所以一个 15.0 s 的请求实际出 362 帧 = 15.083 s。
+不改：改成"对齐后再校验"只有两条出路——超界就拒（把合法请求拒掉）或往下退一档
+（14.4–15.0 s 的请求统统塌到 345 帧 = 14.375 s），两者都比现在多超 0.083 s 更难受。
+所以 `[4,15]` 是**请求时长**的界，交付时长最多再长 16/24 s。
 
 ---
 
 ## 6. 未决
 
-- #57 给 H3 注册 PipelineConfig，让 `--deploy-config` 真正可用（注册会把 bare-CLI 启动改走
-  `merge_pipeline_deploy`，且 `final_output_type` 从 `image` 翻成 `video`，需真机 A/B）。
-- #52 网关入口参数限流。
-- #23 宿主内存超账治理——目前 137 GB 常驻是能跑，但没有余量给第二个模型。
+- #57 给 H3 注册 PipelineConfig，让 `--deploy-config` 真正可用。**照 HunyuanImage3 的
+  AR/DiT 拆法做**：那两个 key（`hunyuan_image3_ar` / `hunyuan_image3_dit`）都是
+  `hf_architectures=()` 的纯部署键，任何 HF config 都探测不到它们，只能由 yaml 里的
+  `pipeline:` 字段点名（`config_factory.py:236` 里这条优先级最高，直接短路自动探测）。
+  H3 同样不填 `diffusers_class_name`，裸 CLI 启动的行为就一点不变，风险归零。
+- #23 宿主内存超账治理——137 GB 常驻在独占机器上够用。**部署原则是一机一模型**，
+  所以这条不是扩容约束，只有在影响自身稳定性时才值得动。
 - #37 768p 同 seed 产物不确定。

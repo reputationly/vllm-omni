@@ -55,6 +55,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPref
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -1022,6 +1023,7 @@ class WorkerProc:
             "ok": True,
             "error": None,
             "error_type": None,
+            "error_status_code": None,
             "traceback": None,
             "bool_result": None,
         }
@@ -1032,11 +1034,13 @@ class WorkerProc:
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             rpc_exception = e
+            client_status, client_type = client_error_metadata(e)
             status.update(
                 {
                     "ok": False,
                     "error": str(e),
-                    "error_type": type(e).__name__,
+                    "error_type": client_type or type(e).__name__,
+                    "error_status_code": client_status,
                     "traceback": traceback.format_exc(),
                 }
             )
@@ -1115,6 +1119,10 @@ class WorkerProc:
                     output_rank = msg.get("output_rank")
                     exec_all_ranks = msg.get("exec_all_ranks", False)
                     wave_id = msg.get("wave_id")
+                    # Carry 4xx metadata across the process boundary; without it
+                    # the executor can only rebuild a generic RuntimeError and a
+                    # bad request surfaces as HTTP 500.
+                    err_status, err_type = client_error_metadata(e)
                     if self.result_mq is not None:
                         if rpc_id is not None:
                             # Async RPC: must complete the executor's pending
@@ -1124,6 +1132,8 @@ class WorkerProc:
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,
                                     error=str(e),
+                                    error_status_code=err_status,
+                                    error_type=err_type,
                                 )
                             )
                         elif output_rank is None and exec_all_ranks:
@@ -1151,11 +1161,26 @@ class WorkerProc:
                                 except Exception:
                                     dp_rank = self.gpu_id
                                 self._return_result(
-                                    {"status": "error", "error": str(e), "dp_rank": dp_rank, "wave_id": wave_id}
+                                    {
+                                        "status": "error",
+                                        "error": str(e),
+                                        "error_status_code": err_status,
+                                        "error_type": err_type,
+                                        "dp_rank": dp_rank,
+                                        "wave_id": wave_id,
+                                    }
                                 )
                         elif output_rank is None or output_rank == self.gpu_id:
                             # Normal RPC: only the expected rank replies
-                            self._return_result({"status": "error", "error": str(e), "wave_id": wave_id})
+                            self._return_result(
+                                {
+                                    "status": "error",
+                                    "error": str(e),
+                                    "error_status_code": err_status,
+                                    "error_type": err_type,
+                                    "wave_id": wave_id,
+                                }
+                            )
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

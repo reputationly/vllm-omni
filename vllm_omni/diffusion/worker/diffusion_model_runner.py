@@ -809,7 +809,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     request_id=req.request_id,
                                     step_index=req.step_index,
                                     finished=True,
-                                    result=DiffusionOutput(error=str(per_req_exc)),
+                                    result=DiffusionOutput.from_exception(per_req_exc),
                                 )
                             )
 
