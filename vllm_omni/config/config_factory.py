@@ -207,7 +207,14 @@ class StageConfigFactory:
         model_lower = model.lower().replace("-", "").replace("_", "")
         best: str | None = None
         best_len = 0
-        for registered_key in OMNI_PIPELINES.keys():
+        for registered_key, registered in OMNI_PIPELINES.items():
+            # Deploy-only topologies are selectable solely by a deploy YAML's
+            # ``pipeline:`` field; a checkpoint directory whose name happens to
+            # contain the key must not pull in its bundled deploy defaults.
+            # Callable entries are hf_config-keyed resolvers and hf_config is
+            # already known to be None here, so only plain configs are checked.
+            if isinstance(registered, PipelineConfig) and registered.deploy_only:
+                continue
             candidate = registered_key.lower().replace("-", "").replace("_", "")
             if candidate and candidate in model_lower and len(candidate) > best_len:
                 best = registered_key

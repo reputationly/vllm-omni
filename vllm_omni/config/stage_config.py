@@ -288,6 +288,12 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    # Deploy-only topology: never auto-selected. The path-substring fallback in
+    # StageConfigFactory._try_infer_model_type skips these entries, so the only
+    # way in is a deploy YAML's ``pipeline:`` field. Set this on keys that carry
+    # a default_deploy_config_name whose defaults would be wrong for a bare
+    # ``vllm serve <path>`` launch.
+    deploy_only: bool = False
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""

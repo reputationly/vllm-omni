@@ -79,6 +79,7 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
     MING_TTS_PIPELINE,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_DIT_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
@@ -131,6 +132,10 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,
     "hunyuan_image3_dit": HUNYUAN_IMAGE3_DIT_PIPELINE,
     "hunyuan_video_15": HUNYUAN_VIDEO_15_PIPELINE,
+    # Deploy-only key: unreachable by auto-detection, selected solely by a
+    # deploy YAML's ``pipeline:`` field. See the module docstring for why it is
+    # not spelled ``minimax_h3``.
+    "minimax_h3_dit": MINIMAX_H3_DIT_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,

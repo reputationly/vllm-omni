@@ -1,0 +1,111 @@
+# MiniMax-H3 FL2VA (offline INT8) — DiT stage, A100 PCIE 40G x4
+#
+# Measured configuration, transcribed from
+#   docs/实验报告/MiniMax-H3-GPUStack-生产部署档.md  §3 / §4
+# 480p 生产档 (832x480 / 124 frames / 20 steps / flow_shift 12):
+# 70-72 s end-to-end, peak 24.1 GiB/rank, idle 12.9 GiB/rank, host ~137 GB.
+#
+# Weights: /nfs-data/models/MiniMax-H3-FL2VA-INT8 (offline W8A8, DiT only —
+# text_encoder/video_vae/audio_vae stay BF16). Pass NO quantization flag: the
+# checkpoint is already serialized INT8 and --quantization routes it into the
+# online-quantization path instead.
+#
+# Requires --gpus '"device=0,1,2,3"' and /nfs-data mounted.
+#
+# --- What CANNOT move into this file (verified in code, not assumed) ---
+#
+# 1. The six VLLM_OMNI_* environment variables must stay `export`s in the
+#    launch command. A stage-level `env:` block is parsed into
+#    StageDeployConfig.env and then dropped: stage_runtime_env /
+#    stage_runtime_setup (engine/stage_init_utils.py) have no live callers, and
+#    the production path (stage_engine_startup.py -> setup_stage_devices) only
+#    forwards `devices`.
+#
+# 2. --init-timeout / --stage-init-timeout 2400 stay on the CLI. Neither is a
+#    StageDeployConfig field nor a pipeline-wide engine field, so a YAML key
+#    would silently land in engine_extras and be filtered out.
+#
+# 3. --safetensors-load-strategy lazy is omitted ON PURPOSE, here and in the
+#    launch command. It never reaches the diffusion loader:
+#    diffusion_model_runner.py builds `LoadConfig()` with no arguments before
+#    constructing DiffusersPipelineLoader, so diffusers_loader.py always reads
+#    the default (None). The knob that actually prevented the load-time host
+#    OOM is enable_multithread_weight_load: false below, which IS read off
+#    od_config.
+#
+# --- Why parallel_config is nested rather than flat ---
+#
+# tensor_parallel_size / ulysses_degree / ring_degree / text_encoder_tp_size /
+# vae_patch_parallel_size / vae_parallel_mode are DiffusionParallelConfig
+# fields, not OmniDiffusionConfig fields. YAML stage fields stay FLAT in
+# engine_args (only CLI runtime_overrides get folded into parallel_config, by
+# _apply_diffusion_parallel_runtime_overrides), and OmniDiffusionConfig
+# .from_kwargs filters to its own field names — so a flat `tensor_parallel_size: 4`
+# here would be silently dropped and the stage would come up single-card.
+# Write them nested; that dict IS an OmniDiffusionConfig field and is coerced
+# to DiffusionParallelConfig in __post_init__.
+#
+# --- Why tp4 and not usp4 ---
+#
+# tp4 shards the 33B DiT and leaves 76-98 GB host headroom; 13/13 requests
+# survived. usp4 replicates the whole model 4x, leaves 22-24 GB, and NCCL's raw
+# cudaMalloc starts failing — 4 of 13 requests died. Do NOT switch back for the
+# latency numbers; those numbers do not apply to this profile.
+pipeline: minimax_h3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    # H3 serves exactly one request at a time; the gateway must queue.
+    # (Also the OmniDiffusionConfig default — stated here as contract.)
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+
+    # 40 GB cards cannot hold the model resident; swap in/out is mandatory.
+    enable_cpu_offload: true
+
+    # VAE decode is the second memory spike. Tiling + tile-parallel decode keeps
+    # it under the cap; without them the run OOMs after denoise completes.
+    vae_use_tiling: true
+
+    diffusion_attention_backend: FLASH_ATTN
+
+    # Whole-graph compile does not get through 52 blocks. Regional costs ~17 s
+    # extra on cold start and is stable afterwards.
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+
+    # Multi-threaded safetensors loading briefly doubles host RSS and the OOM
+    # killer takes the worker out mid-load. Equivalent to
+    # --disable-multithread-weight-load.
+    enable_multithread_weight_load: false
+
+    enable_diffusion_pipeline_profiler: true
+
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      # Shard the Qwen3-VL encoder across all 4 DiT ranks instead of pinning it
+      # on rank 0.
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+
+    default_sampling_params:
+      # Production step count. The pipeline's own fallback is 50 steps
+      # (pipeline_minimax_h3.py: `sampling.num_inference_steps or 50`), i.e.
+      # 2.5x the cost, so the default is worth setting. A request that sends
+      # num_inference_steps still wins.
+      # Not set here: seed (H3 already falls back to 42) and flow_shift (H3
+      # reads it from extra_params and defaults to the checkpoint's 12.0 —
+      # OmniDiffusionConfig.flow_shift is a Wan2.2 knob H3 never reads).
+      num_inference_steps: 20
