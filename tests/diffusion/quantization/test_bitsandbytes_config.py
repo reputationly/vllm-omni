@@ -67,41 +67,57 @@ def test_bitsandbytes_compress_statistics_defaults_off():
     assert DiffusionBitsAndBytesConfig.from_config({"compress_statistics": True}).compress_statistics is True
 
 
-def test_bitsandbytes_config_from_transformers_checkpoint_dict():
-    """A transformers-serialized quantization_config must not crash the build.
+def test_prequantized_checkpoint_gets_vllms_config():
+    """An already-quantized checkpoint must NOT get the online diffusion config.
 
-    ``BitsAndBytesConfig.to_dict()`` writes the private backing fields
-    (``_load_in_4bit``) alongside the public ones, and none of its ``bnb_4bit_*``
-    names match this config's constructor. Handing that dict over verbatim is
-    what killed the HunyuanImage-3.0-Instruct-Distil-NF4 DiT stage with
-    "unexpected keyword argument '_load_in_4bit'": ``_build_single`` resolves
-    ``_OVERRIDES`` before the registry branch that does the filtering, so the
-    builder has to filter itself. Regression guard for that.
+    DiffusionBitsAndBytesConfig quantizes ``layer.weight`` during loading, so
+    giving it uint8-packed 4-bit weights produces garbage, not an error. The
+    pre-quantized path belongs to vLLM's BitsAndBytesConfig, which is what
+    HunyuanImage-3's DiT was written against: it reads
+    ``quant_config.llm_int8_skip_modules`` to keep the router gate in BF16
+    (hunyuan_image3_transformer.py). An upstream merge silently swapped the class
+    under it; this pins the routing back.
     """
+    from vllm.model_executor.layers.quantization import get_quantization_config
+
     config = build_quant_config(
         {
             "quant_method": "bitsandbytes",
             "_load_in_4bit": True,
             "_load_in_8bit": False,
             "load_in_4bit": True,
-            "bnb_4bit_quant_type": "fp4",
+            "bnb_4bit_quant_type": "nf4",
             "bnb_4bit_use_double_quant": True,
             "bnb_4bit_compute_dtype": "bfloat16",
-            "modules_to_not_convert": ["proj_out"],
+            "llm_int8_skip_modules": ["mlp.gate"],
         }
     )
-    assert config is not None
+    assert isinstance(config, get_quantization_config("bitsandbytes"))
     assert config.get_name() == "bitsandbytes"
-    # Checkpoint spellings that have a home must REACH it, not merely be
-    # reported as dropped: honoring fp4 as nf4, or losing the skip list, is a
-    # valid-but-wrong config, which is worse than the crash this replaced.
-    assert config.quant_type == "fp4"
+    # The load-bearing one: losing it silently re-quantizes the router gate.
+    assert config.llm_int8_skip_modules == ["mlp.gate"]
+
+
+def test_online_request_still_gets_the_diffusion_config():
+    """No serialized markers means a BF16 checkpoint quantized at load time."""
+    from vllm_omni.quantization.bitsandbytes_config import DiffusionBitsAndBytesConfig
+
+    assert isinstance(build_quant_config("bitsandbytes"), DiffusionBitsAndBytesConfig)
+    assert isinstance(
+        build_quant_config({"quant_method": "bitsandbytes", "quant_type": "fp4"}),
+        DiffusionBitsAndBytesConfig,
+    )
+
+
+def test_checkpoint_aliases_reach_the_online_config():
+    """modules_to_not_convert has a home on the online config; it must reach it.
+
+    Not a serialized marker, so this stays on the diffusion path -- a deploy-time
+    skip list for online quantization. Dropping it would silently quantize layers
+    the caller asked to leave alone.
+    """
+    config = build_quant_config({"quant_method": "bitsandbytes", "modules_to_not_convert": ["proj_out"]})
     assert config.ignored_layers == ["proj_out"]
-    # bnb_4bit_use_double_quant is deliberately NOT honored: True has been
-    # observed to turn wide projections into 1e30 (see
-    # test_bitsandbytes_compress_statistics_defaults_off). It is dropped with a
-    # WARNING rather than aliased.
-    assert config.compress_statistics is False
 
 
 def test_explicit_params_win_over_checkpoint_aliases():
@@ -109,13 +125,10 @@ def test_explicit_params_win_over_checkpoint_aliases():
     config = build_quant_config(
         {
             "quant_method": "bitsandbytes",
-            "bnb_4bit_quant_type": "fp4",
-            "quant_type": "nf4",
             "modules_to_not_convert": ["from_checkpoint"],
             "ignored_layers": ["explicit"],
         }
     )
-    assert config.quant_type == "nf4"
     assert config.ignored_layers == ["explicit"]
 
 

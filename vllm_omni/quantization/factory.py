@@ -96,11 +96,15 @@ logger = init_logger(__name__)
 # that same ``from_config`` would raise. Aliasing is the narrow fix.
 #
 # NOT listed, deliberately: ``bnb_4bit_use_double_quant`` -> ``compress_statistics``.
-# Honoring it faithfully is a live hazard, not a gap — see
+# These aliases only ever reach the ONLINE configs (a pre-quantized checkpoint
+# takes the branch in _build_bitsandbytes and never gets here), and on that path
+# nested absmax is a live hazard rather than a gap: see
 # ``DiffusionBitsAndBytesConfig.__init__``, where True turns MiniMax-H3's
 # ``blocks.0.adaln_proj`` output into 1e30 and fails the request with
-# "v must be finite". It stays dropped, and _drop_unsupported_kwargs' WARNING
-# names it so the choice is visible in the log rather than implicit here.
+# "v must be finite". For an already-quantized checkpoint the flag is not a
+# runtime knob at all — nestedness travels in the serialized QuantState
+# descriptor and the model unpacks it itself (HunyuanImage-3's
+# ``dequantize_double_quant``), so nothing is lost by omitting it here either.
 _CHECKPOINT_KEY_ALIASES = {
     "modules_to_not_convert": "ignored_layers",  # HF / AutoRound skip list
     "bnb_4bit_quant_type": "quant_type",  # transformers BitsAndBytesConfig
@@ -169,8 +173,48 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return _construct_override(DiffusionInt8Config, kw)
 
 
+# transformers' ``BitsAndBytesConfig.to_dict()`` vocabulary. Any of these in a
+# checkpoint's quantization_config means the weights on disk are ALREADY
+# quantized — which is the one case DiffusionBitsAndBytesConfig cannot serve.
+_SERIALIZED_BNB_MARKERS = (
+    "load_in_4bit",
+    "_load_in_4bit",
+    "load_in_8bit",
+    "_load_in_8bit",
+    "bnb_4bit_quant_type",
+    "llm_int8_skip_modules",
+)
+
+
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
-    """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
+    """BitsAndBytes: vLLM's config for pre-quantized checkpoints, ours for online.
+
+    Two unrelated callers share this method name, and they need different classes:
+
+    * ONLINE — upstream #5037 registered this override to quantize BF16/FP16
+      diffusion transformers at load time. That is what DiffusionBitsAndBytesConfig
+      does, and all it does: BnBOnlineLinearMethod calls ``bnb_F.quantize_4bit`` on
+      ``layer.weight`` unconditionally (bitsandbytes_config.py).
+    * OFFLINE — HunyuanImage-3's DiT ships an already-quantized NF4 checkpoint. Its
+      weights are uint8-packed 4-bit with separate ``quant_state.bitsandbytes__nf4``
+      descriptors, which the model parses and binds itself
+      (hunyuan_image3_transformer.py), and it reads
+      ``quant_config.llm_int8_skip_modules`` to keep the router gate in BF16. Both
+      are vLLM-BitsAndBytesConfig APIs, written (f27e506c) while this method still
+      resolved through the vLLM registry.
+
+    Handing an offline checkpoint to the online config is not a near-miss: it would
+    re-quantize 4-bit packed bytes as if they were activations-scale floats. The
+    upstream merge that added this override made exactly that swap silently, so
+    route by the only signal that separates the two — whether the checkpoint's own
+    config says it is already quantized.
+    """
+    if any(marker in kw for marker in _SERIALIZED_BNB_MARKERS):
+        # Reproduce the registry branch of _build_single verbatim: this IS the
+        # path these checkpoints took before the override existed.
+        config_cls = get_quantization_config("bitsandbytes")
+        return config_cls(**_drop_unsupported_kwargs(config_cls, kw))
+
     from .bitsandbytes_config import DiffusionBitsAndBytesConfig
 
     return _construct_override(DiffusionBitsAndBytesConfig, kw)
