@@ -81,32 +81,113 @@ from .component_config import ComponentQuantizationConfig  # noqa: E402
 logger = init_logger(__name__)
 
 
+# Checkpoint spellings that mean one of our constructor params. Applied before
+# the signature filter, and only when the canonical key is absent, so an
+# explicit Omni-side value always wins.
+#
+# These exist because the override builders construct through ``__init__``
+# rather than ``from_config``, and the classes' own ``from_config`` is where
+# such translation normally lives. Routing overrides through ``from_config``
+# instead is NOT a drop-in swap: ``DiffusionInt8Config.from_config`` derives
+# ``is_checkpoint_int8_serialized`` from ``quant_method`` (int8_config.py) where
+# ``__init__`` defaults it to False, so the switch would flip long-standing int8
+# models between online and offline quantization; and ``_build_single`` never
+# receives ``quant_method`` anyway (``_pop_method_name`` strips it upstream), so
+# that same ``from_config`` would raise. Aliasing is the narrow fix.
+#
+# NOT listed, deliberately: ``bnb_4bit_use_double_quant`` -> ``compress_statistics``.
+# Honoring it faithfully is a live hazard, not a gap — see
+# ``DiffusionBitsAndBytesConfig.__init__``, where True turns MiniMax-H3's
+# ``blocks.0.adaln_proj`` output into 1e30 and fails the request with
+# "v must be finite". It stays dropped, and _drop_unsupported_kwargs' WARNING
+# names it so the choice is visible in the log rather than implicit here.
+_CHECKPOINT_KEY_ALIASES = {
+    "modules_to_not_convert": "ignored_layers",  # HF / AutoRound skip list
+    "bnb_4bit_quant_type": "quant_type",  # transformers BitsAndBytesConfig
+}
+
+
+def _accepted_params(config_cls: type) -> set[str] | None:
+    """Names ``config_cls.__init__`` accepts, or None when it takes anything.
+
+    None means "do not police this class": either the signature is unreadable
+    (builtin / C-implemented ``__init__``) or it declares ``**kwargs``, which is
+    an explicit opt-in to receiving extras.
+    """
+    try:
+        params = inspect.signature(config_cls.__init__).parameters
+    except (TypeError, ValueError):  # builtins / C-implemented __init__
+        return None
+
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return None
+    return {name for name in params if name != "self"}
+
+
+def _apply_checkpoint_aliases(config_cls: type, kw: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite known checkpoint spellings onto the params ``config_cls`` accepts."""
+    accepted = _accepted_params(config_cls)
+    if accepted is None:  # class takes **kwargs; it parses its own spellings
+        return kw
+
+    aliased = dict(kw)
+    for alias, canonical in _CHECKPOINT_KEY_ALIASES.items():
+        if alias in aliased and canonical in accepted and aliased.get(canonical) is None:
+            aliased[canonical] = aliased[alias]
+    return aliased
+
+
+def _construct_override(config_cls: type, kw: dict[str, Any]) -> QuantizationConfig:
+    """Instantiate an Omni quant config from checkpoint-derived kwargs.
+
+    Every ``_OVERRIDES`` builder MUST go through here rather than calling its
+    config class directly. ``_build_single`` resolves ``_OVERRIDES`` BEFORE the
+    vLLM registry and returns immediately, so the ``_drop_unsupported_kwargs``
+    call on the registry branch never runs for an overridden method — filtering
+    has to happen inside the builder, against the real target class. (Filtering
+    against the builder function itself is a no-op: they all take ``**kw``,
+    which reads as "accepts everything".)
+
+    This is not hypothetical. The guard was added for
+    HunyuanImage-3.0-Instruct-Distil-NF4 while ``bitsandbytes`` still resolved
+    through the registry; upstream then added a ``bitsandbytes`` override, and
+    the merge of the two silently disarmed it — the DiT stage died on
+    ``DiffusionBitsAndBytesConfig.__init__() got an unexpected keyword argument
+    '_load_in_4bit'``. Neither side conflicted textually, so nothing flagged it.
+
+    Alias BEFORE filtering: dropping is the last resort, and a checkpoint field
+    that has a home must reach it rather than merely be reported as discarded.
+    """
+    aliased = _apply_checkpoint_aliases(config_cls, kw)
+    return config_cls(**_drop_unsupported_kwargs(config_cls, aliased))
+
+
 def _build_int8(**kw: Any) -> QuantizationConfig:
     """Lazy import for Int8 diffusion config (supports CUDA + NPU)."""
     from .int8_config import DiffusionInt8Config
 
-    return DiffusionInt8Config(**kw)
+    return _construct_override(DiffusionInt8Config, kw)
 
 
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
     """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
     from .bitsandbytes_config import DiffusionBitsAndBytesConfig
 
-    return DiffusionBitsAndBytesConfig(**kw)
+    return _construct_override(DiffusionBitsAndBytesConfig, kw)
 
 
 def _build_mxfp8(**kw: Any) -> QuantizationConfig:
     """Lazy import for W8A8 MXFP8 diffusion config (NPU only)."""
     from .mxfp8_config import DiffusionMXFP8Config
 
-    return DiffusionMXFP8Config(**kw)
+    return _construct_override(DiffusionMXFP8Config, kw)
 
 
 def _build_mxfp4(**kw: Any) -> QuantizationConfig:
     """Lazy import for W4A4 MXFP4 diffusion config (NPU only)."""
     from .mxfp4_config import DiffusionMXFP4Config
 
-    return DiffusionMXFP4Config(**kw)
+    return _construct_override(DiffusionMXFP4Config, kw)
 
 
 def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
@@ -122,7 +203,7 @@ def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     """
     from .mxfp4_config import DiffusionMXFP4DualScaleMixedConfig
 
-    return DiffusionMXFP4DualScaleMixedConfig(**kw)
+    return _construct_override(DiffusionMXFP4DualScaleMixedConfig, kw)
 
 
 def _build_inc(**kw: Any) -> QuantizationConfig:
@@ -133,10 +214,10 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     if "bits" in kw and "weight_bits" not in kw:
         kw["weight_bits"] = kw.pop("bits")
 
-    # Filter to only valid INCConfig params
-    valid = set(inspect.signature(OmniINCConfig.__init__).parameters) - {"self"}
-    filtered = {k: v for k, v in kw.items() if k in valid}
-    return OmniINCConfig(**filtered)
+    # Was a hand-rolled signature filter; _construct_override does the same thing
+    # and additionally logs what it discarded, so a checkpoint field this runtime
+    # silently ignores becomes visible instead of vanishing.
+    return _construct_override(OmniINCConfig, kw)
 
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
@@ -288,6 +369,12 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
     """Build a single QuantizationConfig by method name.
 
     Resolution: _OVERRIDES first, then vLLM registry via from_config().
+
+    Note the asymmetry: the registry branch below filters checkpoint kwargs
+    here, but the _OVERRIDES branch returns before ever reaching it. Any builder
+    registered in _OVERRIDES is therefore responsible for its own filtering and
+    must construct through _construct_override — see its docstring for the
+    upstream-merge accident that this rule exists to prevent.
     """
     method = _normalize_method_name(method)
 
@@ -329,16 +416,10 @@ def _drop_unsupported_kwargs(config_cls: type, kwargs: dict[str, Any]) -> dict[s
     Anything else that is dropped is logged at WARNING, because that is a value
     the checkpoint meant to express and this runtime does not honor.
     """
-    try:
-        signature = inspect.signature(config_cls.__init__)
-    except (TypeError, ValueError):  # builtins / C-implemented __init__
+    accepted = _accepted_params(config_cls)
+    if accepted is None:
         return kwargs
 
-    params = signature.parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return kwargs
-
-    accepted = {name for name in params if name != "self"}
     kept = {key: value for key, value in kwargs.items() if key in accepted}
     dropped = sorted(set(kwargs) - set(kept))
     if dropped:

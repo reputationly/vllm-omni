@@ -67,6 +67,58 @@ def test_bitsandbytes_compress_statistics_defaults_off():
     assert DiffusionBitsAndBytesConfig.from_config({"compress_statistics": True}).compress_statistics is True
 
 
+def test_bitsandbytes_config_from_transformers_checkpoint_dict():
+    """A transformers-serialized quantization_config must not crash the build.
+
+    ``BitsAndBytesConfig.to_dict()`` writes the private backing fields
+    (``_load_in_4bit``) alongside the public ones, and none of its ``bnb_4bit_*``
+    names match this config's constructor. Handing that dict over verbatim is
+    what killed the HunyuanImage-3.0-Instruct-Distil-NF4 DiT stage with
+    "unexpected keyword argument '_load_in_4bit'": ``_build_single`` resolves
+    ``_OVERRIDES`` before the registry branch that does the filtering, so the
+    builder has to filter itself. Regression guard for that.
+    """
+    config = build_quant_config(
+        {
+            "quant_method": "bitsandbytes",
+            "_load_in_4bit": True,
+            "_load_in_8bit": False,
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "fp4",
+            "bnb_4bit_use_double_quant": True,
+            "bnb_4bit_compute_dtype": "bfloat16",
+            "modules_to_not_convert": ["proj_out"],
+        }
+    )
+    assert config is not None
+    assert config.get_name() == "bitsandbytes"
+    # Checkpoint spellings that have a home must REACH it, not merely be
+    # reported as dropped: honoring fp4 as nf4, or losing the skip list, is a
+    # valid-but-wrong config, which is worse than the crash this replaced.
+    assert config.quant_type == "fp4"
+    assert config.ignored_layers == ["proj_out"]
+    # bnb_4bit_use_double_quant is deliberately NOT honored: True has been
+    # observed to turn wide projections into 1e30 (see
+    # test_bitsandbytes_compress_statistics_defaults_off). It is dropped with a
+    # WARNING rather than aliased.
+    assert config.compress_statistics is False
+
+
+def test_explicit_params_win_over_checkpoint_aliases():
+    """An alias must never overwrite a value the caller set explicitly."""
+    config = build_quant_config(
+        {
+            "quant_method": "bitsandbytes",
+            "bnb_4bit_quant_type": "fp4",
+            "quant_type": "nf4",
+            "modules_to_not_convert": ["from_checkpoint"],
+            "ignored_layers": ["explicit"],
+        }
+    )
+    assert config.quant_type == "nf4"
+    assert config.ignored_layers == ["explicit"]
+
+
 def test_bitsandbytes_config_with_custom_params():
     """Test BitsAndBytes config with custom parameters."""
     config = build_quant_config(
