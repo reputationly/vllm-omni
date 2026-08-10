@@ -29,7 +29,7 @@ import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from starlette.datastructures import State
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -126,6 +126,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
     ResponseFormat,
 )
+from vllm_omni.entrypoints.openai.protocol.video_tasks import VideoTaskRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
@@ -3091,6 +3092,19 @@ def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,
 ) -> None:
+    """Delete the temp copies a multipart upload spooled to disk.
+
+    ONLY call this on references whose files WE created. It is not a no-op for
+    caller-owned files: the audio branch below falls back to deleting
+    ``reference_audio.path`` itself whenever ``cleanup_paths`` is empty, so
+    calling it on a path the caller handed us — an NFS reference the facade
+    materialized, say — erases that caller's file the first time a task runs.
+
+    That is why the JSON task path (``/v1/tasks/video/``) builds its reference
+    dataclasses with EMPTY ``cleanup_paths`` and never calls this at all; see
+    ``_run_video_task_job``. If you are adding a fourth video surface, decide
+    which of the two you are before wiring cleanup up.
+    """
     if reference_video is not None:
         for path in reference_video.cleanup_paths:
             if os.path.exists(path):
@@ -4140,8 +4154,8 @@ async def create_audio_gen_task(request: AudioGenTaskRequest, raw_request: Reque
 # ---------------------------------------------------------------------------
 
 
-def _resolve_task_image_path(path: str, allowed_root: str | None) -> str:
-    """Validate one facade-injected input image path.
+def _resolve_task_image_path(path: str, allowed_root: str | None, *, media_kind: str = "image") -> str:
+    """Validate one facade-injected input media path.
 
     SECURITY: unlike the sync endpoints (which take bytes/URLs), this endpoint
     reads server-side paths. The facade owns ``image_path`` and only ever injects
@@ -4153,17 +4167,21 @@ def _resolve_task_image_path(path: str, allowed_root: str | None) -> str:
     We reuse vLLM's existing ``--allowed-local-media-path`` rather than inventing
     a second whitelist, so operators have one knob. Fail closed: when it is unset
     we refuse path inputs entirely instead of allowing everything.
+
+    ``media_kind`` only shapes the error text — /v1/tasks/video/ feeds video and
+    audio paths through the same confinement, and "Input image not found" for an
+    mp3 sends whoever is debugging to the wrong field.
     """
     candidate = (path or "").strip()
     if candidate.startswith("file://"):
         candidate = url2pathname(urlparse(candidate).path)
     if not candidate:
-        raise ValueError("Empty input image path")
+        raise ValueError(f"Empty input {media_kind} path")
     if not os.path.isabs(candidate):
-        raise ValueError(f"Input image path must be absolute: {candidate!r}")
+        raise ValueError(f"Input {media_kind} path must be absolute: {candidate!r}")
     if not allowed_root:
         raise ValueError(
-            "Refusing to read a local input image because --allowed-local-media-path is not set. "
+            f"Refusing to read a local input {media_kind} because --allowed-local-media-path is not set. "
             "Set it to the facade's media root (never '/') to enable path inputs."
         )
     real_root = os.path.realpath(allowed_root)
@@ -4175,10 +4193,32 @@ def _resolve_task_image_path(path: str, allowed_root: str | None) -> str:
     except ValueError:  # different drives / mixed absolute-relative
         inside = False
     if not inside:
-        raise ValueError(f"Input image path {candidate!r} is outside --allowed-local-media-path {allowed_root!r}")
+        raise ValueError(
+            f"Input {media_kind} path {candidate!r} is outside --allowed-local-media-path {allowed_root!r}"
+        )
     if not os.path.isfile(real_path):
-        raise ValueError(f"Input image not found: {candidate!r}")
+        raise ValueError(f"Input {media_kind} not found: {candidate!r}")
     return real_path
+
+
+def _resolve_task_media_paths(paths: list[str], allowed_root: str | None, *, media_kind: str) -> list[str]:
+    """Confine a list of facade-injected paths, returning the resolved real paths."""
+    return [_resolve_task_image_path(path, allowed_root, media_kind=media_kind) for path in paths]
+
+
+def _task_allowed_media_root(app_state: Any, engine_client: Any) -> str:
+    """Resolve the ``--allowed-local-media-path`` whitelist for a task endpoint.
+
+    Read the CLI args FIRST: a pure-diffusion server (single diffusion stage) has
+    no vllm_config, so ``engine_client.model_config`` either does not exist or does
+    not carry ``allowed_local_media_path``, and reading only from there makes every
+    path input fail closed even when the operator did pass the flag.
+    """
+    allowed_root = getattr(getattr(app_state, "args", None), "allowed_local_media_path", "") or ""
+    if not allowed_root:
+        model_config = getattr(engine_client, "model_config", None)
+        allowed_root = getattr(model_config, "allowed_local_media_path", "") or ""
+    return allowed_root
 
 
 def _confine_task_output_path(path: str, allowed_roots: list[str]) -> str:
@@ -4566,15 +4606,7 @@ async def _run_image_job(
         # behavior, mirroring /v1/images/edits: RGBA/P inputs otherwise diverge
         # from the offline path and can shift AR recaption before DiT runs.
         normalize_rgb = request.bot_task is not None or request.sys_type is not None
-        # Resolve the whitelist from the CLI args FIRST: a pure-diffusion server
-        # (single diffusion stage) has no vllm_config, so engine_client.model_config
-        # either does not exist or does not carry allowed_local_media_path, and
-        # reading only from there makes every path input fail closed even when the
-        # operator did pass the flag.
-        allowed_root = getattr(getattr(app_state, "args", None), "allowed_local_media_path", "") or ""
-        if not allowed_root:
-            model_config = getattr(engine_client, "model_config", None)
-            allowed_root = getattr(model_config, "allowed_local_media_path", "") or ""
+        allowed_root = _task_allowed_media_root(app_state, engine_client)
         input_paths = request.input_image_paths()
         # Count first, decode second. The route already rejected an over-limit
         # request at submit; this is defence in depth for any other caller, and
@@ -4885,6 +4917,253 @@ async def create_image_task(request: ImageTaskRequest, raw_request: Request) -> 
             stage_configs=stage_configs,
             width=width,
             height=height,
+        )
+    )
+    await AUDIO_TASKS.upsert(task_id, task)
+    return ref
+
+
+# ---------------------------------------------------------------------------
+# Async video task API (text-to-video / keyframe / reference-driven video).
+#
+# Fourth sibling of the TTS, diffusion-audio and image async APIs above, sharing
+# their task store / manager / registry so the global status, result, cancel and
+# queue endpoints below serve video tasks unchanged — only submit is new.
+#
+# Same reason for existing as /v1/tasks/image/: the GPUStack facade dispatches
+# strictly by engine kind, POSTing to ``v1/tasks/{kind}/`` (gpustack
+# routes/videos.py), and every task_type that is not image/audio/music/audiogen
+# falls through to kind "video". POST /v1/videos and /v1/videos/sync cannot serve
+# it — they are multipart-only and take references as uploaded bytes or URLs,
+# while the facade sends JSON whose media inputs are absolute NFS paths it has
+# already materialized. Those two stay the direct-caller surface.
+# ---------------------------------------------------------------------------
+
+
+async def _run_video_task_job(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+    task_id: str,
+    save_result_path: str,
+    *,
+    image_paths: list[str],
+    video_paths: list[str],
+    audio_paths: list[str],
+    allowed_root: str,
+    app_state: Any,
+) -> None:
+    """Render one video task and write the MP4 to ``save_result_path``.
+
+    Mirrors ``_run_image_job``: the route resolved every handle while its HTTP
+    request was alive, so this coroutine outlives it safely.
+
+    The reference dataclasses are built with EMPTY ``cleanup_paths`` and
+    ``_cleanup_video_references`` is deliberately never called here. Those inputs
+    are the facade's NFS files, not temp copies we made — and for audio the
+    cleanup helper falls back to deleting ``reference_audio.path`` itself when
+    ``cleanup_paths`` is empty, which would erase the caller's uploaded reference
+    the first time a task ran. The multipart path needs that helper because it
+    spools uploads to /tmp; this path materializes nothing.
+    """
+    job = await AUDIO_TASK_STORE.get(task_id)
+    if job is None:
+        logger.warning("Video task %s missing before generation started; skipping", task_id)
+        return
+
+    await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.PROCESSING, "start_time": time.time()})
+    try:
+        reference_image: ReferenceImage | None = None
+        if image_paths:
+            # RGB-normalized to match the multipart path's H3 handling
+            # (_persist_uploaded_media_references converts every reference image),
+            # so a PNG with alpha behaves identically whichever surface sent it.
+            images = await asyncio.to_thread(_load_task_images, image_paths, allowed_root, normalize_rgb=True)
+            reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
+        # Videos and audio stay as PATHS: the reference encoders need the original
+        # container streams (a video's soundtrack included), which is also what the
+        # multipart path hands over once it has spooled the upload to disk.
+        reference_video = ReferenceVideo(data=list(video_paths)) if video_paths else None
+        reference_audio = (
+            ReferenceAudio(path=audio_paths if len(audio_paths) > 1 else audio_paths[0]) if audio_paths else None
+        )
+
+        video_bytes, _stage_durations, _peak_memory_mb, _action = await handler.generate_video_bytes(
+            request,
+            task_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+            reference_audio=reference_audio,
+        )
+        if not video_bytes:
+            # generate_video_bytes returns b"" for action-only models, which have
+            # no MP4 to persist. Writing a 0-byte file would report COMPLETED and
+            # hand the facade an unplayable artifact.
+            raise RuntimeError("Video generation returned no video bytes for this model.")
+
+        await atomic_write_bytes(video_bytes, save_result_path)
+        logger.info("Video task %s wrote %s", task_id, save_result_path)
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()})
+    except asyncio.CancelledError:
+        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
+        raise
+    except (EngineGenerateError, EngineDeadError) as exc:
+        logger.exception("Video task %s failed (engine error)", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        if isinstance(exc, EngineDeadError):
+            terminate_if_errored(server=app_state.server, engine=app_state.engine_client)
+    except Exception as exc:
+        logger.exception("Video task %s failed", task_id)
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.FAILED,
+                "end_time": time.time(),
+                # Keep OmniClientError's own error_type ("BadRequestError") rather
+                # than flattening every failure to a class name: the facade copies
+                # error_type through verbatim, and it is the only thing left that
+                # distinguishes "the caller sent an illegal parameter" from "the
+                # engine broke" once the submit call has already returned 200.
+                "error": str(exc),
+                "error_type": getattr(exc, "error_type", None) or type(exc).__name__,
+            },
+        )
+
+
+@router.post(
+    "/v1/tasks/video/",
+    responses={
+        HTTPStatus.OK.value: {"model": AudioTaskResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def create_video_task(request: VideoTaskRequest, raw_request: Request) -> AudioTaskResponse:
+    """Submit an asynchronous video generation task.
+
+    Returns immediately with a PENDING record; poll the shared global status /
+    result / cancel endpoints (keyed by task_id) exactly like the TTS,
+    diffusion-audio and image async APIs.
+
+    Everything knowable without the GPU is checked HERE — prompt, model identity,
+    param ranges, media paths — so the caller gets a real 400 instead of a task
+    that fails minutes later, and so a rejected request never takes a queue slot.
+    Model-specific validation (MiniMax-H3's duration window, frame_indices arity,
+    checkpoint-partition support) belongs to the pipeline and surfaces on the task
+    record as FAILED with the engine's own message.
+    """
+    if not (request.prompt or "").strip():
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Empty prompt")
+
+    # Reject byte/URL references outright. They are the multipart endpoints'
+    # input model; here they would be silently ignored, which is the exact
+    # failure mode that makes a misrouted request look like a model bug.
+    unsupported = request.unsupported_reference_keys()
+    if unsupported:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                f"{', '.join(unsupported)} not supported by /v1/tasks/video/; it takes server paths "
+                "(image_path / last_frame_path / video_path / audio_path). Use POST /v1/videos for "
+                "uploaded bytes or URL references."
+            ),
+        )
+
+    # Resolve the handler HERE, while the request is still alive: a misrouted
+    # model then fails at submit with a proper status instead of minutes later
+    # inside the job, and the job never needs the Request itself.
+    handler = Omnivideo(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Video generation handler not initialized.",
+        )
+    app_state = raw_request.app.state
+    app_model_name, app_stage_configs = _resolve_video_runtime_context(raw_request)
+    model_name = handler.model_name or app_model_name or request.model or "unknown"
+    # The facade strips `model` (control key), so absent means "this server's
+    # model". A DIFFERENT name is a misrouted request: serving it silently would
+    # return a video from a model the caller did not ask for. Same check
+    # _parse_video_form runs for the multipart endpoints.
+    if not (request.model or "").strip():
+        request.model = model_name
+    elif request.model != model_name:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{request.model}' but server is running '{model_name}'.",
+        )
+    handler.set_stage_configs_if_missing(app_stage_configs)
+
+    # Range/format checks on the generation params happen in this constructor —
+    # VideoGenerationRequest is the one schema that types them, so a bad
+    # num_inference_steps or a malformed size is a 400 here rather than a
+    # ValidationError escaping as a 500.
+    try:
+        video_request = request.to_video_request()
+    except ValidationError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+
+    engine_client = getattr(app_state, "engine_client", None)
+    allowed_root = _task_allowed_media_root(app_state, engine_client)
+    try:
+        image_paths = _resolve_task_media_paths(request.reference_image_paths(), allowed_root, media_kind="image")
+        video_paths = _resolve_task_media_paths(request.reference_video_paths(), allowed_root, media_kind="video")
+        audio_paths = _resolve_task_media_paths(request.reference_audio_paths(), allowed_root, media_kind="audio")
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+
+    # Knowable here, so it must not become a FAILED task minutes later.
+    # _run_and_extract raises the same 400, but by then reserve() has spent a
+    # queue slot and the facade only sees error_type="HTTPException" instead of
+    # the BadRequestError that tells it the CALLER was wrong. The check there
+    # stays: it also guards the multipart /v1/videos surface.
+    if image_paths and video_paths and not bool(getattr(handler, "supports_mixed_reference_inputs", False)):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="This diffusion model does not support mixed image and video references.",
+        )
+
+    task_id = request.task_id or f"video_task_{random_uuid()}"
+    save_result_path = resolve_save_path(request.save_result_path, task_id, STORAGE_MANAGER.storage_path, ".mp4")
+    # Confine the write target. The facade dictates a path under its own NFS
+    # output root (which the GPUStack backend also passes as
+    # --allowed-local-media-path), so both roots are legitimate; anything else is
+    # a direct caller trying to write outside them.
+    try:
+        save_result_path = _confine_task_output_path(
+            save_result_path,
+            [
+                STORAGE_MANAGER.storage_path,
+                allowed_root,
+            ],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+
+    try:
+        ref = await AUDIO_TASK_MANAGER.reserve(task_id, save_result_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail=str(exc)) from exc
+
+    task = asyncio.create_task(
+        _run_video_task_job(
+            handler,
+            video_request,
+            task_id,
+            save_result_path,
+            image_paths=image_paths,
+            video_paths=video_paths,
+            audio_paths=audio_paths,
+            allowed_root=allowed_root,
+            app_state=app_state,
         )
     )
     await AUDIO_TASKS.upsert(task_id, task)
