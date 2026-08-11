@@ -782,6 +782,17 @@ class MossTTSCodecDecoder(nn.Module):
             self._n_channels,
         )
 
+        # Streaming decode needs the codec's persistent decoder state pool.
+        # Surface a missing pool here rather than from the first decode call:
+        # inside ``forward()`` it kills the Stage-1 engine core, which takes the
+        # whole server down long after it reported ready.
+        if self._async_chunk and not callable(getattr(codec, "initialize_decoder_state_pool", None)):
+            raise RuntimeError(
+                f"MOSS codec built from {codec_path} ({type(codec).__name__}) has no decoder state pool, "
+                "so it cannot serve async_chunk streaming decode. Deploy with async_chunk disabled or use a "
+                "codec checkpoint the v2 tokenizer classes can load."
+            )
+
         self._configure_decoder_cudagraph(device)
         if self._async_chunk and self._streaming_graph_batch_sizes and self._streaming_graph_frame_sizes:
             self._ensure_stream_session()
@@ -794,11 +805,25 @@ class MossTTSCodecDecoder(nn.Module):
 
     def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
         config_dict, _ = MossAudioTokenizerV2Config.get_config_dict(codec_path)
-        is_v2 = config_dict.get("number_channels", 1) >= 2
+        declared_channels = config_dict.get("number_channels", config_dict.get("channels_numbers"))
+        is_v2 = int(declared_channels or 1) >= 2
 
-        if is_v2:
+        # The legacy v1 classes only implement one-shot ``batch_decode``; the
+        # persistent decoder state pool that ``async_chunk`` streaming decode
+        # needs exists solely in the v2 classes. Those load a mono v1
+        # checkpoint unchanged (their projections collapse to Identity exactly
+        # where it ships no weights), so a streaming deployment must use them
+        # for both layouts.
+        if is_v2 or self._async_chunk:
             try:
                 codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
+                if declared_channels is None:
+                    # MossAudioTokenizerV2Config defaults number_channels to 2
+                    # while the v1 config class defaults to 1, and the mono
+                    # MOSS-Audio-Tokenizer checkpoint declares neither. Taking
+                    # the v2 default would de-interleave a mono waveform into
+                    # two channels and halve every utterance's duration.
+                    codec_cfg.number_channels = 1
                 codec = MossAudioTokenizerV2Model(codec_cfg)
                 logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
                 return codec_cfg, codec
