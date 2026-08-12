@@ -1,0 +1,68 @@
+# MiniMax-H3 FL2VA Turbo8 (BF16) — 加速版 DiT stage, A100 PCIE 40G x4
+#
+# 与 minimax_h3_a100_40g.yaml（原始版 / INT8 / 20 步）成对使用，两者可以同时在线，
+# 分别作为「原始版」和「加速版」对外提供。差异只有三处：权重、步数、显存画像。
+#
+# 权重：/nfs-data/models/MiniMax-H3-FL2VA-Turbo8-BF16
+#   由 tools/minimax_h3/bake_turbo_lora.py 把 lightx2v 的
+#   minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors（rank 128 / alpha 8 →
+#   缩放 0.0625）融进官方 BF16 FL2VA transformer 得到，208 个线性层被改，
+#   其余 327 个张量逐字节未变（已验证）。
+#   是 BF16 不是 INT8 —— 同样不要传任何量化参数。
+#
+# 实测（832x480 / 209 帧 / seed 11 / 同 prompt，对比现网 INT8 20 步）：
+#   耗时      63 s   vs 111 s        1.76x
+#   四类内容  58-62 s vs 109-112 s   1.79-1.93x
+#   锐度      追平或超过 20 步（镜头快移那类 +19%，需人眼确认是否过锐）
+#   768p      345 帧 8 步约 338 s（热态），基座 20 步约 810 s
+#
+# 显存画像与原始版不同，排容量时按这个来：
+#   480p 209 帧   29.8 GiB/卡（INT8 原始版是 24-25）
+#   768p 345 帧   36.66 GiB/卡，余量仅 2.8 GiB —— 768p 长视频上线前必须压测
+#   权重体积      62 GB（INT8 原始版 44 GB）
+#   宿主内存      与原始版同量级，仍需 >= 200 GB 可用
+#
+# --- 和原始版一样挪不进本文件的东西 ---
+# 六个 VLLM_OMNI_* 环境变量、--init-timeout / --stage-init-timeout，
+# 原因见 minimax_h3_a100_40g.yaml 的注释，此处不重复。
+pipeline: minimax_h3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    task_type: fl2va
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+
+    enable_cpu_offload: true
+    vae_use_tiling: true
+    diffusion_attention_backend: FLASH_ATTN
+
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+
+    enable_multithread_weight_load: false
+    enable_diffusion_pipeline_profiler: true
+
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+
+    default_sampling_params:
+      # 加速版的核心：8 步。这份权重是按 4/8 NFE 蒸馏的，
+      # 超过 8 步会开始过锐（实测 20 步明显劣化，不要调高）。
+      # flow_shift 不在这里设：H3 从 extra_params 读，默认 12.0（音频 3.0），
+      # 与该 LoRA 的训练契约一致。
+      num_inference_steps: 8
