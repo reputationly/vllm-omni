@@ -1426,11 +1426,15 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
+    * ``PROGRESS`` — mid-forward status ping (``result`` carries a
+      ``diffusion.progress.ProgressEvent``). Fire-and-forget: it resolves no
+      future and may be dropped without affecting the request.
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
+    PROGRESS = "progress"
 
 
 @dataclass

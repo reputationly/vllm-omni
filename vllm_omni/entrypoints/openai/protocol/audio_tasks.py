@@ -170,3 +170,10 @@ class AudioTaskResponse(BaseModel):
     error: str | None = None
     error_type: str = ""
     save_result_path: str | None = None
+    # Progress contract shared with the GPUStack facade: the engine reports which
+    # phase it is in and how far through it, and the facade folds that into a
+    # global percentage using its own per-model stage weights. Absent (None) for
+    # models that don't report — the facade falls back to an elapsed-time
+    # estimate, so these are optional by design.
+    phase: str | None = None
+    phase_progress: float | None = None

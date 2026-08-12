@@ -47,6 +47,11 @@ logger = init_logger(__name__)
 
 _SIGNAL_EXIT_BASE = 128
 
+# How often the proc volunteers queue position and phase for its in-flight
+# requests. Deliberately coarse: this feeds a human-facing progress bar polled
+# every few seconds, and the pipeline-side reporter is already throttled.
+_PROGRESS_PUMP_INTERVAL_S = 0.5
+
 
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
@@ -386,6 +391,62 @@ class StageDiffusionProc:
             finally:
                 tasks.pop(request_id, None)
 
+        async def _pump_progress() -> None:
+            """Volunteer queue position and phase for in-flight requests.
+
+            The engine parks both of these locally, but the client lives in
+            another process and cannot ask: the request socket is one-way
+            PUSH/PULL, and turning a status poll into an RPC round-trip would
+            park an HTTP handler behind whatever the engine loop is doing. So
+            the proc pushes them on the existing response socket instead, and
+            the client keeps the latest per request.
+
+            Sends only on change, so an idle denoise loop between throttled
+            phase reports costs nothing. A client that predates this message
+            type ignores it (its drain skips unknown types), which is what
+            makes this safe to roll out on one side first.
+
+            Every send is NOBLOCK and a full queue simply drops the tick: a
+            status message must never sit ahead of a result on this socket, and
+            the client only ever wants the latest value anyway. Dropping also
+            forgets the last-sent state so the next tick resends rather than
+            deduping against something the client never got.
+            """
+            last: dict[str, tuple[Any, Any, Any]] = {}
+            while True:
+                await asyncio.sleep(_PROGRESS_PUMP_INTERVAL_S)
+                try:
+                    for request_id in list(tasks):
+                        executing = self._engine.is_request_executing(request_id)
+                        progress = self._engine.get_progress(request_id) or {}
+                        current = (executing, progress.get("phase"), progress.get("phase_progress"))
+                        if last.get(request_id) == current:
+                            continue
+                        last[request_id] = current
+                        try:
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "progress",
+                                        "request_id": request_id,
+                                        "executing": current[0],
+                                        "phase": current[1],
+                                        "phase_progress": current[2],
+                                    }
+                                ),
+                                flags=zmq.NOBLOCK,
+                            )
+                        except zmq.Again:
+                            last.pop(request_id, None)
+                    for request_id in list(last):
+                        if request_id not in tasks:
+                            del last[request_id]
+                except Exception:
+                    # Never let a status nicety take down the request loop.
+                    logger.debug("Progress pump tick failed.", exc_info=True)
+
+        progress_pump = asyncio.create_task(_pump_progress())
+
         try:
             while True:
                 # Await recv and fatal_event concurrently so the loop wakes
@@ -482,6 +543,12 @@ class StageDiffusionProc:
             raise
 
         finally:
+            # Cancelled before the request tasks: the pump reads ``tasks`` and
+            # writes to a socket this block is about to close.
+            progress_pump.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await progress_pump
+
             for task in tasks.values():
                 task.cancel()
             if tasks:

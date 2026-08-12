@@ -1108,6 +1108,31 @@ class DiffusionEngine:
         self.executor.shutdown()
         self._shutdown_complete = True
 
+    def is_request_executing(self, request_id: str) -> bool | None:
+        """Whether the scheduler has actually started this request.
+
+        Tri-state on purpose. ``True``/``False`` mean the scheduler knows the
+        request and it is (or is not) executing; ``None`` means it has no state
+        for it — not yet submitted, already finished, or a request that never
+        goes through the diffusion scheduler at all. Callers must not read None
+        as "queued": for a plain TTS job that is simply the normal answer.
+        """
+        state = self.scheduler.get_request_state(request_id)
+        if state is None or state.status is None:
+            return None
+        return state.status == DiffusionRequestStatus.RUNNING
+
+    def get_progress(self, request_id: str) -> dict[str, Any] | None:
+        """Live progress for a running request as ``{"phase", "phase_progress"}``.
+
+        None when the pipeline reports nothing — most don't, and callers are
+        expected to have a coarser fallback rather than treat this as required.
+        """
+        event = self.executor.get_progress(request_id)
+        if event is None:
+            return None
+        return {"phase": event.phase, "phase_progress": event.phase_progress}
+
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
 
@@ -1149,6 +1174,9 @@ class DiffusionEngine:
         state = self.scheduler.get_request_state(request_id)
         popped_state = self.scheduler.pop_request_state(request_id)
         state = state or popped_state
+        # Single choke point every request passes through on its way out —
+        # keeps the executor's progress table from growing without bound.
+        self.executor.clear_progress(request_id)
 
         if state is None:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")

@@ -48,6 +48,13 @@ from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.progress import (
+    PHASE_DECODE,
+    PHASE_DENOISE,
+    PHASE_ENCODE,
+    PHASE_PREPARE,
+    report_phase,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -1680,6 +1687,12 @@ class MiniMaxH3Pipeline(
         extra = sampling.extra_args or {}
         task = self._resolve_task(extra.get("task"), multi_modal_data)
 
+        # Phase markers for the async status API. ref2va spends real time here
+        # (decoding/aligning reference videos on CPU) before a single GPU op
+        # runs, so "preparing" has to be visible — otherwise a long job looks
+        # idle right up until sampling starts.
+        report_phase(PHASE_PREPARE)
+
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
         raw_audio = multi_modal_data.get("audio")
@@ -1787,6 +1800,7 @@ class MiniMaxH3Pipeline(
                 audio_index += 1
                 condition_labels.append(("audio", audio_index))
 
+            report_phase(PHASE_ENCODE)
             text_embeddings, text_tags = self.encode_prompt(
                 task=task,
                 prompt=prompt,
@@ -1867,6 +1881,8 @@ class MiniMaxH3Pipeline(
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         videos = []
         audios = []
+        # Entering sampling; minimax_h3_denoise_loop reports the per-step detail.
+        report_phase(PHASE_DENOISE)
         for output_seed in _minimax_h3_output_seeds(seed, num_outputs):
             video_latent, audio_latent = self.diffuse(
                 task=task,
@@ -1890,6 +1906,7 @@ class MiniMaxH3Pipeline(
                 audio_condition_lengths=audio_lengths,
                 keyframe_frame_indices=keyframe_frame_indices,
             )
+            report_phase(PHASE_DECODE)
             video, audio = self.decode(video_latent, audio_latent, height=height, width=width)
             videos.append(video)
             audios.append(audio)

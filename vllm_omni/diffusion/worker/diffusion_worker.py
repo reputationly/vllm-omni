@@ -49,6 +49,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.progress import ProgressEvent, set_progress_sink
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
@@ -827,6 +828,13 @@ class WorkerProc:
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
+        # Pipelines report progress through a module-level sink (they have no
+        # handle on this object); route it onto the result queue the executor
+        # already drains. Step-execution mode gets its progress from the
+        # scheduler's per-step outputs and has no result pump, so leave it alone.
+        if not self.od_config.step_execution:
+            set_progress_sink(self._enqueue_progress)
+
         self._async_output_queue: queue.Queue | None = None
         self._async_output_thread: threading.Thread | None = None
         if not self.od_config.step_execution:
@@ -860,6 +868,17 @@ class WorkerProc:
             base_worker_class=base_worker_class,
         )
         return wrapper
+
+    def _enqueue_progress(self, event: ProgressEvent) -> None:
+        """Ship one progress event to the executor. Best-effort by design: the
+        request must never fail because a status ping could not be sent."""
+        result_mq = self.result_mq
+        if result_mq is None:
+            return
+        try:
+            result_mq.enqueue(AsyncDiffusionOutput(kind=AsyncOutputKind.PROGRESS, result=event))
+        except Exception:
+            logger.debug("Failed to enqueue progress for %s", event.request_id, exc_info=True)
 
     def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""

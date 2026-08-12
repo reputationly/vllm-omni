@@ -150,6 +150,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._output_futures: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._completed_outputs: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._batch_split_map: dict[str, dict[str, str]] = {}  # batch_id -> {per_req_id: request_id}
+        # request_id -> latest ProgressEvent, parked by the result pump. Purely
+        # informational: entries are overwritten in place and dropped when the
+        # request finishes, so a missed message costs nothing.
+        self._progress: dict[str, Any] = {}
         self._futures_lock = threading.RLock()
         self._pump_running = False
         self._pump_stop = threading.Event()
@@ -869,6 +873,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._sync_result_buffer.put(msg)
                 continue
 
+            if msg.kind == AsyncOutputKind.PROGRESS:
+                event = msg.result
+                if event is not None:
+                    with self._futures_lock:
+                        self._progress[event.request_id] = event
+                continue
+
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
@@ -937,6 +948,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                                 fut.set_result(msg.output)
                         with self._futures_lock:
                             self._completed_outputs[batch_id] = fut
+
+    def get_progress(self, request_id: str) -> Any | None:
+        """Latest ProgressEvent for a running request, or None if the workers
+        have not reported one (yet, or at all — most pipelines don't)."""
+        progress = getattr(self, "_progress", None)
+        if not progress:
+            return None
+        with self._futures_lock:
+            return progress.get(request_id)
+
+    def clear_progress(self, request_id: str) -> None:
+        progress = getattr(self, "_progress", None)
+        if not progress:
+            return
+        with self._futures_lock:
+            progress.pop(request_id, None)
 
     def _next_rpc_id(self) -> str:
         with self._rpc_id_lock:

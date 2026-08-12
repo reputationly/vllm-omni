@@ -158,8 +158,13 @@ class AudioGenTaskRequest(BaseModel):
         "target_metadata_path",
     )
 
-    def to_chat_request(self) -> ChatCompletionRequest:
+    def to_chat_request(self, request_id: str | None = None) -> ChatCompletionRequest:
         """Build the equivalent diffusion ``ChatCompletionRequest``.
+
+        ``request_id`` pins the engine-side request id. The async task route
+        passes its task id so ``GET /v1/tasks/{id}/status`` can look the running
+        request up; left None, the diffusion chat path mints its own
+        ``chatcmpl-`` id as before.
 
         The diffusion chat path reads its params from
         ``getattr(request, "extra_body", None) or request.model_extra``. vLLM's
@@ -205,5 +210,11 @@ class AudioGenTaskRequest(BaseModel):
         # Audiogen always produces audio — force the modality last so a caller can't
         # override it via an extra.
         flat_params["modalities"] = ["audio"]
+        # Also last, and for the same reason: a caller-supplied request_id extra
+        # must not displace the task id the status endpoint polls by. Set through
+        # the constructor rather than by assignment so it lands in
+        # model_fields_set, which is what the diffusion chat path tests.
+        if request_id is not None:
+            flat_params["request_id"] = request_id
 
         return ChatCompletionRequest(model=self.model, messages=messages, **flat_params)

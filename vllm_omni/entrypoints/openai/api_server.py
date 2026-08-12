@@ -97,8 +97,13 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
+from vllm_omni.diffusion.progress import PHASE_SAVE
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.audio_task_manager import AUDIO_TASK_MANAGER, resolve_save_path
+from vllm_omni.entrypoints.openai.audio_task_manager import (
+    AUDIO_TASK_MANAGER,
+    resolve_save_path,
+    visible_task_status,
+)
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
@@ -4046,7 +4051,7 @@ async def _run_audio_gen_job(
         # raw_request is unused in the diffusion branch of create_chat_completion,
         # so calling with raw_request=None is safe (the None-guard is only on the
         # non-diffusion branch).
-        chat_req = request.to_chat_request()
+        chat_req = request.to_chat_request(request_id=task_id)
         resp = await handler.create_chat_completion(chat_req, raw_request=None)
         if isinstance(resp, ErrorResponse):
             # Surface the handler's error message; the except block below records
@@ -4360,7 +4365,11 @@ async def _generate_task_images(
             extra_body=extra_body,
             reference_images=_encode_images_png_b64(pil_images) or None,
             mask_image=_encode_images_png_b64([mask_image])[0] if mask_image is not None else None,
-            request_id=f"img_task-{task_id}",
+            # The engine request id IS the task id, with no decoration: that is
+            # what /v1/tasks/{id}/status looks progress up by (AsyncOmni.
+            # get_progress matches the external id exactly), so a prefix here
+            # would silently make image tasks unpollable.
+            request_id=task_id,
             stream=False,
             model=model_name,
             output_format="png",
@@ -4485,7 +4494,8 @@ async def _generate_task_images(
         gen_params=gen_params,
         stage_configs=stage_configs,
         prompt=prompt,
-        request_id=f"img_task-{task_id}",
+        # Bare task id, same reason as the multi-stage branch above.
+        request_id=task_id,
     )
     return _extract_images_from_result(gen_result)
 
@@ -4673,7 +4683,7 @@ async def _run_image_job(
                             pil_images=pil_images,
                             width=width,
                             height=height,
-                            request_id=f"img_task-{task_id}",
+                            request_id=task_id,
                         )
                     if bridged:
                         # AR's <img_ratio_*> is the canonical target shape: it
@@ -5000,9 +5010,23 @@ async def _run_video_task_job(
             # hand the facade an unplayable artifact.
             raise RuntimeError("Video generation returned no video bytes for this model.")
 
+        # The engine request is over, so its live progress is gone; the write to
+        # shared NFS is the last visible phase and happens right here.
+        await AUDIO_TASK_STORE.update_fields(task_id, {"phase": PHASE_SAVE, "phase_progress": 0.0})
         await atomic_write_bytes(video_bytes, save_result_path)
         logger.info("Video task %s wrote %s", task_id, save_result_path)
-        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()})
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.COMPLETED,
+                "end_time": time.time(),
+                # Push the last phase to its end. The status endpoint only
+                # overlays live progress while PROCESSING, so without this a
+                # COMPLETED task keeps returning the save/0.0 written above and
+                # the facade folds that into a global percentage below 100.
+                "phase_progress": 100.0,
+            },
+        )
     except asyncio.CancelledError:
         await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
         raise
@@ -5175,18 +5199,83 @@ async def list_audio_tasks() -> list[AudioTaskResponse]:
     return await AUDIO_TASK_MANAGER.list_tasks()
 
 
+_LIVE_PROGRESS_GAP_LOGGED = False
+
+
+def _warn_once_without_live_progress(engine_client: Any) -> None:
+    """Say once that this deployment cannot report queueing or live progress.
+
+    Both signals ride the inline stage client, so a multi-stage or multi-replica
+    diffusion deployment answers None to every lookup — indistinguishable, from
+    the caller's side, from "nothing to report for this request". Left silent it
+    reads as a broken progress bar; said once at the first poll that wanted it,
+    it reads as the known limitation it is.
+
+    Deliberately quiet when the engine has no such probe at all (plain TTS or AR
+    deployments): they have no diffusion stage to report on, so there is no gap.
+    """
+    global _LIVE_PROGRESS_GAP_LOGGED
+    if _LIVE_PROGRESS_GAP_LOGGED:
+        return
+    supports = getattr(engine_client, "supports_live_progress", None)
+    if supports is None or supports():
+        return
+    _LIVE_PROGRESS_GAP_LOGGED = True
+    logger.warning(
+        "Task status: this deployment runs its diffusion stage out-of-process "
+        "(multi-stage or multi-replica), where neither queue position nor live "
+        "phase is observable. Accepted-but-queued tasks will report 'processing' "
+        "and carry no phase; downstream progress falls back to an elapsed-time "
+        "estimate."
+    )
+
+
 # Declared before the parametrized /v1/tasks/{task_id}/status so the literal
 # "queue/status" is not captured as task_id="queue".
 @router.get("/v1/tasks/queue/status")
-async def get_audio_queue_status() -> JSONResponse:
-    return JSONResponse(content=await AUDIO_TASK_MANAGER.queue_status())
+async def get_audio_queue_status(raw_request: Request) -> JSONResponse:
+    # Hand the manager the same execution probe the per-task endpoint uses, so
+    # a job reported as pending there is not simultaneously this endpoint's
+    # current_task.
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    return JSONResponse(
+        content=await AUDIO_TASK_MANAGER.queue_status(getattr(engine_client, "is_request_executing", None))
+    )
 
 
 @router.get("/v1/tasks/{task_id}/status", response_model=AudioTaskResponse)
-async def get_audio_task_status(task_id: str) -> AudioTaskResponse:
+async def get_audio_task_status(task_id: str, raw_request: Request) -> AudioTaskResponse:
     job = await AUDIO_TASK_MANAGER.get_status(task_id)
     if job is None:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Task not found")
+    if job.status == AudioTaskStatus.PROCESSING:
+        # Accepted != running: several jobs are admitted at once and the
+        # scheduler serializes them, so a job still waiting its turn reports as
+        # pending (see visible_task_status for why that matters downstream).
+        engine_client = getattr(raw_request.app.state, "engine_client", None)
+        _warn_once_without_live_progress(engine_client)
+        is_executing = getattr(engine_client, "is_request_executing", None)
+        visible = visible_task_status(job.status, is_executing(task_id) if is_executing else None)
+        if visible != job.status:
+            return job.model_copy(update={"status": visible})
+
+        # Live phase, read straight off the engine rather than stored on the job:
+        # the pipeline runs in a worker process and pushes progress to the
+        # executor asynchronously, so the freshest value is always the one we
+        # pull at poll time. Every async task submits its engine request under
+        # the bare task id — video, image, TTS and audiogen alike — so no side
+        # mapping is needed. Keep it that way when adding a task type: this
+        # lookup matches the external id exactly, so any decoration on the
+        # submit side silently costs that task type its progress.
+        progress = getattr(engine_client, "get_progress", None)
+        live = progress(task_id) if progress is not None else None
+        if live:
+            job = job.model_copy(
+                update={
+                    "phase": live.get("phase"),
+                    "phase_progress": live.get("phase_progress"),
+                }
+            )
     return job
 
 

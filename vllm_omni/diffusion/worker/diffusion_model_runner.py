@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.progress import progress_scope
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
@@ -521,7 +522,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
+            # Progress is reported per request; a multi-request batch has no
+            # single answer to "which phase are you in", so it reports nothing.
+            progress_request_id = reqs[0].request_id if len(reqs) == 1 else None
+            with (
+                set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config),
+                progress_scope(progress_request_id),
+            ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(

@@ -130,6 +130,10 @@ class StageDiffusionClient(StageClientBase):
         self._connect_transport(request_address, response_address)
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        # Latest queue position / phase the subprocess volunteered, per request.
+        # Entries are dropped when the request finishes, errors or is aborted,
+        # so this tracks in-flight requests only.
+        self._live_state: dict[str, dict[str, Any]] = {}
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
         self._tasks: dict[str, asyncio.Task] = {}
@@ -239,7 +243,22 @@ class StageDiffusionClient(StageClientBase):
             msg_type = msg.get("type")
 
             if msg_type == "result":
-                self._output_queue.put_nowait(msg["output"])
+                output = msg["output"]
+                # Streaming requests send many results; only the last one ends
+                # the request, so keep the live state until then.
+                if getattr(output, "finished", True):
+                    self._live_state.pop(getattr(output, "request_id", ""), None)
+                self._output_queue.put_nowait(output)
+            elif msg_type == "progress":
+                # Volunteered by the proc's progress pump, not requested. Older
+                # subprocesses never send this and simply leave the map empty,
+                # which reads as "nothing to report" — the same answer this
+                # client gave before the channel existed.
+                self._live_state[msg["request_id"]] = {
+                    "executing": msg.get("executing"),
+                    "phase": msg.get("phase"),
+                    "phase_progress": msg.get("phase_progress"),
+                }
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "error":
@@ -264,6 +283,7 @@ class StageDiffusionClient(StageClientBase):
                 # Route request errors as error outputs so the Orchestrator
                 # sees the request complete (instead of hanging forever).
                 if req_id is not None:
+                    self._live_state.pop(req_id, None)
                     self._output_queue.put_nowait(
                         OmniRequestOutput.from_error(
                             req_id,
@@ -385,7 +405,35 @@ class StageDiffusionClient(StageClientBase):
                 raise EngineDeadError(f"StageDiffusionProc died unexpectedly (exit code {exitcode})")
             return None
 
+    def is_request_executing(self, request_id: str) -> bool | None:
+        """Whether the subprocess scheduler has this request on the GPU.
+
+        Same tri-state as the inline client: None means "no state", which here
+        also covers a subprocess that predates the progress channel and a
+        request whose first pump tick has not landed yet. Only an explicit
+        False means queued.
+        """
+        self._drain_responses()
+        state = self._live_state.get(request_id)
+        return None if state is None else state.get("executing")
+
+    def get_progress(self, request_id: str) -> dict[str, Any] | None:
+        """Latest phase the subprocess reported for this request, or None.
+
+        Reads the parked value rather than asking across the process boundary,
+        so a status poll costs nothing beyond a non-blocking socket drain. The
+        value is at most one pump interval stale, which a progress bar cannot
+        perceive.
+        """
+        self._drain_responses()
+        state = self._live_state.get(request_id)
+        if not state or state.get("phase") is None:
+            return None
+        return {"phase": state["phase"], "phase_progress": state.get("phase_progress")}
+
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        for request_id in request_ids:
+            self._live_state.pop(request_id, None)
         self._request_socket.send(
             self._encoder.encode(
                 {

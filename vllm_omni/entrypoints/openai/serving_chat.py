@@ -3507,7 +3507,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ChatCompletionResponse with generated images or ErrorResponse
         """
         try:
-            request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+            # An explicitly supplied request_id wins: the async task jobs
+            # (/v1/tasks/audiogen/) submit under their task id so
+            # GET /v1/tasks/{id}/status can find live progress, which
+            # AsyncOmni.get_progress() looks up by exact external id.
+            # Tested with model_fields_set, not truthiness: vLLM's request_id
+            # carries a random default_factory value, so `or` would rename every
+            # ordinary chat request away from the chatcmpl- form.
+            request_id = (
+                request.request_id if "request_id" in request.model_fields_set else f"chatcmpl-{uuid.uuid4().hex[:16]}"
+            )
             created_time = int(time.time())
 
             # Convert messages to dict format

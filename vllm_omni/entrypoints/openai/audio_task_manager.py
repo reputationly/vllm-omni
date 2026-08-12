@@ -16,6 +16,7 @@ the speech handler and app state).
 import asyncio
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from vllm.logger import init_logger
@@ -51,6 +52,37 @@ def resolve_save_path(save_result_path: str, task_id: str, output_root: str, def
     return str(path)
 
 
+def visible_task_status(status: AudioTaskStatus, executing: bool | None) -> AudioTaskStatus:
+    """The status to report for a task the engine has accepted.
+
+    This route admits several jobs at once and starts a coroutine for each, so
+    PROCESSING really means "accepted" — the diffusion scheduler still runs them
+    one at a time. A job waiting its turn is reported as pending, matching
+    LightX2V, whose FIFO worker only flips to processing when it picks the task
+    up. It matters downstream: the GPUStack facade starts an elapsed-time
+    progress estimate the moment a task looks like it is running, and under
+    backpressure that clock would tick through the whole queue wait — parking the
+    bar near its ceiling before the job had done any work.
+
+    ``executing`` is tri-state and None must NOT be read as "queued": it means
+    the scheduler has no state for the request — not submitted yet, already
+    finished, or a request that never goes through a diffusion stage at all
+    (plain TTS). Only an explicit False demotes.
+
+    None is also what a deployment whose diffusion stage runs out-of-process
+    returns for EVERY request, because the signal rides the inline stage client
+    (see ``AsyncOmni.supports_live_progress``). Such a deployment therefore
+    never demotes and keeps reporting accepted-but-queued jobs as processing —
+    the facade's elapsed-time estimate then runs through the queue wait, which
+    is exactly what this function exists to prevent. The API server logs that
+    gap once; closing it needs a progress channel on the out-of-process client,
+    not a change here.
+    """
+    if status == AudioTaskStatus.PROCESSING and executing is False:
+        return AudioTaskStatus.PENDING
+    return status
+
+
 class AudioTaskManager:
     def __init__(self, max_queue_size: int = 8, *, store=None, tasks=None) -> None:
         # store/tasks default to the module-level singletons; injectable for tests.
@@ -84,10 +116,19 @@ class AudioTaskManager:
     async def list_tasks(self) -> list[AudioTaskResponse]:
         return await self._store.list_values()
 
-    async def queue_status(self) -> dict:
+    async def queue_status(self, executing: Callable[[str], bool | None] | None = None) -> dict:
+        """Queue-wide view, bucketed by the SAME rule as the per-task endpoint.
+
+        ``executing`` is the engine's execution probe. Without it this reports
+        raw stored status, which contradicts ``GET /v1/tasks/{id}/status``: a
+        backpressured job shows there as pending while still holding
+        ``current_task`` here. ``active_count`` (and therefore admission) is
+        unaffected either way — pending and processing both count as active.
+        """
         items = await self._store.list_values()
-        pending = sum(1 for t in items if t.status == AudioTaskStatus.PENDING)
-        processing = [t for t in items if t.status == AudioTaskStatus.PROCESSING]
+        visible = [(t, visible_task_status(t.status, executing(t.task_id) if executing else None)) for t in items]
+        pending = sum(1 for _, status in visible if status == AudioTaskStatus.PENDING)
+        processing = [t for t, status in visible if status == AudioTaskStatus.PROCESSING]
         active = pending + len(processing)
         return {
             "is_processing": len(processing) > 0,

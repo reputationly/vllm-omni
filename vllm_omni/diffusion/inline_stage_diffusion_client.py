@@ -83,6 +83,21 @@ class InlineStageDiffusionClient(StageClientBase):
         """Load model metadata from HuggingFace and populate od_config fields."""
         self.od_config.enrich_config()
 
+    def is_request_executing(self, request_id: str) -> bool | None:
+        """Whether the request is on the GPU rather than queued behind another
+        (see DiffusionEngine.is_request_executing for the tri-state)."""
+        return self._engine.is_request_executing(request_id)
+
+    def get_progress(self, request_id: str) -> dict[str, Any] | None:
+        """Live progress for a running request (see DiffusionEngine.get_progress).
+
+        Only the inline client can answer this: the engine lives in this very
+        process. The out-of-process client has no channel for it and returns
+        None, so a multi-stage / multi-replica deployment degrades to the
+        facade's elapsed-time estimate rather than reporting nothing at all.
+        """
+        return self._engine.get_progress(request_id)
+
     def _mark_engine_dead(self) -> None:
         if self._engine_dead:
             return

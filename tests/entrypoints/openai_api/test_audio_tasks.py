@@ -14,7 +14,11 @@ import asyncio
 
 import pytest
 
-from vllm_omni.entrypoints.openai.audio_task_manager import AudioTaskManager, resolve_save_path
+from vllm_omni.entrypoints.openai.audio_task_manager import (
+    AudioTaskManager,
+    resolve_save_path,
+    visible_task_status,
+)
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.audio_tasks import (
     AudioTaskRequest,
@@ -51,9 +55,49 @@ def test_audio_task_response_fields_use_start_end_time():
         "error",
         "error_type",
         "save_result_path",
+        # Progress contract (facade folds phase + phase_progress into a global
+        # percentage); optional, absent for models that don't report.
+        "phase",
+        "phase_progress",
     }
     assert dumped["start_time"] is None and dumped["end_time"] is None
     assert dumped["error_type"] == ""
+    assert dumped["phase"] is None and dumped["phase_progress"] is None
+
+
+# --------------------------------------------------------------------------- #
+# 1b. Reported status vs. engine execution state (backpressure).
+# --------------------------------------------------------------------------- #
+def test_queued_job_reports_pending_not_processing():
+    # The route admits several jobs and the scheduler serializes them; a job
+    # waiting its turn must not look like it is running, or the facade starts
+    # estimating progress through the queue wait.
+    assert visible_task_status(AudioTaskStatus.PROCESSING, False) == AudioTaskStatus.PENDING
+
+
+def test_executing_job_stays_processing():
+    assert visible_task_status(AudioTaskStatus.PROCESSING, True) == AudioTaskStatus.PROCESSING
+
+
+def test_unknown_execution_state_leaves_the_status_alone():
+    # None is NOT "queued": no scheduler state covers not-yet-submitted, just
+    # finished, and every request that never touches a diffusion stage (plain
+    # TTS). Demoting those would freeze the facade at the queued tier for a
+    # whole run.
+    assert visible_task_status(AudioTaskStatus.PROCESSING, None) == AudioTaskStatus.PROCESSING
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AudioTaskStatus.PENDING,
+        AudioTaskStatus.COMPLETED,
+        AudioTaskStatus.FAILED,
+        AudioTaskStatus.CANCELLED,
+    ],
+)
+def test_only_processing_is_ever_rewritten(status):
+    assert visible_task_status(status, False) == status
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +268,27 @@ async def test_queue_status_fields():
     assert status["queue_available"] == 7
     assert status["is_processing"] is False
     assert status["current_task"] is None
+
+
+@pytest.mark.asyncio
+async def test_queue_status_demotes_queued_task_like_the_status_endpoint():
+    """A backpressured job must not be pending on one endpoint and the
+    current_task on the other."""
+    mgr = _fresh_manager(max_queue_size=8)
+    await mgr.reserve("t1", "/nfs/t1.wav")
+    await mgr._store.update_fields("t1", {"status": AudioTaskStatus.PROCESSING})
+
+    accepted = await mgr.queue_status(lambda _task_id: True)
+    assert accepted["is_processing"] is True
+    assert accepted["current_task"] == "t1"
+
+    queued = await mgr.queue_status(lambda _task_id: False)
+    assert queued["is_processing"] is False
+    assert queued["current_task"] is None
+    assert queued["pending_count"] == 1
+    # Admission is deliberately unchanged by the demotion: pending and
+    # processing both occupy a queue slot.
+    assert queued["active_count"] == accepted["active_count"] == 1
 
 
 @pytest.mark.asyncio

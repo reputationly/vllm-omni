@@ -1022,6 +1022,88 @@ class AsyncOmni(EngineClient, OmniBase):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
 
+    def is_request_executing(self, request_id: str) -> bool | None:
+        """Whether an in-flight request (EXTERNAL id) is actually executing, as
+        opposed to waiting its turn in the diffusion scheduler.
+
+        Tri-state, and the None case carries weight: it means "no scheduler
+        state", which covers a request that hasn't been submitted yet, one that
+        just finished, and every request that never touches a diffusion stage
+        (plain TTS). Only an explicit False means "queued".
+        """
+        try:
+            for internal_id in self._internal_request_ids(request_id):
+                for client in self._stage_clients_latest_first():
+                    getter = getattr(client, "is_request_executing", None)
+                    if getter is None:
+                        continue
+                    executing = getter(internal_id)
+                    if executing is not None:
+                        return executing
+        except Exception:
+            logger.debug("[AsyncOmni] execution-state lookup failed for %s", request_id, exc_info=True)
+        return None
+
+    def _internal_request_ids(self, external_request_id: str) -> list[str]:
+        return [s.request_id for s in self.request_states.values() if s.external_request_id == external_request_id]
+
+    def _stage_clients_latest_first(self) -> list[Any]:
+        """Stage clients in reverse pipeline order.
+
+        ``stage_clients`` is built in stage order, and a request visits the
+        stages in that order, so when two of them still hold state for the same
+        id the LATER one is the live stage and the earlier one is an entry whose
+        cleanup has not landed yet. Walking backwards makes the freshest stage
+        win instead of whichever one happens to come first.
+        """
+        return list(reversed(getattr(self.engine, "stage_clients", []) or []))
+
+    def get_progress(self, request_id: str) -> dict[str, Any] | None:
+        """Live generation progress for an in-flight request, by EXTERNAL id.
+
+        Returns ``{"phase", "phase_progress"}`` when a diffusion stage reported
+        one, else None (no such request, pipeline doesn't report, or the stage
+        runs out-of-process). Best-effort and synchronous by design: it is
+        answering a status poll, and must never raise into it.
+        """
+        try:
+            internal_ids = self._internal_request_ids(request_id)
+            if not internal_ids:
+                return None
+            for client in self._stage_clients_latest_first():
+                getter = getattr(client, "get_progress", None)
+                if getter is None:
+                    continue
+                for internal_id in internal_ids:
+                    progress = getter(internal_id)
+                    if progress:
+                        return progress
+        except Exception:
+            logger.debug("[AsyncOmni] progress lookup failed for %s", request_id, exc_info=True)
+        return None
+
+    def supports_live_progress(self) -> bool:
+        """Whether this deployment can answer :meth:`get_progress` and
+        :meth:`is_request_executing` AT ALL, as opposed to having nothing to say
+        about one particular request.
+
+        Both hooks live on the inline stage client, which StageRuntime installs
+        only for a single-stage, single-replica diffusion deployment
+        (``use_inline`` in ``stage_runtime.py``); the out-of-process client has
+        no channel for them, so every lookup comes back None. A caller cannot
+        tell that apart from "this request has no scheduler state" — the two
+        look identical from outside — which is why this probe exists: it lets
+        the caller report the gap once instead of serving a permanent,
+        unexplained absence of progress.
+        """
+        try:
+            for client in getattr(self.engine, "stage_clients", []) or []:
+                if getattr(client, "get_progress", None) is not None:
+                    return True
+        except Exception:
+            logger.debug("[AsyncOmni] progress capability probe failed", exc_info=True)
+        return False
+
     async def submit_interaction_async(
         self,
         request_id: str,

@@ -107,6 +107,19 @@ class DiffusionExecutor(ABC):
         """Check if the executor and workers are healthy."""
         pass
 
+    def get_progress(self, request_id: str) -> Any | None:
+        """Latest progress event reported mid-forward for a running request.
+
+        Optional capability: executors with no side channel from their workers
+        keep the default, and callers degrade to whatever coarser signal they
+        have (elapsed time, at the facade).
+        """
+        return None
+
+    def clear_progress(self, request_id: str) -> None:
+        """Drop a finished request's progress entry. No-op by default."""
+        return None
+
     def register_failure_callback(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked when the executor fatally fails.
 

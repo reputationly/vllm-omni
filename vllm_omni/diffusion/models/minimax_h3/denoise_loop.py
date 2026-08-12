@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.progress import PHASE_DENOISE, report_phase
 
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
@@ -277,6 +278,8 @@ def minimax_h3_denoise_loop(
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step_end is not None:
                 on_step_end(step, video_rows, audio_rows)
+            # Status only — throttled and a no-op outside a served request.
+            report_phase(PHASE_DENOISE, step + 1, num_steps)
 
     set_forward_context_denoise_step_idx(None)
     return video_rows, audio_rows
