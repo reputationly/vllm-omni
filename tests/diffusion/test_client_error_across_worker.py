@@ -18,7 +18,7 @@ from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_MSG = "MiniMax H3 output duration must be in [4, 15] seconds, got 29.958"
+_MSG = "MiniMax H3 output duration must be in [2, 16] seconds, got 29.958"
 
 
 def _worker_status(**overrides):

@@ -1398,8 +1398,9 @@ def test_ref2va_two_video_recipe_rejects_real_duration_overflow(monkeypatch, tmp
         )
 
 
-@pytest.mark.parametrize("duration", [4.0, 15.0])
+@pytest.mark.parametrize("duration", [2.0, 4.0, 15.0, 16.0])
 def test_g2_output_duration_accepts_official_boundaries(duration):
+    """4.0/15.0 are MiniMax's documented range; 2.0/16.0 are this deployment's widened gate."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1415,7 +1416,7 @@ def test_g2_output_duration_accepts_official_boundaries(duration):
     assert height > 0 and width > 0
 
 
-@pytest.mark.parametrize("duration", [3.99, 15.01, float("nan"), "not-a-duration"])
+@pytest.mark.parametrize("duration", [1.99, 16.01, float("nan"), "not-a-duration"])
 def test_g2_output_duration_rejects_out_of_contract_values(duration):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 

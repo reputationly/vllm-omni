@@ -123,8 +123,21 @@ MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
 }
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
-MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
-MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+# Output duration gate. MiniMax's model card documents 4-15 s; this deployment
+# widens it to 2-16 s (2026-08-12) to cover short clips and the 396-frame
+# (16.5 s) tail that the sweep archive already exercised. Requests outside the
+# vendor's documented range are served, not validated for quality.
+#
+# Note the gate below runs on the *requested* duration, while the frame count is
+# then rounded UP to the nearest 17n+5. A request at exactly the maximum
+# therefore yields a slightly longer output (16.0 s -> 396 frames -> 16.5 s),
+# which is why callers should submit the duration they want rather than an
+# already-aligned frame count.
+MINIMAX_H3_MIN_OUTPUT_SECONDS = 2.0
+MINIMAX_H3_MAX_OUTPUT_SECONDS = 16.0
+# Rendered into the client-facing errors so the message can never drift from the
+# constants above.
+MINIMAX_H3_OUTPUT_SECONDS_RANGE = f"[{MINIMAX_H3_MIN_OUTPUT_SECONDS:g}, {MINIMAX_H3_MAX_OUTPUT_SECONDS:g}]"
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -849,27 +862,33 @@ class MiniMaxH3Pipeline(
         duration = target.get("duration_seconds", extra.get("duration_seconds", extra.get("duration")))
         if duration is not None:
             if isinstance(duration, bool):
-                raise OmniClientError(f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration!r}")
+                raise OmniClientError(
+                    f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, got {duration!r}"
+                )
             try:
                 duration = float(duration)
             except (TypeError, ValueError) as exc:
                 raise OmniClientError(
-                    f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration!r}"
+                    f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, got {duration!r}"
                 ) from exc
             if (
                 not math.isfinite(duration)
                 or not MINIMAX_H3_MIN_OUTPUT_SECONDS <= duration <= MINIMAX_H3_MAX_OUTPUT_SECONDS
             ):
-                raise OmniClientError(f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration}")
+                raise OmniClientError(
+                    f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, got {duration}"
+                )
             requested_frames = int(round(duration * fps))
         elif int(sampling.num_frames or 1) > 1:
             requested_frames = int(sampling.num_frames)
         else:
             requested_frames = 124 if task == "ref2va" else 209
             duration = requested_frames / fps
-        if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= requested_frames / fps <= MINIMAX_H3_MAX_OUTPUT_SECONDS:
+        requested_seconds = requested_frames / fps
+        if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= requested_seconds <= MINIMAX_H3_MAX_OUTPUT_SECONDS:
             raise OmniClientError(
-                f"MiniMax H3 output duration must be in [4, 15] seconds, got {requested_frames / fps:.3f}"
+                f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, "
+                f"got {requested_seconds:.3f}"
             )
         num_frames = minimax_h3_align_frame_count(requested_frames)
 
