@@ -94,6 +94,15 @@ image id: 0e0aacfa336c
 image size: 33GB
 ```
 
+> ⚠️ 本节记录的是 **2026-07-26 实验当时**的镜像。`arm64-a100-latest` 是**浮动 tag**，
+> 内容随出包滚动 —— 上面的 image id 不等于今天拉到的东西，复现必须钉日期 tag。
+>
+> **2026-08-11 复核**（INT8-v2 实验，节点 `dev-gpustack-a100-0030`）：
+> `arm64-a100-latest` 与 `arm64-a100-20260809-0612-3f4fe637`
+> （digest `sha256:d71c261f…3146ae`）当前均为
+> `py3.12 / torch 2.11.0+cu130 / vllm 0.26.0 / bitsandbytes 0.50.0`。
+> 本报告的实测数字产自 7-26 那版镜像，**未在 vllm 0.26.0 上重跑过**。
+
 本地 vLLM-Omni：
 
 ```text

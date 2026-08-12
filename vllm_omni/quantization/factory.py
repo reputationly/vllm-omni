@@ -425,19 +425,42 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
     if method in _OVERRIDES:
         return _OVERRIDES[method](**kwargs)
 
-    if method not in QUANTIZATION_METHODS:
+    # _OVERRIDES is keyed on the normalized (underscored) name, but vLLM's
+    # registry keeps each method's original spelling — and several are
+    # hyphenated ("compressed-tensors"). Looking the normalized name up in the
+    # registry therefore misses them: a compressed-tensors checkpoint died with
+    # "Unknown quantization method: 'compressed_tensors'" while
+    # SUPPORTED_QUANTIZATION_METHODS listed 'compressed-tensors' two lines
+    # later. Map back to the registry's spelling instead. Computed per call
+    # because plugins can extend the registry after import.
+    registry_method = {_normalize_method_name(name): name for name in QUANTIZATION_METHODS}.get(method)
+
+    if registry_method is None:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
-    config_cls = get_quantization_config(method)
+    config_cls = get_quantization_config(registry_method)
+    checkpoint_kwargs = dict(kwargs)
     kwargs = _drop_unsupported_kwargs(config_cls, kwargs)
 
     try:
         return config_cls(**kwargs)
     except TypeError:
-        sig = inspect.signature(config_cls.__init__)
-        raise TypeError(
-            f"Cannot instantiate {config_cls.__name__} with kwargs {kwargs}. Expected signature: {sig}"
-        ) from None
+        # Not every config's __init__ is checkpoint-shaped. CompressedTensorsConfig
+        # takes a parsed `target_scheme_map`, not the raw `config_groups` the
+        # checkpoint carries, so direct construction can only ever fail for it —
+        # from_config() is the classmethod that does that parsing, and is what
+        # this function's contract has always promised. Fall back to it rather
+        # than construct-or-die, keeping the existing direct path (and its kwarg
+        # filtering) intact for the methods that do accept checkpoint fields.
+        try:
+            return config_cls.from_config(checkpoint_kwargs)
+        except Exception as from_config_error:
+            sig = inspect.signature(config_cls.__init__)
+            raise TypeError(
+                f"Cannot instantiate {config_cls.__name__} with kwargs {kwargs} "
+                f"(signature: {sig}); {config_cls.__name__}.from_config() also failed "
+                f"with {type(from_config_error).__name__}: {from_config_error}"
+            ) from from_config_error
 
 
 def _drop_unsupported_kwargs(config_cls: type, kwargs: dict[str, Any]) -> dict[str, Any]:
