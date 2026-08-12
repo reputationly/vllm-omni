@@ -1087,14 +1087,13 @@ class AsyncOmni(EngineClient, OmniBase):
         :meth:`is_request_executing` AT ALL, as opposed to having nothing to say
         about one particular request.
 
-        Both hooks live on the inline stage client, which StageRuntime installs
-        only for a single-stage, single-replica diffusion deployment
-        (``use_inline`` in ``stage_runtime.py``); the out-of-process client has
-        no channel for them, so every lookup comes back None. A caller cannot
-        tell that apart from "this request has no scheduler state" — the two
-        look identical from outside — which is why this probe exists: it lets
-        the caller report the gap once instead of serving a permanent,
-        unexplained absence of progress.
+        Both diffusion stage clients implement them — the inline one straight
+        off the engine, the out-of-process one off the state its subprocess
+        pumps back — so this is True for either topology. It stays as a probe
+        because a client that lacks the hooks answers None for every request,
+        and from outside that is indistinguishable from "this request has no
+        scheduler state": without the probe the caller would serve a permanent,
+        unexplained absence of progress instead of reporting the gap once.
         """
         try:
             for client in getattr(self.engine, "stage_clients", []) or []:

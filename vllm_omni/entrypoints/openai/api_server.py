@@ -5205,11 +5205,12 @@ _LIVE_PROGRESS_GAP_LOGGED = False
 def _warn_once_without_live_progress(engine_client: Any) -> None:
     """Say once that this deployment cannot report queueing or live progress.
 
-    Both signals ride the inline stage client, so a multi-stage or multi-replica
-    diffusion deployment answers None to every lookup — indistinguishable, from
-    the caller's side, from "nothing to report for this request". Left silent it
-    reads as a broken progress bar; said once at the first poll that wanted it,
-    it reads as the known limitation it is.
+    Both stage clients implement the two hooks (inline off the engine,
+    out-of-process off its pumped state), so this normally stays quiet; it fires
+    for a diffusion client that has neither. Such a client answers None to every
+    lookup — indistinguishable, from the caller's side, from "nothing to report
+    for this request". Left silent it reads as a broken progress bar; said once
+    at the first poll that wanted it, it reads as the known limitation it is.
 
     Deliberately quiet when the engine has no such probe at all (plain TTS or AR
     deployments): they have no diffusion stage to report on, so there is no gap.
@@ -5222,11 +5223,10 @@ def _warn_once_without_live_progress(engine_client: Any) -> None:
         return
     _LIVE_PROGRESS_GAP_LOGGED = True
     logger.warning(
-        "Task status: this deployment runs its diffusion stage out-of-process "
-        "(multi-stage or multi-replica), where neither queue position nor live "
-        "phase is observable. Accepted-but-queued tasks will report 'processing' "
-        "and carry no phase; downstream progress falls back to an elapsed-time "
-        "estimate."
+        "Task status: this deployment's diffusion stage client reports neither "
+        "execution state nor live phase. Accepted-but-queued tasks will report "
+        "'processing' and carry no phase; downstream progress falls back to an "
+        "elapsed-time estimate."
     )
 
 

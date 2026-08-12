@@ -69,14 +69,14 @@ def visible_task_status(status: AudioTaskStatus, executing: bool | None) -> Audi
     finished, or a request that never goes through a diffusion stage at all
     (plain TTS). Only an explicit False demotes.
 
-    None is also what a deployment whose diffusion stage runs out-of-process
-    returns for EVERY request, because the signal rides the inline stage client
-    (see ``AsyncOmni.supports_live_progress``). Such a deployment therefore
-    never demotes and keeps reporting accepted-but-queued jobs as processing —
-    the facade's elapsed-time estimate then runs through the queue wait, which
-    is exactly what this function exists to prevent. The API server logs that
-    gap once; closing it needs a progress channel on the out-of-process client,
-    not a change here.
+    Both stage clients answer it: the inline one reads the scheduler directly,
+    the out-of-process one reads the value its subprocess pumps over the
+    response socket (at most one pump interval stale, which only widens the
+    window in which a just-queued job still reports processing). A client with
+    no such probe at all reports None for every request and therefore never
+    demotes — ``AsyncOmni.supports_live_progress`` exists to tell that apart
+    from "nothing to say about this one request" so the gap can be logged
+    rather than silently degrading into the queue-wait estimate above.
     """
     if status == AudioTaskStatus.PROCESSING and executing is False:
         return AudioTaskStatus.PENDING
