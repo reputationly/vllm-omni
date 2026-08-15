@@ -250,8 +250,12 @@ def minimax_h3_denoise_loop(
             _log_step_memory(step, video_rows, audio_rows)
             with torch.inference_mode():
                 v_video, v_audio = model(**fk)
-            mv_video_t = v_video.float()[update]
-            mv_audio_t = v_audio.float()[audio_update]
+            # 先按掩码取行、再转 fp32。反过来写（.float()[update]）会为**整条 packed
+            # sequence** 分配一份 fp32 临时副本，而 update 只覆盖要去噪的目标帧：
+            # 1344x768/362 帧下整条约 107856 rows x 5376 hidden x 4B ≈ 2.2 GiB，
+            # 而当前 40G 卡在该档位的余量只有 1~3 GiB。取值完全相同，只是不再多分配。
+            mv_video_t = v_video[update].float()
+            mv_audio_t = v_audio[audio_update].float()
 
             x0_video = minimax_h3_rf_v_to_x0(
                 video_rows[update],

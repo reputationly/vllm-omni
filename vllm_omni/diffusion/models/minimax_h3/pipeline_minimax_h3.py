@@ -110,9 +110,51 @@ MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
-MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE"
+MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV = "VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE"
+
+
+def _reference_image_short_edge() -> int:
+    """ref2va 参考图被归一到的短边，默认 2048。
+
+    每张参考图都会按这个短边缩放后进 packed sequence，而 rows 正比于像素数：短边 2048 时
+    单张 3584x2048 贡献 112*64 = 7168 rows，9 张就是 64512 —— 相当于 1344x768/362 帧目标
+    序列（约 107856 rows）的 60%。2026-08-15 实测 9 张参考图在 40G 卡上必 OOM，且是在
+    encode_image（单图编码时关掉 parallel tiling，见 vae.py）阶段、20 秒内就炸。
+
+    注意 _reference_image_shape 的 scale 没有上限，**小图会被放大**：喂 448x256 同样得到
+    3584x2048。所以调用方压缩参考图是无效的，唯一的旋钮在这里。
+
+    做成 env 可配而不是直接改小默认值：短边决定参考图带进模型的信息量，调小虽然能解 OOM，
+    但会影响参考效果，必须先做画质 A/B 再决定是否改默认。参考**视频**用的是
+    MINIMAX_H3_BASE_SHORT_EDGE = 768（reference_video.py），可作为下调时的对齐目标。
+    """
+    raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "").strip()
+    if not raw:
+        return 2048
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; falling back to 2048",
+            MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
+            raw,
+        )
+        return 2048
+    # 下界取 VAE 与 patch 对齐所需的最小值；上界沿用 _reference_image_shape 的入参校验，
+    # 免得一个笔误把序列撑爆或缩到不可用。
+    if not MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE <= value <= 5760:
+        logger.warning(
+            "%s=%d out of range [%d, 5760]; falling back to 2048",
+            MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
+            value,
+            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+        )
+        return 2048
+    return value
+
+
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "21:9": 21.0 / 9.0,
     "16:9": 16.0 / 9.0,
@@ -537,7 +579,7 @@ def _reference_image_shape(image: Image.Image) -> tuple[int, int]:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    scale = _reference_image_short_edge() / min(width, height)
     return (
         _align_multiple(
             width * scale,
