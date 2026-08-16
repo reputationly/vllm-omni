@@ -250,10 +250,12 @@ def minimax_h3_denoise_loop(
             _log_step_memory(step, video_rows, audio_rows)
             with torch.inference_mode():
                 v_video, v_audio = model(**fk)
-            # 先按掩码取行、再转 fp32。反过来写（.float()[update]）会为**整条 packed
-            # sequence** 分配一份 fp32 临时副本，而 update 只覆盖要去噪的目标帧：
-            # 1344x768/362 帧下整条约 107856 rows x 5376 hidden x 4B ≈ 2.2 GiB，
-            # 而当前 40G 卡在该档位的余量只有 1~3 GiB。取值完全相同，只是不再多分配。
+            # 先按掩码取行、再转 fp32：反过来写（.float()[update]）会先给**整条 packed
+            # sequence** 分配 fp32 临时副本，而 update 只覆盖要去噪的目标帧。
+            # 注意量级：v_video 是 logits，行宽是 MINIMAX_H3_VIDEO_ROW_WIDTH=96（VAE latent
+            # 宽度），不是 DiT 内部的 hidden 5376。1344x768/15s 实测 115024 rows，瞬时峰值
+            # 85.6MB -> 62.1MB，只省约 23MB —— 相对该档位 2GiB 级的余量属噪声，**不解 OOM**。
+            # 保留仅因为严格不劣：布尔掩码索引两种写法都返回 copy、下游只读，取值必然一致。
             mv_video_t = v_video[update].float()
             mv_audio_t = v_audio[audio_update].float()
 

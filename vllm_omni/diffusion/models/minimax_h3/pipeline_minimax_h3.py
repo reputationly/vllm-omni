@@ -113,22 +113,120 @@ MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE"
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV = "VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE"
+# 归一**目标**短边的取值范围。刻意不复用 reference_video.py 的
+# MINIMAX_H3_{MIN,MAX}_REFERENCE_DIMENSION —— 那两个约束的是**用户上传原图**的边长
+# （reference_video.py:114/246），这里约束的是**缩放后的目标**，是两个概念，数值上碰巧沾边。
+# 下界取 patch 对齐粒度：小于它会被 _align_multiple 归零。
+# 上界取 5760：目标短边超过允许上传的最大边长没有实际意义。
+MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET = MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
+MINIMAX_H3_REFERENCE_IMAGE_MAX_TARGET = 5760
+MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV = "VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE"
+MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV = "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS"
+
+
+def _reference_image_max_pixels() -> int:
+    """归一后的面积上限，0（默认）表示不封顶，保持既有行为。
+
+    参考图是这套代码里**唯一没有面积封顶**的一条路：参考视频按
+    MINIMAX_H3_MAX_PIXELS = 768*1344 封顶（reference_video.py:_reference_video_shape），
+    输出画布按 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768*1344 封顶，只有参考图没有。
+
+    后果是 rows 随宽高比放大：短边归一到 2048 时，比例 1.75 的图是 112*64 = 7168 rows，
+    而比例上限 2.5 的图（如 2560x1024 -> 5120x2048）是 160*64 = 10240 rows，面积达到视频
+    封顶值的 10 倍。2026-08-16 的包络实测用的是 1.75 素材（9 图 64512 rows，最坏用例
+    219744 rows 通过、余量仅 0.39 GiB）；换成 2.5 比例则 9 图 92160 rows、最坏约 223600，
+    **超出已验证范围约 1.8%**，即一次合法上传就可能把引擎打 OOM。
+
+    置为 1032192（= 768*1344，与视频/输出对齐）后，任何比例的单图恒 ≤1008 rows，这个尾巴
+    与宽高比彻底解耦。默认不开启：封顶对极端比例的图是**真实降分辨率**（2560x1024 会被压到
+    1600x640），不像 [[no_upscale]] 那样只是去掉插值，因此同样需要画质 A/B 才能翻默认值。
+    """
+    raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; area cap stays disabled",
+            MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
+            raw,
+        )
+        return 0
+    if value < 0:
+        logger.warning(
+            "%s=%d is negative; area cap stays disabled",
+            MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
+            value,
+        )
+        return 0
+    # 下界是一个 patch 的面积：再小会被 _align_multiple 归零。
+    if 0 < value < MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE**2:
+        logger.warning(
+            "%s=%d is below one %dx%d patch; clamping to %d",
+            MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
+            value,
+            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE**2,
+        )
+        return MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE**2
+    return value
+
+
+def _reference_image_no_upscale() -> bool:
+    """置 1 时只缩不放：短边已小于目标的图不再被插值放大。
+
+    契约是"**绝不放大**"而不是"保持原生分辨率"——后者与 32 对齐不可兼得：源边长不是 32 的
+    倍数时只能向下取（1008 -> 992）。仅靠 min(1.0, scale) 不够，因为 _align_multiple 是最近
+    取整、会向上越界，所以 _reference_image_shape 里还按源尺寸向下对齐做了一次封顶。
+
+    默认关闭（保持既有行为）。开启后 1024x1024 在默认目标 2048 下不再被放大成 2048x2048
+    （4096 rows），而是保持原生（1024 rows）—— 省 4 倍且**不丢任何真实细节**，因为放大出来的
+    像素全是插值。这与官方 processor 的 Qwen3VL 语义一致：按面积钳制、区间内保留原生分辨率。
+
+    默认没有直接打开，是因为**同一套"强制归一到固定短边"的写法在参考视频上也存在**
+    （reference_video.py 的 MINIMAX_H3_BASE_SHORT_EDGE = 768 同样会放大小视频）。两处一致，
+    不排除是有意为之——把参考条件统一到某个规范分辨率。但图用 2048、视频用 768 的不对称又
+    说明它不像是硬性要求。仅凭代码判不了，需要画质 A/B 才能决定是否翻默认值。
+    """
+    return os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV, "").strip() in {"1", "true", "True"}
 
 
 def _reference_image_short_edge() -> int:
-    """ref2va 参考图被归一到的短边，默认 2048。
+    """ref2va 参考图被归一到的短边，默认 2048（保持既有行为）。
 
-    每张参考图都会按这个短边缩放后进 packed sequence，而 rows 正比于像素数：短边 2048 时
-    单张 3584x2048 贡献 112*64 = 7168 rows，9 张就是 64512 —— 相当于 1344x768/362 帧目标
-    序列（约 107856 rows）的 60%。2026-08-15 实测 9 张参考图在 40G 卡上必 OOM，且是在
-    encode_image（单图编码时关掉 parallel tiling，见 vae.py）阶段、20 秒内就炸。
+    每张参考图按这个短边缩放后进 packed sequence，rows 正比于像素数。2026-08-15 在
+    40G A100 x4 上实测（1344x768/15s/20 步，engine 日志 rows video=115024）：
 
-    注意 _reference_image_shape 的 scale 没有上限，**小图会被放大**：喂 448x256 同样得到
-    3584x2048。所以调用方压缩参考图是无效的，唯一的旋钮在这里。
+        短边 2048 -> 单张 3584x2048 = 112*64 = 7168 rows
+        短边  768 -> 单张 1344x768  =  42*24 = 1008 rows
 
-    做成 env 可配而不是直接改小默认值：短边决定参考图带进模型的信息量，调小虽然能解 OOM，
-    但会影响参考效果，必须先做画质 A/B 再决定是否改默认。参考**视频**用的是
-    MINIMAX_H3_BASE_SHORT_EDGE = 768（reference_video.py），可作为下调时的对齐目标。
+    115024 = 107856（目标序列）+ 7168，与上式精确吻合。9 张参考图在 2048 下就是 64512 rows、
+    占目标序列 60%，实测 20 秒内即在 encode_image 阶段 OOM（单图编码关掉了 parallel tiling，
+    见 vae.py）；同一用例改到 768 则跑通，1039s / 峰值 38533MiB，与**单图** 2048 的
+    1024s / 38137MiB 基本持平。单图场景下 768 同样净赚：828s / 36853MiB。
+
+    注意 _reference_image_shape 的 scale 没有 min(1.0, …) 上限，**小图会被放大**：喂
+    448x256 同样得到 3584x2048。所以调用方压缩参考图无效，唯一的旋钮在这里。
+
+    与官方口径的关系（MiniMaxAI/MiniMax-H3）：官方 API 的 conditions[] 不暴露参考素材分辨率，
+    2048 是本适配层自选值、无官方出处；官方 processor 走 Qwen3VL 那套按**面积**钳制的语义
+    （[256^2, 4096^2]，区间内保留原生分辨率），与这里的强制归一并不一致。官方模型规格标称
+    支持 ≤9 图，故 2048 下 9 图必 OOM 意味着达不到标称能力。参考**视频**用的是
+    MINIMAX_H3_BASE_SHORT_EDGE = 768（reference_video.py），图/视频这处不对称更像疏忽。
+
+    仍做成 env 可配而不直接改默认：上述实测素材原生就是 1344x768（短边 768），2048 纯属把它
+    插值放大 2.67 倍，自然无损；但线上用户可能上传远高于 768 的原图，那时 768 会真的丢细节。
+    改默认值需先按线上输入分布做画质 A/B。取值范围见 MINIMAX_H3_REFERENCE_IMAGE_{MIN,MAX}_TARGET。
+
+    **这个旋钮只降低天花板，不消除放大**：短边小于目标值的图仍会被插值放大（目标 768 时
+    512x512 仍被拉成 768x768）。要真正止住放大得给 scale 加 min(1.0, …)，见
+    MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV。
+
+    **它也管不住宽高比**：短边固定后 rows 仍随比例线性涨（1.75 比例 7168 rows，
+    2.5 比例 10240 rows）。要让单图代价与比例解耦，见
+    MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV 的面积封顶。
     """
     raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "").strip()
     if not raw:
@@ -142,14 +240,25 @@ def _reference_image_short_edge() -> int:
             raw,
         )
         return 2048
-    # 下界取 VAE 与 patch 对齐所需的最小值；上界沿用 _reference_image_shape 的入参校验，
-    # 免得一个笔误把序列撑爆或缩到不可用。
-    if not MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE <= value <= 5760:
+    # 不变式：**任何非法输入都不得解析出比默认值更贵的目标**。
+    # 越下界夹取（16 -> 32）保住"调小省显存"的意图，且必定更省；越上界**不能**同样夹到 5760 ——
+    # 那是把手滑变成最贵的一档：2560x1024 在短边 5760 下是 14400x5760 = 81000 rows/图，
+    # 而 2048 档只有 10240，差 7.9 倍，正好制造这个开关要防的 OOM。所以越上界回落默认值。
+    if value < MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET:
         logger.warning(
-            "%s=%d out of range [%d, 5760]; falling back to 2048",
+            "%s=%d is below the %d-pixel patch alignment; clamping to %d",
             MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
             value,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+            MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET,
+            MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET,
+        )
+        return MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET
+    if value > MINIMAX_H3_REFERENCE_IMAGE_MAX_TARGET:
+        logger.warning(
+            "%s=%d exceeds the %d-pixel ceiling; falling back to 2048 rather than clamping up",
+            MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
+            value,
+            MINIMAX_H3_REFERENCE_IMAGE_MAX_TARGET,
         )
         return 2048
     return value
@@ -334,6 +443,11 @@ def get_minimax_h3_post_process_func(
 
 def _align_multiple(value: float, multiple: int = 32) -> int:
     return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+
+def _align_multiple_down(value: float, multiple: int = 32) -> int:
+    """向下对齐。_align_multiple 用的是最近取整，会向上越过源尺寸（1008 -> 1024）。"""
+    return max(multiple, int(math.floor(float(value) / multiple)) * multiple)
 
 
 def _load_image(value: Any) -> Image.Image:
@@ -580,16 +694,40 @@ def _reference_image_shape(image: Image.Image) -> tuple[int, int]:
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
     scale = _reference_image_short_edge() / min(width, height)
-    return (
-        _align_multiple(
-            width * scale,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-        ),
-        _align_multiple(
-            height * scale,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-        ),
-    )
+    no_upscale = _reference_image_no_upscale()
+    if no_upscale:
+        scale = min(1.0, scale)
+    target_width = width * scale
+    target_height = height * scale
+    # 面积封顶，与 _reference_video_shape / _resolve_output_canvas 同形；默认关闭。
+    max_pixels = _reference_image_max_pixels()
+    area = target_width * target_height
+    if max_pixels and area > max_pixels:
+        area_scale = math.sqrt(max_pixels / area)
+        target_width *= area_scale
+        target_height *= area_scale
+    out_width = _align_multiple(target_width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE)
+    out_height = _align_multiple(target_height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE)
+    if max_pixels and out_width * out_height > max_pixels:
+        # 最近取整会把面积重新抬过封顶：1024x1024 在 768*1344 封顶下算出 1016，round 回 1024，
+        # 面积仍是 1048576 > 1032192。越界时改用向下对齐。
+        out_width = _align_multiple_down(target_width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE)
+        out_height = _align_multiple_down(target_height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE)
+        # 向下对齐仍可能不够：_align_multiple_down 有 max(multiple, …) 下限，短边压到 32 后
+        # 长边还是 64，乘积 2048 就再也降不下去。例如 2560x1024 配 cap=1800 会停在 64x32。
+        # 逐 patch 削长边直到真正落进封顶——env 已保证 cap >= 32*32，故必定收敛且不会归零。
+        while out_width * out_height > max_pixels and max(out_width, out_height) > MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE:
+            if out_width >= out_height:
+                out_width -= MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
+            else:
+                out_height -= MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
+    if no_upscale:
+        # min(1.0, scale) 还不够：_align_multiple 是最近取整，会把 1008 抬成 1024、
+        # 把 1080x1440 抬成 1088x1440（顺带改掉比例）。按源尺寸向下对齐再取小，
+        # 才真正兑现"绝不放大"。源边长下限 256 >> 32，向下对齐不会归零。
+        out_width = min(out_width, _align_multiple_down(width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE))
+        out_height = min(out_height, _align_multiple_down(height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE))
+    return (out_width, out_height)
 
 
 def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
