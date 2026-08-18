@@ -216,3 +216,77 @@ def test_out_of_range_params_raise_at_build_time(kwargs):
     req = _req(**kwargs)
     with pytest.raises(ValidationError):
         req.to_video_request()
+
+
+# --------------------------------------------------- hand-written reference_order
+
+
+def test_a_hand_written_reference_order_is_reported():
+    """``reference_order`` is derived from ``references``, never supplied.
+
+    ``VideoTaskRequest`` forwards extras, so a caller can put it in the body and
+    it rides through untouched. Nothing then keeps it consistent with the media
+    that actually arrived in the buckets, and the first reader is serving —
+    inside the background job, after ``reserve()`` has taken a queue slot. The
+    route asks this question before that happens.
+    """
+    assert _req(reference_order=[{"type": "image", "index": 0}]).supplies_route_derived_order() is True
+    assert _req(image_path="/nfs/a.png").supplies_route_derived_order() is False
+    # Only a value counts: an explicit null expresses no order, same as absence.
+    assert _req(reference_order=None).supplies_route_derived_order() is False
+
+
+def test_a_hand_written_reference_order_never_reaches_the_generation_request():
+    """Route-owned, so even if the 400 were missed it would not be forwarded.
+
+    Belt and braces on purpose: a dropped order silently builds the video from
+    the *canonical* bucket order, which is a different video, and that is the
+    failure the route rejects rather than absorbs.
+    """
+    video_request = _req(image_path="/nfs/a.png", reference_order=[{"type": "video", "index": 7}]).to_video_request()
+    assert video_request.reference_order is None
+    assert (video_request.model_extra or {}) == {}
+
+
+def test_the_derived_order_is_still_supplied_by_the_route():
+    """The guard is about the *caller* writing it; the route still derives it."""
+    req = VideoTaskRequest(
+        prompt="p",
+        references=[{"type": "video", "path": "/nfs/a.mp4"}, {"type": "image", "path": "/nfs/b.png"}],
+    )
+    assert req.supplies_route_derived_order() is False
+    forwarded = req.to_video_request().reference_order
+    assert [(entry.type, entry.index) for entry in forwarded] == [("video", 0), ("image", 0)]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"index": 0},  # no modality at all
+        {"type": "image"},  # no index at all
+        {"type": "picture", "index": 0},  # not a modality the pipeline buckets
+        {"type": "image", "index": "a"},  # serving uses it as a list subscript
+        {"type": "image", "index": -1},  # negative subscripts wrap, silently
+        {"type": "image", "index": 0, "path": "/nfs/a.png"},  # media rides in buckets
+    ],
+)
+def test_malformed_order_entries_are_refused_by_the_schema(entry):
+    """Typed entries, so a bad one is a ValidationError the route turns into 400.
+
+    As a loose ``list[dict[str, Any]]`` every one of these passed submit and
+    blew up later on ``entry["type"]`` / ``entry["index"]``, by which point the
+    caller had a PENDING task instead of an answer.
+    """
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+
+    with pytest.raises(ValidationError):
+        VideoGenerationRequest(prompt="p", reference_order=[entry])
+
+
+def test_well_formed_order_entries_are_accepted():
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+
+    request = VideoGenerationRequest(
+        prompt="p", reference_order=[{"type": "audio", "index": 2}, {"type": "video", "index": 0}]
+    )
+    assert [(entry.type, entry.index) for entry in request.reference_order] == [("audio", 2), ("video", 0)]

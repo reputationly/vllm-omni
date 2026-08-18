@@ -155,12 +155,10 @@ def test_request_schema_carries_and_orders_references():
     assert request.reference_video_paths() == ["/nfs/a.mp4"]
     assert request.reference_audio_paths() == ["/nfs/c.wav"]
     assert request.reference_order() == [("video", 0), ("image", 0), ("audio", 0)]
-    # It survives into the generation request, which is what serving reads.
-    assert request.to_video_request().reference_order == [
-        {"type": "video", "index": 0},
-        {"type": "image", "index": 0},
-        {"type": "audio", "index": 0},
-    ]
+    # It survives into the generation request, which is what serving reads —
+    # as typed entries, so serving indexes attributes rather than raw keys.
+    forwarded = request.to_video_request().reference_order
+    assert [(entry.type, entry.index) for entry in forwarded] == [("video", 0), ("image", 0), ("audio", 0)]
 
 
 def test_bucketed_requests_are_untouched():
@@ -185,3 +183,63 @@ def test_mixing_ordered_and_bucketed_inputs_is_reported_not_resolved():
         image_path="/a.png",
     )
     assert request.conflicting_reference_inputs() == ["image_path"]
+
+
+def test_bucket_slots_are_the_identity_for_a_bucketed_request():
+    """The common case must cost nothing and change nothing.
+
+    Every request served so far is bucketed, so the permutation that re-orders
+    the encoded rows has to be the identity there — otherwise this fix is a
+    regression for every existing caller.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
+        audio_bucket_slots,
+        canonical_order_from_buckets,
+        visual_bucket_slots,
+    )
+
+    ordered = canonical_order_from_buckets(num_images=2, video_has_audio=[False, True], num_audios=1)
+    assert visual_bucket_slots(ordered, num_images=2) == [0, 1, 2, 3]
+    assert audio_bucket_slots(ordered, video_has_audio=[False, True]) == [0, 1]
+
+
+def test_bucket_slots_permute_an_interleaved_request():
+    """video, image, audio: the rows have to move, not only the labels."""
+    from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
+        audio_bucket_slots,
+        ordered_references_from_request,
+        visual_bucket_slots,
+    )
+
+    ordered = ordered_references_from_request(
+        [("video", 0), ("image", 0), ("audio", 0)],
+        num_images=1,
+        video_has_audio=[True],
+        num_audios=1,
+    )
+    # Visual rows arrive images-then-videos, so the video sits at slot 1.
+    assert visual_bucket_slots(ordered, num_images=1) == [1, 0]
+    # Audio rows arrive embedded-then-standalone; the video's soundtrack is 0.
+    assert audio_bucket_slots(ordered, video_has_audio=[True]) == [0, 1]
+
+
+def test_a_silent_video_occupies_no_audio_slot():
+    """The embedded audio bucket only holds the videos that carry sound.
+
+    Indexing it by the video's own bucket index would read the *next* video's
+    soundtrack once any earlier video is silent.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
+        audio_bucket_slots,
+        ordered_references_from_request,
+    )
+
+    ordered = ordered_references_from_request(
+        [("video", 2), ("video", 0), ("video", 1)],
+        num_images=0,
+        video_has_audio=[False, True, True],
+        num_audios=0,
+    )
+    # Videos 1 and 2 carry sound and occupy embedded slots 0 and 1; video 0
+    # carries none and occupies nothing.
+    assert audio_bucket_slots(ordered, video_has_audio=[False, True, True]) == [1, 0]

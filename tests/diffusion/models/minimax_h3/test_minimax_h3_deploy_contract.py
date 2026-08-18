@@ -37,20 +37,65 @@ def test_diffusion_config_carries_the_contract_fields():
     assert "minimax_h3_admission_policy" in fields
 
 
-def test_stage_fields_reach_engine_args():
-    """`_build_engine_args` copies StageDeployConfig through; assert it really does."""
-    from dataclasses import asdict
+def _diffusion_stage_engine_values(**deploy_fields):
+    """Run a deploy stage through the real override plumbing, not a stand-in.
 
-    from vllm_omni.config.stage_config import StageDeployConfig
+    An earlier version of this test copied ``asdict(StageDeployConfig)`` and
+    asserted the keys survived, which is true of any field whatsoever and so
+    proved nothing. The step that actually rejects a field is
+    ``_validate_stage_engine_override_ownership``, reached only from
+    ``_stage_engine_values``; go through it.
+    """
+    from vllm_omni.config.omni_config import _stage_engine_values
+    from vllm_omni.config.stage_config import StageDeployConfig, StageExecutionType, StagePipelineConfig
 
-    stage = StageDeployConfig(
-        stage_id=0,
+    return _stage_engine_values(
+        StageDeployConfig(stage_id=0, **deploy_fields),
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="dit",
+            execution_type=StageExecutionType.DIFFUSION,
+        ),
+    )
+
+
+def test_stage_fields_reach_the_diffusion_overrides():
+    """A YAML that sets the contract must start, and the value must arrive."""
+    values = _diffusion_stage_engine_values(
         minimax_h3_inference_contract="official_diffusers_v1",
         minimax_h3_admission_policy="parity_fixture_v1",
     )
-    copied = {key: value for key, value in asdict(stage).items() if value is not None}
-    assert copied["minimax_h3_inference_contract"] == "official_diffusers_v1"
-    assert copied["minimax_h3_admission_policy"] == "parity_fixture_v1"
+    diffusion = dict(values.diffusion.to_kwargs())
+    assert diffusion["minimax_h3_inference_contract"] == "official_diffusers_v1"
+    assert diffusion["minimax_h3_admission_policy"] == "parity_fixture_v1"
+
+
+def test_the_contract_fields_have_a_structured_owner():
+    """They must be declared on the diffusion projection, not only on the deploy surface.
+
+    Ownership is what the validator checks. A field present on
+    ``StageDeployConfig`` but absent from ``_DiffusionConfigProjection`` makes
+    every deployment that sets it fail at startup.
+    """
+    from vllm_omni.config.omni_config import _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+
+    assert "minimax_h3_inference_contract" in _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+    assert "minimax_h3_admission_policy" in _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+
+
+def test_an_unowned_stage_field_still_fails_loudly():
+    """The guard the previous test relies on has to be live, not vacuous."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="no structured config owner"):
+        _diffusion_stage_engine_values(engine_extras={"minimax_h3_nonexistent_knob": "x"})
+
+
+def test_absent_contract_fields_do_not_reach_the_overrides():
+    """Unset means legacy: the keys must not appear at all, not appear as None."""
+    diffusion = dict(_diffusion_stage_engine_values().diffusion.to_kwargs())
+    assert "minimax_h3_inference_contract" not in diffusion
+    assert "minimax_h3_admission_policy" not in diffusion
 
 
 def test_config_value_beats_the_env_and_reaches_the_strategy():

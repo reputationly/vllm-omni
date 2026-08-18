@@ -119,7 +119,11 @@ def test_describe_reports_the_resolved_contract():
     from vllm_omni.diffusion.models.minimax_h3.strategy import MiniMaxH3InferenceStrategy
 
     expected = {field for field in MiniMaxH3InferenceStrategy.__dataclass_fields__ if field != "name"}
-    assert expected | {"inference_contract"} == set(described)
+    # ``model_validation_semantics`` is derived rather than stored — as a
+    # settable field nothing read it, so a builder could have set it to
+    # contradict the envelope it names. It is still reported, because that is
+    # what an operator reads the envelope off.
+    assert expected | {"inference_contract", "model_validation_semantics"} == set(described)
 
 
 def test_env_selects_the_contract_when_config_is_silent():
@@ -221,16 +225,39 @@ def test_shape_changing_switches_stay_parity_only_in_production():
         )
 
 
-def test_parity_short_edge_must_be_a_usable_geometry():
+def test_parity_short_edge_degrades_and_never_resolves_more_expensively():
+    """Bad input must not take the instance down, and must not raise the ceiling.
+
+    This test used to demand a raise for every one of these, which was wrong
+    twice over: ``1000`` is a value legacy deploy files legitimately carry
+    (``_align_multiple`` rounds the resolved geometry, so a non-multiple of 32
+    has always worked), and demanding a raise for the *cheap* mistakes while the
+    parser had no upper bound at all meant ``10240`` — 25x the default's rows —
+    sailed through. The invariant is one-directional: never more expensive than
+    the default.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_image_geometry import (
+        MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET,
+    )
     from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
 
-    for bad in ("1000", "0", "-32", "many"):
-        with pytest.raises(ValueError):
-            resolve_strategy(
-                inference_contract="official_diffusers_v1",
-                admission_policy="parity_fixture_v1",
-                environ={"VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": bad},
-            )
+    def resolved(raw: str) -> int:
+        return resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy="parity_fixture_v1",
+            environ={"VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": raw},
+        ).reference_image_short_edge
+
+    assert resolved("1000") == 1000  # in range: honoured verbatim
+    assert resolved("0") == 32  # below the patch alignment: clamped, and cheaper
+    assert resolved("-32") == 32
+    assert resolved("many") == MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET
+    # The one that matters: over the ceiling falls BACK, it does not clamp up.
+    assert resolved("10240") == MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET
+    assert resolved("5760") == 5760
+
+    for raw in ("1000", "0", "-32", "many", "10240", "5760", "99999999"):
+        assert resolved(raw) <= MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET or int(raw) == resolved(raw)
 
 
 def test_default_official_short_edge_is_the_released_one():
@@ -371,17 +398,45 @@ def test_the_legacy_short_edge_knob_is_not_shadowed_by_the_strategy():
     )
     assert overridden.reference_image_short_edge == 1024
 
-    # Validated identically regardless of contract.
+    # Resolved identically regardless of contract, and identically to the
+    # pipeline's own env path — one parser, one answer. A legacy deployment
+    # carrying 1000 keeps working; one that fat-fingers 10240 gets the default
+    # back rather than a target 25x more expensive than the one it replaced.
     for contract in ("legacy", "official_diffusers_v1"):
-        with pytest.raises(ValueError, match="multiple of 32"):
-            resolve_strategy(
+        for raw, expected in (("1000", 1000), ("10240", 2048), ("nope", 2048), ("8", 32)):
+            strategy = resolve_strategy(
                 inference_contract=contract,
                 admission_policy=None,
                 environ={
-                    "VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": "1000",
+                    "VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": raw,
                     "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "official_short_edge",
                 },
             )
+            assert strategy.reference_image_short_edge == expected, (contract, raw)
+
+
+def test_the_short_edge_has_exactly_one_parser():
+    """The two entry points must not be able to disagree again.
+
+    They did: the pipeline warned and degraded, the strategy raised, and on the
+    one input where the difference was dangerous — an in-range-looking multiple
+    of 32 above the ceiling — the strategy was the *looser* of the two.
+    """
+    import os
+    from unittest.mock import patch
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    for raw in ("768", "1000", "2048", "5760", "10240", "31", "0", "-1", "", "abc"):
+        with patch.dict(os.environ, {"VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": raw}, clear=False):
+            via_pipeline = pipeline_minimax_h3._reference_image_short_edge()
+        via_strategy = resolve_strategy(
+            inference_contract="legacy",
+            admission_policy=None,
+            environ={"VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": raw},
+        ).reference_image_short_edge
+        assert via_pipeline == via_strategy, raw
 
 
 def test_the_two_noise_axes_can_be_selected_independently():
