@@ -1159,9 +1159,13 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
         pipeline_minimax_h3 as pipeline_module,
     )
 
+    # What rank 0 now puts on the object list: metadata only, with the frame
+    # shape standing in for the pixels. ``None`` means "no decoded frames in
+    # memory" — the legacy case, where every rank reads the intermediate file
+    # itself and nothing is broadcast at all.
     prepared = [
-        {"prepared_path": "video-1.mp4"},
-        {"prepared_path": "video-2.mp4"},
+        {"prepared_path": "video-1.mp4", "frames_shape": None},
+        {"prepared_path": "video-2.mp4", "frames_shape": None},
     ]
 
     class FakeVideoVAE:

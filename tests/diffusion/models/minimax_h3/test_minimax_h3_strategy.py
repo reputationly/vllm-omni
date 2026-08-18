@@ -26,6 +26,7 @@ def test_default_is_legacy_and_matches_production_today():
     assert strategy.reference_order_mode == "legacy_bucket_canonicalization"
     assert strategy.reference_video_decode_mode == "legacy_h264_intermediate"
     assert strategy.reference_video_target_truncation is False
+    assert strategy.reference_video_vae_frame_snap_mode == "legacy_no_snap"
     assert strategy.reference_audio_resample_mode == "legacy_double_resample"
     assert strategy.reference_audio_target_truncation is False
     assert strategy.model_validation_semantics == "legacy"
@@ -47,6 +48,7 @@ def test_official_contract_resolves_every_field_to_the_oracle():
     assert strategy.reference_order_mode == "ordered_references"
     assert strategy.reference_video_decode_mode == "official_lossless_frames"
     assert strategy.reference_video_target_truncation is True
+    assert strategy.reference_video_vae_frame_snap_mode == "official_vae_chunk"
     assert strategy.reference_audio_resample_mode == "official_single_resample"
     assert strategy.reference_audio_target_truncation is True
     assert strategy.model_validation_semantics == "official"

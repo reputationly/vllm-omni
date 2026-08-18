@@ -89,6 +89,106 @@ def test_official_reference_image_keeps_its_own_geometry(oracle_reference_images
     assert len(distinct) > 1
 
 
+class _StageConfig:
+    """The two attributes the engine's diffusion-stage lookup reads."""
+
+    def __init__(self, stage_type, engine_args=None):
+        self.stage_type = stage_type
+        self.engine_args = engine_args
+
+
+def _out_of_process_view(stage_configs, monkeypatch, model_class_name="MiniMaxH3Pipeline"):
+    """The config view an out-of-process deployment's serving layer sees."""
+    from vllm_omni.diffusion import data
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    monkeypatch.setattr(data, "resolve_model_class_name", lambda _model: model_class_name)
+
+    class _Engine:
+        _DIFFUSION_CONTRACT_VIEW_FIELDS = AsyncOmniEngine._DIFFUSION_CONTRACT_VIEW_FIELDS
+        _diffusion_stage_engine_args = AsyncOmniEngine._diffusion_stage_engine_args
+        get_diffusion_od_config = AsyncOmniEngine.get_diffusion_od_config
+
+        def __init__(self):
+            self.model = "/models/MiniMax-H3"
+            self.stage_configs = stage_configs
+            self._diffusion_od_config_view = None
+
+    return _Engine().get_diffusion_od_config()
+
+
+def test_the_contract_reaches_the_serving_process(monkeypatch):
+    """Out of process this view is all the serving layer has.
+
+    The worker holds the real config; the front end holds this. A view without
+    the contract fields makes the probe answer *legacy* for a worker running
+    *official* — and the front end then stretches every reference image onto the
+    output canvas, silently, before the worker ever sees it.
+    """
+    from vllm_omni.diffusion.model_metadata import reference_images_bind_output_canvas
+
+    view = _out_of_process_view(
+        [
+            _StageConfig("llm", {"minimax_h3_inference_contract": "legacy"}),
+            _StageConfig("diffusion", {"minimax_h3_inference_contract": "official_diffusers_v1"}),
+        ],
+        monkeypatch,
+    )
+
+    assert view.minimax_h3_inference_contract == "official_diffusers_v1"
+    assert reference_images_bind_output_canvas(view.model_class_name, view) is False
+
+
+def test_a_yaml_that_says_nothing_is_still_legacy(monkeypatch):
+    """The deploy file ships the field commented out, and that must stay legacy."""
+    from vllm_omni.diffusion.model_metadata import reference_images_bind_output_canvas
+
+    view = _out_of_process_view([_StageConfig("diffusion", {})], monkeypatch)
+
+    assert view.minimax_h3_inference_contract is None
+    assert reference_images_bind_output_canvas(view.model_class_name, view) is True
+
+
+def test_the_view_survives_a_deployment_with_no_diffusion_stage(monkeypatch):
+    """Comprehension-only pipelines have no engine_args to read, and must not raise."""
+    view = _out_of_process_view([_StageConfig("llm", {})], monkeypatch, model_class_name=None)
+
+    assert view.minimax_h3_inference_contract is None
+    assert view.minimax_h3_admission_policy is None
+
+
+def test_omegaconf_engine_args_are_read_the_same_way(monkeypatch):
+    """YAML-loaded stage configs carry a DictConfig, not a dict."""
+    from omegaconf import OmegaConf
+
+    engine_args = OmegaConf.create(
+        {
+            "minimax_h3_inference_contract": "official_diffusers_v1",
+            "minimax_h3_admission_policy": "parity_fixture_v1",
+        }
+    )
+    view = _out_of_process_view([_StageConfig("diffusion", engine_args)], monkeypatch)
+
+    assert view.minimax_h3_inference_contract == "official_diffusers_v1"
+    assert view.minimax_h3_admission_policy == "parity_fixture_v1"
+
+
+def test_the_deploy_yaml_field_lands_on_the_diffusion_stage_engine_args():
+    """The path the view depends on, checked end to end against the real YAML.
+
+    ``_build_engine_args`` passes ``StageDeployConfig`` through verbatim, which
+    is why the front end can read the contract at all. Pinned here because it is
+    an incidental-looking passthrough that a refactor could tighten into an
+    allow-list without anyone noticing what broke.
+    """
+    from dataclasses import fields
+
+    from vllm_omni.config.stage_config import StageDeployConfig
+
+    declared = {field.name for field in fields(StageDeployConfig)}
+    assert {"minimax_h3_inference_contract", "minimax_h3_admission_policy"} <= declared
+
+
 @pytest.fixture(scope="module")
 def oracle_reference_images():
     import json
