@@ -175,6 +175,66 @@ def test_the_cross_process_view_carries_it_too():
     assert "diffusion_runtime_environ" in AsyncOmniEngine._DIFFUSION_CONTRACT_VIEW_FIELDS
 
 
+# ------------------------------------------- and survives the representation it crosses in
+
+
+def test_the_mapping_is_read_in_the_representation_a_yaml_deployment_carries():
+    """A YAML stage config is OmegaConf, and a ``DictConfig`` is not a ``dict``.
+
+    This is the one that shipped broken. The value crossed all four hops intact
+    and was then discarded by its own reader, because the reader asked
+    ``isinstance(value, dict)`` and every test — this file included — handed it a
+    hand-built plain dict. So the probes answered ``legacy`` for a worker running
+    ``official`` on exactly the deployment shape the transport was built for, and
+    the suite stayed green.
+    """
+    from omegaconf import OmegaConf
+
+    from vllm_omni.diffusion.models.minimax_h3.strategy import contract_environ
+
+    wrapped = OmegaConf.create({"diffusion_runtime_environ": {_CONTRACT: "official_diffusers_v1"}})
+    assert not isinstance(wrapped.diffusion_runtime_environ, dict), "the premise of this test has changed"
+
+    assert contract_environ(_config(stage_env=wrapped.diffusion_runtime_environ))[_CONTRACT] == "official_diffusers_v1"
+
+
+def test_the_probes_answer_official_off_an_omegaconf_stage_config():
+    """The two answers that were wrong in the field, restated on the real shape."""
+    from omegaconf import OmegaConf
+
+    from vllm_omni.diffusion.model_metadata import (
+        honours_explicit_reference_order,
+        reference_images_bind_output_canvas,
+    )
+
+    wrapped = OmegaConf.create({_CONTRACT: "official_diffusers_v1"})
+    stage = _config(stage_env=wrapped)
+
+    assert reference_images_bind_output_canvas("MiniMaxH3Pipeline", stage) is False
+    assert honours_explicit_reference_order("MiniMaxH3Pipeline", stage) is True
+
+
+def test_the_view_hands_out_plain_python_whatever_the_config_was_built_from():
+    """The transport normalizes once, so no reader has to remember any of this.
+
+    Read off ``to_omegaconf()`` — the actual object a YAML deployment resolves to
+    — rather than a hand-made ``DictConfig``, because the question is what the
+    config layer produces and not what OmegaConf can produce.
+    """
+    from vllm_omni.engine.async_omni_engine import _plain_config_value
+
+    engine_args = _shipped_h3_stage({_CONTRACT: "official_diffusers_v1"}).to_omegaconf().engine_args
+    carried = getattr(engine_args, "diffusion_runtime_environ", None)
+
+    assert not isinstance(carried, dict), "the representation this normalization exists for has changed"
+    normalized = _plain_config_value(carried)
+    assert type(normalized) is dict
+    assert normalized == {_CONTRACT: "official_diffusers_v1"}
+    # And it leaves alone what does not need it: scalars come off OmegaConf plain.
+    assert _plain_config_value("official_diffusers_v1") == "official_diffusers_v1"
+    assert _plain_config_value(None) is None
+
+
 def test_the_stage_env_parser_is_the_one_the_stage_itself_uses():
     """Two parsers of one config surface is how the two sides come to disagree."""
     from vllm_omni.engine.stage_init_utils import stage_runtime_env_mapping

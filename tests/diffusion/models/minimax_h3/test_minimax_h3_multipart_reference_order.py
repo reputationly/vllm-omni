@@ -199,3 +199,75 @@ def test_the_attached_entries_are_what_the_request_schema_accepts():
     order = _multipart_reference_order(_handler(True), [("audio", 0), ("image", 1)])
     request = VideoGenerationRequest(prompt="p", reference_order=order)
     assert [(entry.type, entry.index) for entry in request.reference_order] == [("audio", 0), ("image", 1)]
+
+
+# ------------------------------------------ the one field that arrives past the split
+
+
+def _completed(order, *, num_audios):
+    from vllm_omni.entrypoints.openai.api_server import _order_with_separate_audio
+
+    return _order_with_separate_audio(order, num_audios=num_audios)
+
+
+def _entries(kinds_and_indices):
+    from vllm_omni.entrypoints.openai.protocol.videos import ReferenceOrderEntry
+
+    return [ReferenceOrderEntry(type=kind, index=index) for kind, index in kinds_and_indices]
+
+
+def test_audio_supplied_beside_the_uploads_takes_its_place_in_the_order():
+    """``audio_reference`` is the one media field ``input_references`` may join.
+
+    It is deliberately outside the mutual-exclusion check, and its URLs are
+    decoded into the audio bucket *after* the uploads — so an order derived from
+    the uploads alone names fewer audio references than actually arrived. That is
+    not a partial order the pipeline completes: the validator requires the order
+    to name every reference, so a legal combination failed deep in the worker.
+    """
+    completed = _completed(_entries([("video", 0), ("image", 0)]), num_audios=2)
+    assert [(entry.type, entry.index) for entry in completed] == [
+        ("video", 0),
+        ("image", 0),
+        ("audio", 0),
+        ("audio", 1),
+    ]
+
+
+def test_the_completed_order_is_one_the_validator_accepts():
+    """The actual failure this prevents, at the layer that used to raise it."""
+    from vllm_omni.diffusion.models.minimax_h3.ordered_references import ordered_references_from_request
+
+    uploads_only = _entries([("video", 0), ("image", 0)])
+    buckets = {"num_images": 1, "video_has_audio": [False], "num_audios": 2}
+
+    with pytest.raises(ValueError, match="2 audio reference"):
+        ordered_references_from_request([(e.type, e.index) for e in uploads_only], **buckets)
+
+    completed = _completed(uploads_only, num_audios=2)
+    resolved = ordered_references_from_request([(e.type, e.index) for e in completed], **buckets)
+    assert [(r.kind, r.bucket_index) for r in resolved] == [("video", 0), ("image", 0), ("audio", 0), ("audio", 1)]
+
+
+def test_uploaded_audio_keeps_the_position_the_request_actually_stated():
+    """Only the unnamed remainder is appended; a stated position is not moved."""
+    completed = _completed(_entries([("audio", 0), ("image", 0)]), num_audios=3)
+    assert [(entry.type, entry.index) for entry in completed] == [
+        ("audio", 0),
+        ("image", 0),
+        ("audio", 1),
+        ("audio", 2),
+    ]
+
+
+def test_an_order_that_already_names_every_audio_is_left_exactly_as_it_was():
+    order = _entries([("audio", 1), ("image", 0), ("audio", 0)])
+    assert _completed(order, num_audios=2) is order
+    assert _completed(order, num_audios=0) is order
+
+
+def test_no_order_stays_no_order():
+    """A deployment that refuses an explicit order must not be handed one, and a
+    request that never had an order has nothing to complete."""
+    assert _completed(None, num_audios=2) is None
+    assert _completed(None, num_audios=0) is None

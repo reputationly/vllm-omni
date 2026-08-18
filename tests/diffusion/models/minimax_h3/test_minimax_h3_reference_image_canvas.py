@@ -173,6 +173,41 @@ def test_omegaconf_engine_args_are_read_the_same_way(monkeypatch):
     assert view.minimax_h3_admission_policy == "parity_fixture_v1"
 
 
+def test_a_nested_value_comes_off_the_view_as_plain_python(monkeypatch):
+    """The test above covers scalars, and scalars were never the problem.
+
+    A ``DictConfig`` yields ``str``/``int``/``bool`` for its leaves, so reading
+    the contract out of one looks like proof the representation is handled. It
+    is not: the *container* stays wrapped, and a ``DictConfig`` is a
+    ``MutableMapping`` but not a ``dict``. ``diffusion_runtime_environ`` is the
+    one view field that is a container, its reader asked ``isinstance(value,
+    dict)``, and the mapping was therefore dropped on exactly the deployment
+    shape it exists for — every hand-built-dict test still passing.
+
+    Normalizing here rather than at each reader is the point: this is the one
+    place that knows a config representation was crossed.
+    """
+    from omegaconf import OmegaConf
+
+    from vllm_omni.diffusion.model_metadata import (
+        honours_explicit_reference_order,
+        reference_images_bind_output_canvas,
+    )
+
+    engine_args = OmegaConf.create(
+        {"diffusion_runtime_environ": {"VLLM_OMNI_H3_INFERENCE_CONTRACT": "official_diffusers_v1"}}
+    )
+    assert not isinstance(engine_args.diffusion_runtime_environ, dict), "the premise of this test has changed"
+
+    view = _out_of_process_view([_StageConfig("diffusion", engine_args)], monkeypatch)
+
+    assert type(view.diffusion_runtime_environ) is dict
+    assert view.diffusion_runtime_environ == {"VLLM_OMNI_H3_INFERENCE_CONTRACT": "official_diffusers_v1"}
+    # And the two answers that were wrong in the field because of it.
+    assert reference_images_bind_output_canvas(view.model_class_name, view) is False
+    assert honours_explicit_reference_order(view.model_class_name, view) is True
+
+
 def test_the_deploy_yaml_field_lands_on_the_diffusion_stage_engine_args():
     """The path the view depends on, checked end to end against the real YAML.
 

@@ -29,6 +29,7 @@ import gc
 import shutil
 import subprocess
 import weakref
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,6 +71,17 @@ def _source_frames(count: int, *, height: int, width: int) -> np.ndarray:
     return frames
 
 
+def _timed(frames, fps: float, *, origin: float = 0.0):
+    """``frames`` at a constant ``fps``, in the ``(timestamp, frame)`` shape.
+
+    Constant-rate is the case the streaming normalizer has to keep byte-exact,
+    so every equivalence test below feeds it through here: an evenly spaced
+    timestamp is the definition of the frame index the arithmetic used to read.
+    """
+    for index, frame in enumerate(frames):
+        yield origin + index / fps, frame
+
+
 def _normalize_both(
     frames: np.ndarray, *, fps: float, num_frames: int | None, short_edge: int = 768, resolve_canvas=_identity_canvas
 ):
@@ -86,7 +98,9 @@ def _normalize_both(
         canvas_max_pixels=768 * 1344,
         resolve_canvas=resolve_canvas,
     )
-    return normalize_reference_video_frames(frames, **kwargs), normalize_reference_video_stream(iter(frames), **kwargs)
+    return normalize_reference_video_frames(frames, **kwargs), normalize_reference_video_stream(
+        _timed(frames, fps), **kwargs
+    )
 
 
 # --------------------------------------------------------------------------
@@ -143,7 +157,7 @@ def test_streaming_normalization_carries_the_official_slot_mapping():
     for fps, num_frames in ((25.0, 30), (30.0, 24), (60.0, 49), (23.976, 121)):
         frames = _source_frames(200, height=48, width=64)
         streamed = normalize_reference_video_stream(
-            iter(frames),
+            _timed(frames, fps),
             fps=fps,
             num_frames=num_frames,
             canvas_multiple=32,
@@ -205,9 +219,9 @@ def test_decoding_stops_once_the_request_is_filled():
 
     def counted():
         nonlocal pulled
-        for frame in _source_frames(900, height=48, width=64):
+        for index, frame in enumerate(_source_frames(900, height=48, width=64)):
             pulled += 1
-            yield frame
+            yield index / 60.0, frame
 
     streamed = normalize_reference_video_stream(
         counted(),
@@ -221,10 +235,12 @@ def test_decoding_stops_once_the_request_is_filled():
 
     # The first source frame whose slot boundary reaches 121, by the same
     # expression the normalizer uses — spelling the number out here would only
-    # record a rounding convention twice.
+    # record a rounding convention twice. One more than that is pulled: a
+    # frame's slot span ends where its successor begins, so the successor has to
+    # arrive before the frame that fills the output can be written.
     enough = next(count for count in range(1, 901) if math.floor(count * 24.0 / 60.0 + 0.5) >= 121)
     assert streamed.shape[0] == 121
-    assert pulled == enough < 900, f"decoded {pulled} source frames for 121 output frames"
+    assert pulled == enough + 1 < 900, f"decoded {pulled} source frames for 121 output frames"
 
 
 def test_only_one_source_frame_is_alive_at_a_time():
@@ -232,10 +248,11 @@ def test_only_one_source_frame_is_alive_at_a_time():
 
     CPython frees a frame as soon as the normalizer stops referring to it, so a
     weak reference taken at ``yield`` time is dead a frame or two later. The
-    bound is one — the ``for`` target still holds the previous value while
-    ``next()`` runs — and not "a few": if a future edit collects the source
-    frames into a list, which is the shape of the original bug, every earlier
-    weakref stays alive and the count climbs with the stream.
+    bound is one — the ``for`` target and the one-frame lookahead the timestamp
+    schedule needs are the *same* frame while ``next()`` runs — and not "a few":
+    if a future edit collects the source frames into a list, which is the shape
+    of the original bug, every earlier weakref stays alive and the count climbs
+    with the stream.
     """
     from vllm_omni.diffusion.models.minimax_h3.reference_video_frames import normalize_reference_video_stream
 
@@ -243,11 +260,11 @@ def test_only_one_source_frame_is_alive_at_a_time():
     still_alive: list[int] = []
 
     def watched():
-        for frame in _source_frames(120, height=90, width=160):
+        for index, frame in enumerate(_source_frames(120, height=90, width=160)):
             frame = frame.copy()  # a fresh array per frame, as a decoder gives
             still_alive.append(sum(reference() is not None for reference in handed_out))
             handed_out.append(weakref.ref(frame))
-            yield frame
+            yield index / 30.0, frame
             del frame
 
     normalize_reference_video_stream(
@@ -270,22 +287,37 @@ def test_only_one_source_frame_is_alive_at_a_time():
 # --------------------------------------------------------------------------
 
 
-def _fake_container(frames: np.ndarray, *, rotation: float = 0.0, rate: float = 30.0, with_audio: bool = False):
-    """Just enough of a PyAV container for the reader, minus the codec."""
+def _fake_container(
+    frames: np.ndarray,
+    *,
+    rotation: float = 0.0,
+    rate: float = 30.0,
+    with_audio: bool = False,
+    times: Sequence[float] | None = None,
+):
+    """Just enough of a PyAV container for the reader, minus the codec.
+
+    ``times`` is the presentation timestamp per frame; the default lays them out
+    at ``rate``, which is what a constant-rate container does. Passing an uneven
+    list is how a variable-rate source is expressed, and ``None`` entries stand
+    for a stream that carries no usable timestamps at all.
+    """
 
     class _Frame:
-        def __init__(self, array):
+        def __init__(self, array, time):
             self._array = array
             self.rotation = rotation
+            self.time = time
 
         def to_ndarray(self, format):
             assert format == "rgb24"
             return self._array
 
+    stamps = [index / rate for index in range(len(frames))] if times is None else list(times)
     stream = SimpleNamespace(average_rate=rate, guessed_rate=rate)
     container = SimpleNamespace(
         streams=SimpleNamespace(video=[stream], audio=[object()] if with_audio else []),
-        decode=lambda stream: (_Frame(frame) for frame in frames),
+        decode=lambda stream: (_Frame(frame, stamp) for frame, stamp in zip(frames, stamps, strict=True)),
         seek=lambda offset: None,
     )
     return container, stream
@@ -300,12 +332,14 @@ def test_the_reader_skips_leading_frames_and_uprights_them():
     reader = ReferenceVideoReader(object(), container)
 
     assert reader.fps == pytest.approx(25.0)
-    read = list(reader.iter_frames(skip=2))
-    assert len(read) == 4
+    # 2/25 s in, so on a constant-rate stream this is the frame the old
+    # `skip=int(start * fps)` count landed on.
+    read = list(reader.iter_frames(start_seconds=2 / 25.0))
+    assert [stamp for stamp, _ in read] == pytest.approx([index / 25.0 for index in range(2, 6)])
     # Rotated per frame, which is the same quarter turn the buffered path
     # applies to the whole stack.
-    assert read[0].shape == (8, 4, 3)
-    assert np.array_equal(np.stack(read), np.rot90(frames[2:], k=-1, axes=(1, 2)))
+    assert read[0][1].shape == (8, 4, 3)
+    assert np.array_equal(np.stack([frame for _, frame in read]), np.rot90(frames[2:], k=-1, axes=(1, 2)))
 
 
 def test_the_reader_refuses_a_container_without_a_video_stream():
@@ -335,6 +369,55 @@ def test_an_abandoned_frame_pass_is_retired_before_the_soundtrack():
 
     with pytest.raises(StopIteration):
         next(stream)
+
+
+def test_a_declared_but_empty_audio_track_is_a_video_without_one():
+    """A truncated soundtrack must not become a 500 on a file that used to work.
+
+    The path this replaced decided a reference had sound from the container
+    *metadata* (``bool(meta["audio_codecs"])``) and shelled out to ffmpeg, which
+    hands back silence for an empty track. Raising here instead would reject a
+    real file that legacy accepted — and reject it as a server error, which no
+    caller can act on. For everything downstream, a track with no samples and no
+    track at all are the same video.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import ReferenceVideoReader
+
+    frames = _source_frames(4, height=4, width=8)
+    container, _ = _fake_container(frames, with_audio=True)
+    # A declared stream whose decode yields nothing: no packets, and the
+    # resampler flush produces nothing either.
+    empty = SimpleNamespace(resample=lambda frame: [])
+    av = SimpleNamespace(audio=SimpleNamespace(resampler=SimpleNamespace(AudioResampler=lambda **_: empty)))
+    container.streams.audio = [SimpleNamespace(codec_context=SimpleNamespace(sample_rate=44100), layout="stereo")]
+    container.decode = lambda stream: iter(())
+
+    assert ReferenceVideoReader(av, container).soundtrack() is None
+
+
+def test_an_empty_standalone_audio_reference_is_still_an_error(monkeypatch):
+    """The other half: a standalone reference with no samples is not a reference.
+
+    Same primitive, opposite answer, because the two callers ask different
+    questions — one about an optional part of a condition, one about the whole
+    condition. Leniency that reached here would turn an unusable request into a
+    silent one.
+    """
+    import contextlib
+
+    from vllm_omni.diffusion.models.minimax_h3 import reference_media_decode
+
+    empty = SimpleNamespace(resample=lambda frame: [])
+    stream = SimpleNamespace(codec_context=SimpleNamespace(sample_rate=44100), layout="stereo")
+    container = SimpleNamespace(decode=lambda stream: iter(()), streams=SimpleNamespace(audio=[stream]))
+    av = SimpleNamespace(
+        audio=SimpleNamespace(resampler=SimpleNamespace(AudioResampler=lambda **_: empty)),
+        open=lambda _path: contextlib.nullcontext(container),
+    )
+    monkeypatch.setattr(reference_media_decode, "_import_av", lambda: av)
+
+    with pytest.raises(ValueError, match="decoded to no samples"):
+        reference_media_decode.decode_reference_audio("/nowhere.wav")
 
 
 # --------------------------------------------------------------------------
@@ -390,7 +473,12 @@ def admissible_video(tmp_path_factory) -> Path:
 
 @pytest.mark.parametrize("skip", [0, 7])
 def test_the_reader_matches_the_buffered_decode_over_a_real_container(sample_video, skip):
-    """Same frames, same rate, same soundtrack — read a frame at a time."""
+    """Same frames, same rate, same soundtrack — read a frame at a time.
+
+    Parametrized by frame count rather than by seconds because that is the claim
+    worth pinning against a real codec: on a constant-rate container, asking for
+    ``skip / fps`` seconds hands over exactly the frames the old count did.
+    """
     from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import (
         decode_reference_video,
         open_reference_video,
@@ -400,10 +488,12 @@ def test_the_reader_matches_the_buffered_decode_over_a_real_container(sample_vid
 
     with open_reference_video(str(sample_video)) as reader:
         assert reader.fps == pytest.approx(buffered.fps)
-        streamed = np.stack(list(reader.iter_frames(skip=skip)))
+        read = list(reader.iter_frames(start_seconds=skip / buffered.fps))
+        streamed = np.stack([frame for _, frame in read])
         soundtrack = reader.soundtrack()
 
     assert np.array_equal(streamed, buffered.frames[skip:]), "streamed frames differ from the buffered decode"
+    assert read[0][0] == pytest.approx(skip / buffered.fps, abs=1e-6), "the first frame is not at the asked-for time"
     assert soundtrack is not None
     waveform, sample_rate = soundtrack
     assert sample_rate == buffered.sample_rate
@@ -485,39 +575,194 @@ def test_the_prepared_reference_is_unchanged_by_the_streaming_switch(admissible_
 
 
 # --------------------------------------------------------------------------
-# The gate in front of all of it
+# Variable frame rate: where a frame index stops being a timestamp
 # --------------------------------------------------------------------------
 
 
-def test_admission_bounds_the_decoded_pixels_not_just_the_file_size():
-    """The 50 MiB gate says nothing about what a file expands to.
+def test_a_variable_rate_source_resamples_like_its_constant_rate_expansion():
+    """The oracle is the same stream written out at a constant rate.
 
-    5760x2304 at 60 fps for 15 s is inside every other limit — dimensions,
-    ratio, rate, duration — and compresses well under 50 MiB, yet decodes to
-    ~36 GiB of RGB. Refused up front, with the two knobs that fix it named.
+    A container's ``average_rate`` is exactly that. This source runs 30 fps for
+    its first half second and 10 fps afterwards, averaging 20 — so an index-based
+    schedule believes every frame lasts 50 ms and puts the tail frames in slots
+    they are nowhere near.
+
+    Rather than restate the boundary arithmetic here (which would only record a
+    rounding convention twice), the expectation is produced by expanding the very
+    same content to a real 120 fps constant-rate stream — every VFR frame
+    repeated for as long as it is on screen — and resampling *that*. 120 is a
+    common multiple of 30, 10 and 24, so the expansion is exact rather than a
+    second approximation, and the constant-rate path it goes through is the one
+    already pinned byte-for-byte against the buffered decode above.
     """
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
-        MINIMAX_H3_MAX_DECODED_PIXELS,
-        _validate_reference_video_metadata,
+    from vllm_omni.diffusion.models.minimax_h3.reference_video_frames import normalize_reference_video_stream
+
+    frames = _source_frames(20, height=48, width=64)
+    times = [index / 30.0 for index in range(15)] + [0.5 + index / 10.0 for index in range(5)]
+    average = 20.0  # what the container reports, and what neither half runs at
+    kwargs = dict(
+        num_frames=None,
+        canvas_multiple=32,
+        canvas_short_edge=48,
+        canvas_max_pixels=768 * 1344,
+        resolve_canvas=_identity_canvas,
     )
+
+    streamed = normalize_reference_video_stream(zip(times, frames, strict=True), fps=average, **kwargs)
+
+    # The same content at 120 fps: source frame j held until frame j+1 appears,
+    # and the last one for the nominal interval the normalizer gives it.
+    ends = times[1:] + [times[-1] + 1.0 / average]
+    expanded = [
+        frames[index]
+        for index, (start, end) in enumerate(zip(times, ends, strict=True))
+        for _ in range(round(end * 120) - round(start * 120))
+    ]
+    expected = normalize_reference_video_stream(_timed(expanded, 120.0), fps=120.0, **kwargs)
+
+    assert np.array_equal(streamed, expected)
+    # And the test discriminates: reading the schedule off frame indices at the
+    # average rate is what used to happen, and it is not this answer.
+    by_index = normalize_reference_video_stream(_timed(frames, average), fps=average, **kwargs)
+    assert not np.array_equal(streamed, by_index), "the variable rate made no difference — check the fixture"
+
+
+def test_a_constant_rate_source_resamples_to_the_same_bytes_as_before():
+    """The index-based schedule, restated over timestamps, must not move a pixel.
+
+    ``t_i = i/fps`` turns ``floor(t_next * target + 0.5)`` into
+    ``floor((i+1) * target/fps + 0.5)`` — the old expression, character for
+    character — and that is the whole argument that the parity fixtures still
+    hold. Asserted against ``resample_frame_indices``, which is the contract's
+    own statement of the mapping rather than this module's.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_video_frames import (
+        normalize_reference_video_stream,
+        resample_frame_indices,
+    )
+
+    for fps in _SOURCE_RATES:
+        frames = _source_frames(120, height=48, width=64)
+        streamed = normalize_reference_video_stream(
+            _timed(frames, fps),
+            fps=fps,
+            num_frames=None,
+            canvas_multiple=32,
+            canvas_short_edge=48,
+            canvas_max_pixels=768 * 1344,
+            resolve_canvas=_identity_canvas,
+        )
+        assert [int(frame[-1, -1, 0]) for frame in streamed] == list(resample_frame_indices(120, fps)), f"{fps} fps"
+
+
+def test_the_reader_seeks_a_variable_rate_stream_by_timestamp():
+    """``start_seconds`` is a time, and on a VFR stream a count cannot express it."""
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import ReferenceVideoReader
+
+    frames = _source_frames(8, height=4, width=8)
+    # 6 frames in the first 0.2 s, then one every 0.4 s: average_rate ~ 8 fps.
+    times = [0.0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.6, 1.0]
+    container, _ = _fake_container(frames, rate=8.0, times=times)
+
+    read = list(ReferenceVideoReader(object(), container).iter_frames(start_seconds=0.7))
+
+    # At 0.7 s frame 6 (t=0.6) is on screen; an `int(0.7 * 8) = 5` frame count
+    # would have started at frame 5, which left the screen half a second before.
+    assert [stamp for stamp, _ in read] == pytest.approx([0.6, 1.0])
+    assert int(read[0][1][-1, -1, 0]) == 6
+
+
+def test_the_first_frame_carries_the_time_the_soundtrack_is_cut_at():
+    """Video and audio are cut at one instant, and it is the video's.
+
+    ``start_seconds`` lands inside a frame's display interval; the reader hands
+    over the frame covering it, whose own timestamp is at or before the request.
+    Slicing the soundtrack at the *requested* second instead would offset the two
+    conditions by that remainder — bounded by a frame on a constant-rate source,
+    unbounded on a variable-rate one. Exposing the timestamp on the first frame
+    is what lets the caller cut both at the same place.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import ReferenceVideoReader
+
+    frames = _source_frames(8, height=4, width=8)
+    times = [0.0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.6, 1.0]
+    container, _ = _fake_container(frames, rate=8.0, times=times)
+
+    first_at, _frame = next(ReferenceVideoReader(object(), container).iter_frames(start_seconds=0.85))
+
+    assert first_at == pytest.approx(0.6), "the caller cannot align the soundtrack without the real start"
+
+
+def test_a_stream_without_timestamps_still_behaves_as_a_counted_one():
+    """PTS-less frames fall back to the nominal rate rather than collapsing.
+
+    Nothing admitted should reach this, but a frame whose ``time`` is ``None``
+    must not be read as ``t = 0`` — that would give every frame the same instant
+    and hand the whole reference one output slot.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import ReferenceVideoReader
+
+    frames = _source_frames(6, height=4, width=8)
+    container, _ = _fake_container(frames, rate=25.0, times=[None] * 6)
+
+    read = list(ReferenceVideoReader(object(), container).iter_frames(start_seconds=2 / 25.0))
+
+    assert [stamp for stamp, _ in read] == pytest.approx([index / 25.0 for index in range(2, 6)])
+
+
+# --------------------------------------------------------------------------
+# The gates in front of all of it — and the one that must not come back
+# --------------------------------------------------------------------------
+
+
+def _admissible_meta(width, height, fps, duration):
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration": duration,
+        "frame_count": int(duration * fps),
+        "format_names": ("mov", "mp4", "m4a"),
+        "video_codec": "h264",
+        "audio_codecs": ("aac",),
+        "file_size": 40 * 1024 * 1024,
+    }
+
+
+@pytest.mark.parametrize(
+    "width,height,fps",
+    [
+        (3840, 2160, 60.0),  # ordinary 4K/60
+        (3840, 2160, 50.0),
+        (5760, 2304, 60.0),  # every ceiling in this validator, taken at once
+    ],
+)
+def test_a_reference_at_the_advertised_ceilings_is_admitted(width, height, fps):
+    """No gate on *decoded* pixels: a validator must not refuse what it advertises.
+
+    Dimensions up to 5760, rate up to 60 and duration up to 15 s are each stated
+    as admissible a few lines above, and 5760 x 60 fps x 15 s is 6.7G pixels. A
+    decoded-pixel budget was briefly added here and refused exactly these; it was
+    removed because it narrowed *both* contracts — including legacy, which never
+    buffered anything, it shells out to ffmpeg — against a buffering failure mode
+    that `normalize_reference_video_stream` had already made impossible.
+
+    Parametrized on the three shapes that budget rejected, so restoring it in any
+    form turns this red rather than passing quietly on the 1080p case.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import _validate_reference_video_metadata
+
+    _validate_reference_video_metadata(_admissible_meta(width, height, fps, 15.0), index=0, source="big.mp4")
+
+
+def test_the_compressed_size_gate_is_the_one_that_stayed():
+    """Removing the decoded budget must not have taken the 50 MiB gate with it."""
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import _validate_reference_video_metadata
     from vllm_omni.errors import OmniClientError
 
-    def meta(width, height, fps, duration):
-        return {
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "duration": duration,
-            "frame_count": int(duration * fps),
-            "format_names": ("mov", "mp4", "m4a"),
-            "video_codec": "h264",
-            "audio_codecs": ("aac",),
-            "file_size": 40 * 1024 * 1024,
-        }
+    meta = _admissible_meta(1920, 1080, 30.0, 15.0)
+    _validate_reference_video_metadata(meta, index=0, source="ordinary.mp4")
 
-    with pytest.raises(OmniClientError, match="lower resolution or frame rate"):
-        _validate_reference_video_metadata(meta(5760, 2304, 60.0, 15.0), index=0, source="huge.mp4")
-
-    # The ordinary 1080p reference the limit must not touch.
-    _validate_reference_video_metadata(meta(1920, 1080, 30.0, 15.0), index=0, source="ordinary.mp4")
-    assert 1920 * 1080 * 30 * 15 < MINIMAX_H3_MAX_DECODED_PIXELS
+    meta["file_size"] = 60 * 1024 * 1024
+    with pytest.raises(OmniClientError, match="50 MiB"):
+        _validate_reference_video_metadata(meta, index=0, source="fat.mp4")
