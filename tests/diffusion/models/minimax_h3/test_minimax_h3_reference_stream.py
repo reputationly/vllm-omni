@@ -395,6 +395,50 @@ def test_a_declared_but_empty_audio_track_is_a_video_without_one():
     assert ReferenceVideoReader(av, container).soundtrack() is None
 
 
+def test_the_soundtrack_reports_where_on_the_clock_it_starts():
+    """Because the waveform itself cannot: index 0 is "first sample", not "0 s".
+
+    A container whose streams begin at 5 s hands back samples starting at that
+    instant, with the 5 s nowhere in the array. A caller aligning them against
+    video timestamps — which *are* absolute — that assumes otherwise subtracts
+    the stream offset a second time, and on this file a request starting at zero
+    loses five seconds of sound, or all of it.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import _decode_soundtrack
+
+    class _AudioFrame:
+        def __init__(self, time):
+            self.time = time
+
+        def to_ndarray(self):
+            return np.zeros((1, 4), dtype=np.float32)
+
+    frames = [_AudioFrame(5.0), _AudioFrame(5.1)]
+    resampler = SimpleNamespace(resample=lambda frame: [] if frame is None else [frame])
+    av = SimpleNamespace(audio=SimpleNamespace(resampler=SimpleNamespace(AudioResampler=lambda **_: resampler)))
+    container = SimpleNamespace(decode=lambda stream: iter(frames))
+    stream = SimpleNamespace(codec_context=SimpleNamespace(sample_rate=8000), layout="mono")
+
+    decoded = _decode_soundtrack(av, container, stream)
+
+    assert decoded.sample_rate == 8000
+    assert decoded.waveform.shape == (1, 8)
+    assert decoded.start_seconds == pytest.approx(5.0)
+
+
+def test_a_stream_without_audio_timestamps_starts_at_zero():
+    """The fallback has to be the ordinary answer, not None: it is subtracted."""
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import _decode_soundtrack
+
+    frame = SimpleNamespace(time=None, to_ndarray=lambda: np.zeros((2, 3), dtype=np.float32))
+    resampler = SimpleNamespace(resample=lambda f: [] if f is None else [f])
+    av = SimpleNamespace(audio=SimpleNamespace(resampler=SimpleNamespace(AudioResampler=lambda **_: resampler)))
+    container = SimpleNamespace(decode=lambda stream: iter([frame]))
+    stream = SimpleNamespace(codec_context=SimpleNamespace(sample_rate=16000), layout="stereo")
+
+    assert _decode_soundtrack(av, container, stream).start_seconds == 0.0
+
+
 def test_an_empty_standalone_audio_reference_is_still_an_error(monkeypatch):
     """The other half: a standalone reference with no samples is not a reference.
 
@@ -495,8 +539,10 @@ def test_the_reader_matches_the_buffered_decode_over_a_real_container(sample_vid
     assert np.array_equal(streamed, buffered.frames[skip:]), "streamed frames differ from the buffered decode"
     assert read[0][0] == pytest.approx(skip / buffered.fps, abs=1e-6), "the first frame is not at the asked-for time"
     assert soundtrack is not None
-    waveform, sample_rate = soundtrack
+    waveform, sample_rate, audio_start = soundtrack
     assert sample_rate == buffered.sample_rate
+    assert audio_start == pytest.approx(0.0, abs=1e-6), "an ordinary file starts at zero"
+
     assert np.array_equal(waveform.numpy(), buffered.audio.numpy()), "streamed soundtrack differs"
 
 
@@ -517,7 +563,7 @@ def test_the_soundtrack_survives_an_early_stop(sample_video):
         frames = reader.iter_frames()
         for _ in range(3):
             next(frames)
-        waveform, sample_rate = reader.soundtrack()
+        waveform, sample_rate, _ = reader.soundtrack()
 
     assert sample_rate == buffered.sample_rate
     assert np.array_equal(waveform.numpy(), buffered.audio.numpy())
@@ -572,6 +618,63 @@ def test_the_prepared_reference_is_unchanged_by_the_streaming_switch(admissible_
     assert (prepared["height"], prepared["width"]) == expected_frames.shape[1:3]
     assert prepared["duration_seconds"] == pytest.approx(expected_frames.shape[0] / 24.0)
     assert torch.equal(prepared["audio"], expected_audio)
+
+
+@pytest.fixture(scope="module")
+def offset_video(tmp_path_factory) -> Path:
+    """The same reference, with both streams placed five seconds up the clock.
+
+    ``-output_ts_offset`` is what a container recorded mid-session looks like,
+    and it is the one shape where "the timestamp of the first frame" and "how
+    far into the file that is" stop being the same number.
+    """
+    if not _HAS_FFMPEG:
+        pytest.skip("ffmpeg is not available")
+    pytest.importorskip("av")
+    path = tmp_path_factory.mktemp("h3_stream_offset") / "reference.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=512x288:rate=30:duration=3.0",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3.0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-output_ts_offset", "5.0", "-muxdelay", "0", "-muxpreload", "0",
+            str(path),
+        ],
+        check=True,
+    )  # fmt: skip
+    return path
+
+
+def test_a_container_that_does_not_start_at_zero_keeps_its_whole_soundtrack(offset_video):
+    """The cut is the difference of two clocks, not one of them.
+
+    The video's timestamps are absolute, so the first frame of a file recorded
+    five seconds into a session reads 5.0 — while the decoded waveform starts at
+    its own first sample, with that 5.0 nowhere in the array. Trimming it by the
+    video timestamp alone takes the offset off twice and throws away five
+    seconds of sound, which on this three-second file is all of it.
+    """
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
+
+    with open_reference_video(str(offset_video)) as reader:
+        first_at, _ = next(reader.iter_frames())
+        soundtrack = reader.soundtrack()
+    assert first_at > 4.0, "the fixture was expected to start well past zero"
+    assert soundtrack.start_seconds > 4.0, "and its soundtrack with it"
+
+    prepared = prepare_reference_videos_official([str(offset_video)], target_frame_count=25, audio_sample_rate=16000)[0]
+
+    assert prepared["input_has_audio"] is True
+    audio = prepared["audio"]
+    assert audio is not None and audio.shape[-1] > 0, "the soundtrack was cut away entirely"
+    # A full second of the requested window, not a remnant: the request asked
+    # from the start, so essentially nothing should have been trimmed.
+    assert audio.shape[-1] >= 16000, f"only {audio.shape[-1]} samples survived"
+    assert torch.count_nonzero(audio) > 0, "the surviving samples are silence"
 
 
 # --------------------------------------------------------------------------
