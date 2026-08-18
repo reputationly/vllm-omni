@@ -31,6 +31,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 _READ_VIA_ACCESSOR = {
     "default_num_frames_by_task": "MiniMaxH3InferenceStrategy.default_num_frames",
     "name": "MiniMaxH3InferenceStrategy.is_official",
+    # These two decide ONE thing together — which `num_frames` are admissible —
+    # and they are read through the accessor precisely so they cannot be read
+    # apart. The bug that made the accessor necessary was the duration bound
+    # being applied to the requested frame count and the alignment being applied
+    # after it, i.e. two readers of one rule disagreeing about ordering.
+    "output_duration_seconds": "MiniMaxH3InferenceStrategy.requested_frame_window",
+    "duration_validation_mode": "MiniMaxH3InferenceStrategy.requested_frame_window",
 }
 
 
