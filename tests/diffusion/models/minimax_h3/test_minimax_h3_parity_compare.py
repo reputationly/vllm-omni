@@ -127,3 +127,70 @@ def test_candidate_only_pad_accounting_is_information_not_divergence():
     # The exemption is prefix-scoped: anything else one-sided is still a finding.
     strict = compare_stage("packing", {"sequence_length": 100}, {"sequence_length": 100, "token_tags": [1]})
     assert strict["mismatched"] == ["token_tags"]
+
+
+# --------------------------------------------------------------------------
+# Who is allowed to write the artifacts the comparator reads
+# --------------------------------------------------------------------------
+
+
+def test_only_encoder_rank_zero_writes_the_vision_output_dump(tmp_path, monkeypatch):
+    """The vision tower is replicated, so every encoder rank reaches this dump.
+
+    With ``text_encoder_tp_size > 1`` that is four processes writing the same
+    two paths at once, and both ``np.save`` and ``write_text`` truncate before
+    they write — so the file a parity run reads back can be a torn interleaving
+    of four identical writes. Identical data does not make concurrent
+    truncation safe, and a corrupt artifact is worse than a missing one: the
+    comparator will happily report a difference that is really a half-written
+    file.
+
+    The two neighbouring dumps in the pipeline already gate on rank 0; this one
+    did not.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MINIMAX_H3_PARITY_DUMP_ENV,
+        _parity_dump_vision_output,
+    )
+
+    monkeypatch.setenv(MINIMAX_H3_PARITY_DUMP_ENV, str(tmp_path))
+    embeds = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    for rank in (1, 2, 3):
+        _parity_dump_vision_output(embeds, None, encoder_group=SimpleNamespace(rank_in_group=rank))
+    assert list(tmp_path.iterdir()) == [], "a non-zero encoder rank wrote a parity artifact"
+
+    _parity_dump_vision_output(embeds, None, encoder_group=SimpleNamespace(rank_in_group=0))
+    assert (tmp_path / "image_embeds.npy").exists()
+    assert (tmp_path / "vision_output.json").exists()
+
+
+def test_a_single_rank_run_still_writes_it():
+    """No group at all is the ordinary case, and it must not be silenced."""
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MINIMAX_H3_PARITY_DUMP_ENV,
+        _parity_dump_vision_output,
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        import os
+
+        previous = os.environ.get(MINIMAX_H3_PARITY_DUMP_ENV)
+        os.environ[MINIMAX_H3_PARITY_DUMP_ENV] = directory
+        try:
+            _parity_dump_vision_output(torch.zeros(2, 3), None)
+        finally:
+            if previous is None:
+                os.environ.pop(MINIMAX_H3_PARITY_DUMP_ENV, None)
+            else:
+                os.environ[MINIMAX_H3_PARITY_DUMP_ENV] = previous
+        assert (Path(directory) / "vision_output.json").exists()

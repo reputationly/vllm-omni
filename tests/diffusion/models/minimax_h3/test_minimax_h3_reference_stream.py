@@ -677,6 +677,59 @@ def test_a_container_that_does_not_start_at_zero_keeps_its_whole_soundtrack(offs
     assert torch.count_nonzero(audio) > 0, "the surviving samples are silence"
 
 
+@pytest.fixture(scope="module")
+def delayed_audio_video(tmp_path_factory) -> Path:
+    """A container whose soundtrack starts a second after its picture."""
+    if not _HAS_FFMPEG:
+        pytest.skip("ffmpeg is not available")
+    pytest.importorskip("av")
+    path = tmp_path_factory.mktemp("h3_stream_delayed") / "reference.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=512x288:rate=30:duration=3.0",
+            "-itsoffset", "1.0", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=2.0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-muxdelay", "0", "-muxpreload", "0",
+            str(path),
+        ],
+        check=True,
+    )  # fmt: skip
+    return path
+
+
+def test_a_soundtrack_that_starts_late_stays_late(delayed_audio_video):
+    """Leaving a delayed soundtrack alone does not preserve the delay — it deletes it.
+
+    Nothing downstream carries an offset: the waveform goes straight into
+    ``encode_waveform``, where sample 0 *is* time 0 of the reference. So a
+    soundtrack that begins a second after the picture, handed over unpadded,
+    is conditioned on a second early. The leading silence is not invented — it
+    is what the container has in that second.
+    """
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
+
+    with open_reference_video(str(delayed_audio_video)) as reader:
+        video_at, _ = next(reader.iter_frames())
+        soundtrack = reader.soundtrack()
+    delay = soundtrack.start_seconds - video_at
+    assert delay > 0.5, f"the fixture was expected to delay its audio, got {delay:.3f}s"
+
+    prepared = prepare_reference_videos_official(
+        [str(delayed_audio_video)], target_frame_count=49, audio_sample_rate=16000
+    )[0]
+    audio = prepared["audio"]
+
+    # The first `delay` seconds are silent, and the tone has not been pulled
+    # forward into them.
+    silent = int(delay * 16000 * 0.9)
+    assert torch.count_nonzero(audio[:, :silent]) == 0, "the delayed tone was pulled forward"
+    assert torch.count_nonzero(audio) > 0, "the tone is missing entirely"
+
+
 # --------------------------------------------------------------------------
 # Variable frame rate: where a frame index stops being a timestamp
 # --------------------------------------------------------------------------
