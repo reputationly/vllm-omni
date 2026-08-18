@@ -25,10 +25,16 @@ a habit:
 Parsed rather than imported: this must run on a machine with no torch, and a
 declaration is a syntactic fact.
 
-The environment-variable path is deliberately not in this list.
-``strategy.resolve_strategy`` reads ``os.environ`` directly, so it reaches every
-process without a hop — which is exactly why the env path never broke while the
-deploy-YAML path broke twice.
+The environment-variable path is not in this list, but only because it is
+checked elsewhere and by a different means — an earlier version of this docstring
+claimed it needed no hop at all, and that was wrong. A *process-scoped* variable
+does reach every process without one. A *stage-scoped* one
+(``stages[].runtime.env``) does not: it is applied while the stage starts and
+restored immediately after, so it is a hop like any other, and the serving layer
+never had it. That is carried as ``diffusion_runtime_environ`` and pinned by
+``test_minimax_h3_stage_environment.py``; it is deliberately not
+``minimax_h3_``-prefixed, because it is the transport for the contract rather
+than a field of it.
 """
 
 from __future__ import annotations
