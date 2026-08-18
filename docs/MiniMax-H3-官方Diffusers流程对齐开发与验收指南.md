@@ -458,9 +458,17 @@ oracle 已经近乎逐行一致，应优先通过 direct oracle 测试保护，�
 舍入差异，但必须先证明 token 与 vision 输入完全一致，再比较 embedding；不要把预处理错误归因
 于 TP rounding。
 
-参考视频进入 VAE 前的帧数也要做 pure-function 对拍。官方向下截到 `17n+5`；当前 vLLM 的远端
-VAE processor 看起来会通过 chunk trim 做同类对齐，但尚未形成直接证据。覆盖临界帧数后再
-判断是否存在缺口，当前不要把它列成已确认 P0。
+参考视频进入 VAE 前的帧数也要做 pure-function 对拍。官方在 `modular_pipelines/minimax_h3/
+encoders.py` 的 reference encode 里显式向下截到 `17n+5`（`max(1, (F - 5) // 17) * 17 + 5`），
+证据确凿；且截断只作用于 encode 本地，`_sample_video_condition_frames` 仍读未截断的
+`reference.frames`，所以不能把它上提成一次全局裁剪。
+
+vLLM 侧原先把解码出的全部帧直接交给 VAE：生成片长本身就是 `17n+5`，比生成片长更长的参考会被
+truncation 对齐，因此只有**比生成片长短**的参考会带着别的帧数进 VAE——admission 下限 2s@24fps
+= 48 帧，官方截到 39（latent T=12），vLLM 给 48，latent 时序长度不同，packed 行数随之不同。
+
+该差异现已作为 strategy 轴 `reference_video_vae_frame_snap_mode` 落地
+（official=`official_vae_chunk`，legacy=`legacy_no_snap`），legacy 生产输出逐字节不变。
 
 ### 5.8 P1：scheduler 和 denoise recurrence
 
