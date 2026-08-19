@@ -82,6 +82,30 @@ if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
+
+def _plain_config_value(value: Any) -> Any:
+    """A config value with its OmegaConf wrapper taken off, recursively.
+
+    Values lifted off a stage config are whatever the config representation
+    holds: off YAML that is an OmegaConf node, and a ``DictConfig`` is a
+    ``MutableMapping`` but *not* a ``dict``. Handing one out unwrapped works
+    right up until a reader asks ``isinstance(value, dict)`` — which is an
+    ordinary thing to write, was written, and silently discarded a transported
+    stage environment on every YAML deployment while every hand-built-dict test
+    passed.
+
+    So the view is plain Python by construction rather than by each reader
+    remembering. Scalars — which is what most of these fields are — come off
+    OmegaConf as plain ``str``/``int``/``bool`` already and pass through
+    untouched.
+    """
+    if isinstance(value, Mapping):
+        return {str(key): _plain_config_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_plain_config_value(item) for item in value]
+    return value
+
+
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
 # ============================================================================
@@ -305,11 +329,51 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
+    # Diffusion-stage engine_args a client-side capability probe needs. They are
+    # *contract* selections, not capabilities: a probe that cannot see them
+    # answers for a contract the worker is not running. Kept as a list because
+    # the view is built once and every entry is a plain passthrough.
+    _DIFFUSION_CONTRACT_VIEW_FIELDS = (
+        "minimax_h3_inference_contract",
+        "minimax_h3_admission_policy",
+        # Not a contract field but the transport for the ones that have no
+        # config field at all: a stage's `runtime.env` is applied to the stage
+        # and restored, so this process never has those variables in its own
+        # environment. See `_minimax_h3_strategy`, which overlays the mapping.
+        "diffusion_runtime_environ",
+    )
+
+    def _diffusion_stage_engine_args(self) -> Any:
+        """The first diffusion stage's ``engine_args``, or ``None``.
+
+        ``stage_type`` is the same discriminator ``_resolve_stage_configs`` uses
+        to inject diffusion-only knobs.
+        """
+        for cfg in self.stage_configs or ():
+            if getattr(cfg, "stage_type", None) != "diffusion":
+                continue
+            engine_args = getattr(cfg, "engine_args", None)
+            if engine_args is not None:
+                return engine_args
+        return None
+
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
 
         The worker holds the full config; here we just resolve the pipeline class
         name from the model config (cached). ``model_class_name`` may be ``None``.
+
+        The contract fields ride along because some capability answers *depend*
+        on the contract rather than on the model class. MiniMax-H3 is the first:
+        under ``official_diffusers_v1`` a reference image keeps its own geometry,
+        and the serving layer must not pre-stretch it onto the output canvas. Out
+        of process this view is the only thing the serving layer sees, so a view
+        that omits them makes the front end answer *legacy* for a worker running
+        *official* — silently, on every image-conditioned request. Deploy YAML
+        lands them on the diffusion stage's ``engine_args``
+        (``_build_engine_args`` passes ``StageDeployConfig`` through verbatim);
+        the environment fallbacks in ``strategy.resolve_strategy`` already reach
+        this process on their own.
         """
         if self._diffusion_od_config_view is None:
             from types import SimpleNamespace
@@ -319,11 +383,24 @@ class AsyncOmniEngine:
 
             model_class_name = resolve_model_class_name(self.model)
             metadata = get_diffusion_model_metadata(model_class_name)
+            # OmegaConf DictConfig off YAML, a plain dict from a hand-built
+            # stage config, or absent entirely on a non-diffusion deployment.
+            engine_args = self._diffusion_stage_engine_args()
+            if isinstance(engine_args, dict):
+
+                def read(key: str) -> Any:
+                    return engine_args.get(key)
+            else:
+
+                def read(key: str) -> Any:
+                    return getattr(engine_args, key, None)
+
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
                 supports_multimodal_inputs=metadata.supports_multimodal_inputs,
                 max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+                **{name: _plain_config_value(read(name)) for name in self._DIFFUSION_CONTRACT_VIEW_FIELDS},
             )
         return self._diffusion_od_config_view
 

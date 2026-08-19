@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 
 def _align_frame_count(frame_count: int) -> int:
     """Snap ``frame_count`` up to the MiniMax H3 17n+5 frame boundary."""
@@ -35,29 +37,39 @@ def _time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
+
+    if base_schedule is not None:
+        # Importing a submodule executes ``diffusion.sched.__init__`` first,
+        # which initializes the full request/step scheduler package. Keep that
+        # cost on the denoising path: the HTTP capability probe imports this
+        # module only for frame-count alignment and must remain lightweight.
+        from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+
+        return DMD2SigmaSchedule.from_positions(base_schedule).shifted_sigmas(shift_scale)
+
     if num_steps <= 0:
         raise ValueError("MiniMax H3 num_steps must be > 0")
 
     import torch
 
     # The rectified-flow sigma range is fixed at [1.0, 0.0].
+    # Diffusers counts denoising intervals (transformer evaluations), while a
+    # sigma trajectory contains both ends of every interval.  N requested
+    # steps therefore need N+1 boundaries.  The old N-point grid silently ran
+    # 3/7/19 evaluations for requests labelled 4/8/20.
     base = torch.linspace(
         1.0,
         0.0,
-        int(num_steps),
+        int(num_steps) + 1,
         device="cpu",
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
     shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
-    # A one-point request is still exactly one point.  Normal serving uses
-    # multiple points, but preserving the requested cardinality keeps
-    # ``num_inference_steps`` the sole schedule-size control.
-    if num_steps > 1 and shifted[-1].item() > 0.0:
-        shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
     return [float(value) for value in shifted.tolist()]
 
 
@@ -81,10 +93,12 @@ class MiniMaxH3ShapePlanner:
         *,
         num_steps: int = 50,
         shift_scale: float = 6.0,
+        base_schedule: Sequence[float] | None = None,
     ) -> list[float]:
         return _time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=shift_scale,
+            base_schedule=base_schedule,
         )
 
 
@@ -103,8 +117,10 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
     return MINIMAX_H3_SHAPE_PLANNER.time_shift_sigmas(
         num_steps=num_steps,
         shift_scale=shift_scale,
+        base_schedule=base_schedule,
     )

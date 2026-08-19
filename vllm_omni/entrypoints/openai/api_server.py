@@ -133,6 +133,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.protocol.video_tasks import VideoTaskRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    ReferenceOrderEntry,
     SecondStr,
     SizeStr,
     VideoDeleteResponse,
@@ -3013,7 +3014,22 @@ def _normalize_reference_video_decode_spec(spec: ReferenceVideoDecodeSpec) -> Re
 def _reference_video_decode_spec(
     req: VideoGenerationRequest,
     stage_configs: list[Any] | None,
+    handler: Any = None,
 ) -> ReferenceVideoDecodeSpec:
+    """How much of a reference video to keep while decoding it here.
+
+    Two sources, in order. A model class may answer from the request alone
+    (``reference_video_decode_spec``); Cosmos-3 does, and its answer wins
+    because it encodes a rule about the model rather than about the instance.
+    Otherwise the *handler* answers, because the remaining question — how many
+    frames the pipeline will actually target — depends on the contract the
+    instance was configured with, which a classmethod handed only a request can
+    never see.
+
+    The fallback stays the requested count, so a deployment whose engine is
+    unreachable from here behaves exactly as it did before either source
+    existed.
+    """
     video_params = req.resolve_video_params()
     extra_params = req.extra_params if isinstance(req.extra_params, dict) else {}
     for model_cls in _diffusion_model_classes(stage_configs):
@@ -3026,7 +3042,12 @@ def _reference_video_decode_spec(
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         if spec is not None:
             return _normalize_reference_video_decode_spec(spec)
-    return ReferenceVideoDecodeSpec(max_frames=video_params.num_frames, keep="first")
+
+    max_frames = video_params.num_frames
+    frame_cap = getattr(handler, "reference_video_decode_frame_cap", None)
+    if callable(frame_cap):
+        max_frames = frame_cap(max_frames)
+    return ReferenceVideoDecodeSpec(max_frames=max_frames, keep="first")
 
 
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
@@ -3311,16 +3332,27 @@ def _validate_minimax_h3_image_payload(
 
 async def _persist_uploaded_media_references(
     uploads: list[UploadFile],
-) -> tuple[list[Image.Image], list[str], list[str]]:
+) -> tuple[list[Image.Image], list[str], list[str], list[tuple[str, int]]]:
     """Persist a mixed MiniMax H3 multipart reference list.
 
     Images are decoded in memory; videos and audio remain files because H3's
     reference encoders need the original container streams (including video
     soundtracks).
+
+    Also returns the *upload* order as ``(kind, index-within-its-bucket)``,
+    because splitting a list into three buckets is exactly where an order stops
+    existing. The caller sent an ordered list and H3 reads the order as
+    semantic — it numbers the ``"<Picture i>"`` / ``"<Video k>"`` labels and
+    advances the shared audio/video rotary clock — so *video, image* rebuilt as
+    *image, video* is a different request, not a different spelling of one.
+    Deriving it here rather than in the caller keeps it beside the loop that
+    assigns the bucket indices; two places computing the same indices is how
+    they come to disagree.
     """
     images: list[Image.Image] = []
     videos: list[str] = []
     audios: list[str] = []
+    order: list[tuple[str, int]] = []
     paths: list[str] = []
     if len(uploads) > MINIMAX_H3_MAX_REFERENCE_COUNT:
         raise HTTPException(
@@ -3335,6 +3367,7 @@ async def _persist_uploaded_media_references(
                 try:
                     _validate_minimax_h3_image_payload(payload, filename=upload.filename)
                     with Image.open(io.BytesIO(payload)) as image:
+                        order.append(("image", len(images)))
                         images.append(image.convert("RGB"))
                 except (OSError, ValueError) as exc:
                     raise HTTPException(400, detail=f"Invalid uploaded image reference: {upload.filename}") from exc
@@ -3357,15 +3390,74 @@ async def _persist_uploaded_media_references(
             with os.fdopen(fd, "wb") as output:
                 output.write(payload)
             if kind == "audio":
+                order.append(("audio", len(audios)))
                 audios.append(path)
             else:
+                order.append(("video", len(videos)))
                 videos.append(path)
     except Exception:
         for path in paths:
             if os.path.exists(path):
                 os.unlink(path)
         raise
-    return images, videos, audios
+    return images, videos, audios, order
+
+
+def _multipart_reference_order(
+    handler: Any,
+    upload_order: list[tuple[str, int]],
+) -> list[ReferenceOrderEntry] | None:
+    """Turn a multipart upload order into a `reference_order`, where it is honoured.
+
+    The upload list is ordered and H3 reads that order as semantic — it numbers
+    the ``"<Picture i>"`` / ``"<Video k>"`` labels, fixes the generator's
+    consumption order and advances the shared audio/video rotary clock — but the
+    media travels on in three modality buckets. So the order has to ride beside
+    them or it is simply gone, and the pipeline rebuilds a canonical
+    images-then-videos-then-audios one that is a different request.
+
+    Gated, because a legacy pipeline *refuses* an explicit order outright rather
+    than ignoring it: attaching one unconditionally would turn every mixed
+    multipart request on the default deployment into a 400. This is the same
+    capability probe the ordered-``references`` task route asks, for the same
+    reason. Where it is honoured, a canonical upload order resolves to exactly
+    what the bucket rebuild produces, so attaching it costs nothing and only
+    makes the pipeline's order log say where the order came from.
+    """
+    if not upload_order or not bool(getattr(handler, "honours_explicit_reference_order", True)):
+        return None
+    return [ReferenceOrderEntry(type=kind, index=index) for kind, index in upload_order]
+
+
+def _order_with_separate_audio(
+    order: list[ReferenceOrderEntry] | None,
+    *,
+    num_audios: int,
+) -> list[ReferenceOrderEntry] | None:
+    """Give the separately supplied audio references their position in the order.
+
+    ``audio_reference`` is the one media field ``input_references`` may still be
+    combined with, and its URLs are decoded into the audio bucket *after* the
+    uploads. An order naming only the uploads is not a partial order the
+    pipeline can complete — ``ordered_references_from_request`` requires the
+    order to name every reference that arrived, so leaving it short turns a
+    legal combination into a hard failure deep in the worker.
+
+    Appending is the only placement the request actually states. The uploads
+    carry their own relative order and keep it; the URLs arrived through a
+    different field with no stated position against them, and last is both where
+    the route decodes them and where they land in the bucket, so the indices
+    line up by construction.
+
+    ``None`` in, ``None`` out: a deployment that does not honour an explicit
+    order must not be handed one, and there is nothing to complete.
+    """
+    if order is None:
+        return None
+    named = sum(1 for entry in order if entry.type == "audio")
+    if num_audios <= named:
+        return order
+    return order + [ReferenceOrderEntry(type="audio", index=index) for index in range(named, num_audios)]
 
 
 async def _parse_video_form(
@@ -3527,7 +3619,7 @@ async def _parse_video_form(
             or app_stage_configs
             or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
         )
-        decode_spec = _reference_video_decode_spec(request, stage_configs)
+        decode_spec = _reference_video_decode_spec(request, stage_configs, handler)
     reference_image = None
     reference_video = None
     reference_audio: ReferenceAudio | None = None
@@ -3537,7 +3629,8 @@ async def _parse_video_form(
             reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
             images, audio_paths = [], []
         else:
-            images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
+            images, video_paths, audio_paths, upload_order = await _persist_uploaded_media_references(input_references)
+            request.reference_order = _multipart_reference_order(handler, upload_order)
         if images:
             reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
         if video_paths:
@@ -3627,6 +3720,10 @@ async def _parse_video_form(
             path=audio_paths if len(audio_paths) > 1 else audio_paths[0],
             cleanup_paths=cleanup_paths,
         )
+    # After the audio bucket is final, not before: `audio_reference` is decoded
+    # past the point where the upload order was derived, so an order fixed then
+    # names fewer audio references than actually arrived.
+    request.reference_order = _order_with_separate_audio(request.reference_order, num_audios=len(audio_paths))
 
     return request, handler, effective_model_name, reference_image, reference_video, reference_audio
 
@@ -5101,6 +5198,20 @@ async def create_video_task(request: VideoTaskRequest, raw_request: Request) -> 
             ),
         )
 
+    # `reference_order` is derived from `references` by this route, so a
+    # hand-written one has nothing keeping it consistent with the media that
+    # arrived. Left to ride through it would first be read inside the job, after
+    # reserve(), which is the late failure this route exists to prevent.
+    if request.supplies_route_derived_order():
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                "reference_order is derived from `references` and cannot be supplied directly by "
+                "/v1/tasks/video/. Send `references` as an ordered list of {type, path} entries; the "
+                "order of that list IS the reference order."
+            ),
+        )
+
     # Resolve the handler HERE, while the request is still alive: a misrouted
     # model then fails at submit with a proper status instead of minutes later
     # inside the job, and the job never needs the Request itself.
@@ -5149,10 +5260,37 @@ async def create_video_task(request: VideoTaskRequest, raw_request: Request) -> 
     # queue slot and the facade only sees error_type="HTTPException" instead of
     # the BadRequestError that tells it the CALLER was wrong. The check there
     # stays: it also guards the multipart /v1/videos surface.
+    conflicting = request.conflicting_reference_inputs()
+    if conflicting:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                "`references` carries its own order and cannot be combined with "
+                f"{', '.join(conflicting)}. Send one or the other: resolving a precedence rule "
+                "silently produces a different video than the caller asked for."
+            ),
+        )
+
     if image_paths and video_paths and not bool(getattr(handler, "supports_mixed_reference_inputs", False)):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="This diffusion model does not support mixed image and video references.",
+        )
+
+    # This route MANUFACTURES `reference_order` from `references`, and an
+    # instance whose contract cannot honour one rejects it in the pipeline —
+    # i.e. after reserve(), on the task record, for the most ordinary request
+    # there is. Note what the check above it guards: a *caller-written* order is
+    # already a 400 here, so the route knew this field was dangerous on this
+    # surface and validated only the half it did not create itself.
+    if request.reference_order() and not bool(getattr(handler, "honours_explicit_reference_order", True)):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                "This instance canonicalizes references by modality and cannot honour the order of a "
+                "`references` list. Send the bucketed fields (image_path / last_frame_path / video_path / "
+                "audio_path), or deploy the instance with an inference contract that carries reference order."
+            ),
         )
 
     task_id = request.task_id or f"video_task_{random_uuid()}"

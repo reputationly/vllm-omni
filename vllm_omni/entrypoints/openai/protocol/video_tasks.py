@@ -50,7 +50,7 @@ The status / result / cancel endpoints are shared and task-id keyed, so
 duplicated — only the submit endpoint is new.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -74,6 +74,26 @@ def _split_paths(raw: str | None) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+class OrderedReference(BaseModel):
+    """One entry of an ordered heterogeneous reference list.
+
+    MiniMax-H3 reads its references in order, and the order is semantic three
+    times over: it numbers the ``<Picture i>`` / ``<Audio j>`` / ``<Video k>``
+    labels of the prompt, it fixes the order the request generator is consumed
+    in, and it places each reference block on the shared audio/video rotary
+    clock. The same files in another order are a different request.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["image", "video", "audio"] = Field(
+        description="Reference modality.",
+    )
+    path: str = Field(
+        description="Facade-materialized ABSOLUTE server path, read under --allowed-local-media-path.",
+    )
 
 
 class VideoTaskRequest(BaseModel):
@@ -110,6 +130,18 @@ class VideoTaskRequest(BaseModel):
         ),
     )
 
+    references: list[OrderedReference] | None = Field(
+        default=None,
+        description=(
+            "References in the order the model should read them, for models where that order is "
+            "semantic (MiniMax-H3). Mutually exclusive with image_path / last_frame_path / "
+            "video_path / audio_path: supplying both is rejected rather than resolved, because a "
+            "precedence rule is exactly the kind of convention a caller misremembers, and the cost "
+            "of misremembering it is a silently different video. Absent, the bucketed fields are "
+            "used and their documented canonicalization applies."
+        ),
+    )
+
     # ------------------------------------------------------------ media inputs
     # Facade-materialized server paths, never bytes or URLs. Read under
     # --allowed-local-media-path; see _resolve_task_image_path in api_server.
@@ -141,6 +173,8 @@ class VideoTaskRequest(BaseModel):
     # sends BOTH "prompt" and "input" leaves the unmatched spelling in
     # model_extra.
     _ROUTE_OWNED_KEYS = (
+        "references",
+        "reference_order",
         "model",
         "prompt",
         "input",
@@ -183,13 +217,62 @@ class VideoTaskRequest(BaseModel):
         facade's ``[0, -1]`` for first+last only lines up if the first-frame image
         comes first.
         """
+        if self.references is not None:
+            return [entry.path for entry in self.references if entry.type == "image"]
         return _split_paths(self.image_path) + _split_paths(self.last_frame_path)
 
     def reference_video_paths(self) -> list[str]:
+        if self.references is not None:
+            return [entry.path for entry in self.references if entry.type == "video"]
         return _split_paths(self.video_path)
 
     def reference_audio_paths(self) -> list[str]:
+        if self.references is not None:
+            return [entry.path for entry in self.references if entry.type == "audio"]
         return _split_paths(self.audio_path)
+
+    def reference_order(self) -> list[tuple[str, int]]:
+        """``(kind, index-within-its-bucket)`` per reference, in request order.
+
+        Empty when the request used the bucketed fields, which is how a caller
+        says "I have no order to express" — the pipeline then applies its own
+        documented canonicalization and records that it did.
+        """
+        if self.references is None:
+            return []
+        counts = {"image": 0, "video": 0, "audio": 0}
+        order: list[tuple[str, int]] = []
+        for entry in self.references:
+            order.append((entry.type, counts[entry.type]))
+            counts[entry.type] += 1
+        return order
+
+    def supplies_route_derived_order(self) -> bool:
+        """Whether the caller hand-wrote ``reference_order``, which is route-owned.
+
+        This route *derives* the order from ``references``; the field only
+        exists on ``VideoGenerationRequest`` so the derived value can reach the
+        generation side, which no bucketed field can carry. A hand-written one
+        alongside ``image_path`` / ``video_path`` / ``audio_path`` therefore has
+        nothing keeping it consistent with the media that actually arrived, and
+        the mismatch is not detectable until the pipeline pairs them up — by
+        which time ``reserve()`` has taken a queue slot and the caller gets a
+        FAILED task rather than the 400 this route promises.
+
+        Rejected rather than dropped: a silently ignored order produces a video
+        built from the *canonical* bucket order, which is a different video, and
+        that silent no-op is the same failure mode ``unsupported_reference_keys``
+        exists to prevent.
+        """
+        return (self.model_extra or {}).get("reference_order") is not None
+
+    def conflicting_reference_inputs(self) -> list[str]:
+        """Bucketed media fields supplied alongside an ordered list, if any."""
+        if self.references is None:
+            return []
+        return [
+            name for name in ("image_path", "last_frame_path", "video_path", "audio_path") if getattr(self, name, None)
+        ]
 
     def unsupported_reference_keys(self) -> list[str]:
         """Byte/URL reference keys present in the body, if any.
@@ -234,4 +317,10 @@ class VideoTaskRequest(BaseModel):
         payload["prompt"] = self.prompt
         if self.model:
             payload["model"] = self.model
+        # `references` itself is route-owned and dropped above — the paths are
+        # resolved and security-checked by the route. What the generation side
+        # needs is the ORDER, which no bucketed field can carry.
+        order = self.reference_order()
+        if order:
+            payload["reference_order"] = [{"type": kind, "index": index} for kind, index in order]
         return VideoGenerationRequest(**payload)

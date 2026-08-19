@@ -15,6 +15,23 @@ trust_remote_code: true
 stages:
   - stage_id: 0
     max_num_seqs: 1
+    # Which contract this instance serves. Omitted means `legacy`, i.e. exactly
+    # what production runs today. `official_diffusers_v1` switches the model
+    # semantics — RNG stream, reference geometry and order, default frame count,
+    # media normalization — to the pinned Diffusers MiniMaxH3ModularPipeline.
+    #
+    # It changes the output of every seed, including t2va, so it belongs to an
+    # instance, never to a request. A value that cannot be applied fails at
+    # startup rather than falling back.
+    #
+    # minimax_h3_inference_contract: official_diffusers_v1
+    #
+    # What the deployment accepts (upload size, container/codec whitelists,
+    # resource budgets). Orthogonal to the contract above: production may refuse
+    # media the official in-memory interface would take, but refusing it must
+    # never change the semantics of media already accepted.
+    #
+    # minimax_h3_admission_policy: production_safe_v1
     devices: "0,1,2,3"
     parallel_config:
       pipeline_parallel_size: 1

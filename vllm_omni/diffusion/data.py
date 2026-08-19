@@ -713,6 +713,17 @@ class OmniDiffusionConfig:
     # MoE kernel backend selection
     moe_backend: str = "auto"
 
+    # MiniMax-H3 contract selection, resolved once at pipeline startup. None
+    # means legacy, i.e. exactly what production runs today.
+    minimax_h3_inference_contract: str | None = None
+    minimax_h3_admission_policy: str | None = None
+
+    # The diffusion stage's `runtime.env`, carried as config. Contract knobs
+    # that exist only as environment variables are otherwise invisible to any
+    # process but the stage's own, and a serving layer that cannot see them
+    # answers for the default contract while the worker runs the configured one.
+    diffusion_runtime_environ: dict[str, Any] | None = None
+
     # Compilation
     enforce_eager: bool = False
     # Controls the generic compilation path used when a pipeline does not

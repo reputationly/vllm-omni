@@ -27,14 +27,19 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     imgvid_cond_num_frames: int,
     seed: int,
     noise_aug: float,
+    noise: Sequence[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Apply the imgvid-condition RF noise recipe to packed clean rows.
 
     ``condition_shapes`` contains ``(latent_t, latent_h, latent_w)`` in packed
-    visual-condition order. A new CPU generator with the same row seed is
-    created for every condition. Under the dependent-noise policy, each draw
-    uses the target temporal length plus the template's imgvid-condition frame
-    count, then slices the prefix matching the current condition.
+    visual-condition order.
+
+    ``noise`` supplies the draws, one ``(1, 24, latent_t, latent_h, latent_w)``
+    tensor per condition, so the request's whole RNG contract lives in
+    ``MiniMaxH3RequestNoisePlan`` rather than half of it here. Omitting it falls
+    back to the legacy draw — a new CPU generator per condition, sized from the
+    target length plus the imgvid-condition frame count and sliced back — which
+    is what pins the plan's legacy mode in the tests.
     """
 
     noise_aug = float(noise_aug)
@@ -82,23 +87,31 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     out: list[torch.Tensor] = []
     row_offset = 0
     timestep = torch.tensor(noise_aug, dtype=torch.float32, device="cpu")
-    for latent_t, latent_h, latent_w in parsed_shapes:
-        # Official Ref2VA allows a reference video to be longer than the
-        # generated clip.  The old implementation sized the draw only from
-        # the target clip and consequently rejected valid long references.
-        full_t = max(target_latent_t + imgvid_cond_num_frames, latent_t)
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        noise = torch.randn(
-            1,
-            24,
-            full_t,
-            latent_h,
-            latent_w,
-            generator=generator,
-            dtype=torch.float32,
-            device="cpu",
-        )[:, :, :latent_t]
-        noise_rows = minimax_h3_patchify_video_latent(noise, patch_size=[1, 2, 2]).to(dtype=torch.float32)
+    if noise is not None and len(noise) != len(parsed_shapes):
+        raise ValueError(f"expected {len(parsed_shapes)} condition noise tensors, got {len(noise)}")
+    for index, (latent_t, latent_h, latent_w) in enumerate(parsed_shapes):
+        if noise is not None:
+            drawn = noise[index]
+            expected = (1, 24, latent_t, latent_h, latent_w)
+            if tuple(drawn.shape) != expected:
+                raise ValueError(f"condition noise {index} must have shape {expected}, got {tuple(drawn.shape)}")
+            drawn = drawn.detach().to(device="cpu", dtype=torch.float32)
+        else:
+            # Legacy: a fresh generator per condition, sized from the target
+            # clip plus the condition count, then sliced back.
+            full_t = max(target_latent_t + imgvid_cond_num_frames, latent_t)
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+            drawn = torch.randn(
+                1,
+                24,
+                full_t,
+                latent_h,
+                latent_w,
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            )[:, :, :latent_t]
+        noise_rows = minimax_h3_patchify_video_latent(drawn, patch_size=[1, 2, 2]).to(dtype=torch.float32)
         row_count = int(noise_rows.shape[0])
         clean_part = clean_rows[row_offset : row_offset + row_count].to(torch.float32)
         out.append(timestep * clean_part + (1.0 - timestep) * noise_rows)

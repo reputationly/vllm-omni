@@ -12,6 +12,7 @@ from vllm_omni.diffusion.sched.interface import (
     StepBatchSamplingParamsKey,
 )
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 
 Scheduler = RequestScheduler
@@ -29,4 +30,5 @@ __all__ = [
     "RequestScheduler",
     "StepScheduler",
     "Scheduler",
+    "DMD2SigmaSchedule",
 ]

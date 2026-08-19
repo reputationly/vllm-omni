@@ -366,6 +366,60 @@ class MiniMaxH3Qwen3VLTextRotaryEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+MINIMAX_H3_PARITY_DUMP_ENV = "VLLM_OMNI_H3_PARITY_DUMP_DIR"
+
+
+def _parity_dump_vision_output(image_embeds, deepstack_embeds, *, encoder_group: Any = None) -> None:
+    """The vision tower's output, for a parity run.
+
+    The tower is reimplemented here rather than reused from transformers, so
+    identical inputs do not by themselves imply identical outputs; this is the
+    measurement that decides whether a conditioning difference confined to the
+    vision rows comes from the tower or from what happens after it.
+
+    Rank 0 of the encoder group only, as the prompt and vision-input dumps in
+    the pipeline already are. The tower is *replicated* on every encoder rank,
+    so with ``text_encoder_tp_size > 1`` all of them reach this with the same
+    tensor and would write the same two paths at once — ``np.save`` and
+    ``write_text`` both truncate first, so the artifact a parity run reads back
+    can be a torn interleaving of four identical writes. Identical data does not
+    make concurrent truncation safe.
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    directory = os.environ.get(MINIMAX_H3_PARITY_DUMP_ENV, "").strip()
+    if not directory:
+        return
+    if encoder_group is not None and int(encoder_group.rank_in_group) != 0:
+        return
+    try:
+        import hashlib
+
+        import numpy as np
+
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        detached = image_embeds.detach().float().cpu().contiguous()
+        flat = detached.flatten().to(torch.float64)
+        payload = {
+            "image_embeds": {
+                "dtype": str(image_embeds.dtype).removeprefix("torch."),
+                "shape": list(detached.shape),
+                "sha256": hashlib.sha256(detached.numpy().tobytes()).hexdigest(),
+                "head": flat[:8].tolist(),
+                "mean": float(flat.mean()),
+                "std": float(flat.std()),
+            },
+            "num_deepstack": 0 if deepstack_embeds is None else len(deepstack_embeds),
+        }
+        np.save(target / "image_embeds.npy", detached.numpy())
+        (target / "vision_output.json").write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+    except Exception:  # pragma: no cover - a dump must never fail a request
+        pass
+
+
 class MiniMaxH3Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
@@ -1175,6 +1229,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values.to(device, torch.bfloat16),
                 image_grid_thw.to(device, torch.long),
             )
+            _parity_dump_vision_output(image_embeds, deepstack_image_embeds, encoder_group=self.encoder_group)
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self._get_placeholder_mask(ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)

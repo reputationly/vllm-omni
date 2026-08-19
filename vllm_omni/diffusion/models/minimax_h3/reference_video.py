@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -14,6 +15,8 @@ import numpy as np
 import torch
 
 from vllm_omni.errors import OmniClientError
+
+from .reference_audio import MINIMAX_H3_AUDIO_RESAMPLE_OFFICIAL
 
 MINIMAX_H3_FPS = 24.0
 MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
@@ -33,6 +36,7 @@ MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION = 15.0
 MINIMAX_H3_REFERENCE_DURATION_EPSILON = 1e-2
 MINIMAX_H3_MAX_VIDEO_BYTES = 50 * 1024 * 1024
 MINIMAX_H3_MAX_AUDIO_BYTES = 15 * 1024 * 1024
+
 MINIMAX_H3_VIDEO_FORMATS = frozenset({"mp4", "mov"})
 MINIMAX_H3_VIDEO_CODECS = frozenset({"h264", "h265", "hevc"})
 MINIMAX_H3_AUDIO_FORMATS = frozenset({"wav", "mp3"})
@@ -107,6 +111,53 @@ def _probe_video(path: str) -> dict[str, Any]:
     }
 
 
+def _admit_reference_video_segment(
+    meta: dict[str, Any],
+    *,
+    index: int,
+    start: float,
+    total_duration: float,
+) -> float:
+    """Admit the segment a reference contributes, and say how long it is.
+
+    Split out so the legacy and official decode paths cannot drift: what a
+    deployment accepts is a policy decision and does not belong to either
+    contract. Three things are checked here that ``_validate_reference_video
+    _metadata`` cannot, because they depend on the request rather than on the
+    file — a non-finite offset, the duration left *after* the offset, and the
+    running total across references.
+
+    Args:
+        meta: ``_probe_video`` output for this reference.
+        index: Position in the request, for the error message.
+        start: The requested offset in seconds.
+        total_duration: Seconds already admitted from earlier references.
+
+    Returns:
+        The admitted duration of this segment, possibly clipped to what is left
+        of the 15-second budget.
+    """
+    source_duration = float(meta["duration"])
+    if not math.isfinite(start) or start < 0 or start >= source_duration:
+        raise OmniClientError(f"reference video {index} start_time_seconds is outside the source duration")
+    duration = source_duration - start
+    if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
+        raise OmniClientError(
+            f"reference video {index} must provide at least 2 seconds after start_time_seconds, got {duration:.3f}"
+        )
+    remaining_duration = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION - total_duration
+    if duration > remaining_duration:
+        # ffprobe reports container durations slightly over the nominal value,
+        # so a request that is exactly at the budget is clipped rather than
+        # refused; anything beyond the tolerance is a real overflow.
+        if duration - remaining_duration > MINIMAX_H3_REFERENCE_DURATION_EPSILON:
+            raise OmniClientError("reference videos must be at most 15 seconds in total")
+        duration = remaining_duration
+        if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
+            raise OmniClientError("reference videos must be at most 15 seconds in total")
+    return duration
+
+
 def _validate_reference_video_metadata(meta: dict[str, Any], *, index: int, source: str) -> None:
     width = int(meta["width"])
     height = int(meta["height"])
@@ -133,6 +184,18 @@ def _validate_reference_video_metadata(meta: dict[str, Any], *, index: int, sour
     file_size = int(raw_file_size) if raw_file_size is not None else os.path.getsize(source)
     if file_size > MINIMAX_H3_MAX_VIDEO_BYTES:
         raise OmniClientError(f"reference video {index} exceeds the 50 MiB size limit")
+    # There is deliberately no gate on *decoded* pixels here. One was added with
+    # the official decoder and then removed: it was sized to refuse 4K/60 and
+    # 5760-wide references on the grounds that buffering the source stream costs
+    # tens of GB of host RAM — but neither path buffers. Legacy shells out to
+    # ffmpeg for a transcode, and the official path decodes one frame at a time
+    # onto the generated canvas (see `normalize_reference_video_stream`), so peak
+    # memory follows the canvas and not the source either way. What the gate did
+    # do was refuse, on *both* contracts, material this validator's own three
+    # ceilings advertise as admissible — 5760 wide, 60 fps and 15 s together are
+    # 6.7G pixels — i.e. narrow the shipped behaviour for a failure mode that no
+    # longer exists. If a bound is ever wanted again it belongs on decode *time*,
+    # measured, and it must not be narrower than the envelope above.
     format_names = set(meta.get("format_names", ()))
     if not format_names.intersection(MINIMAX_H3_VIDEO_FORMATS):
         formats = ", ".join(sorted(format_names)) or "unknown"
@@ -344,20 +407,12 @@ def prepare_reference_videos(
         meta = _probe_video(source)
         _validate_reference_video_metadata(meta, index=index, source=source)
         start = 0.0 if item_start is None else float(item_start)
-        if not math.isfinite(start) or start < 0 or start >= float(meta["duration"]):
-            raise OmniClientError(f"reference video {index} start_time_seconds is outside the source duration")
-        duration = float(meta["duration"]) - start
-        if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
-            raise OmniClientError(
-                f"reference video {index} must provide at least 2 seconds after start_time_seconds, got {duration:.3f}"
-            )
-        remaining_duration = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION - total_duration
-        if duration > remaining_duration:
-            if duration - remaining_duration > MINIMAX_H3_REFERENCE_DURATION_EPSILON:
-                raise OmniClientError("reference videos must be at most 15 seconds in total")
-            duration = remaining_duration
-            if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
-                raise OmniClientError("reference videos must be at most 15 seconds in total")
+        duration = _admit_reference_video_segment(
+            meta,
+            index=index,
+            start=start,
+            total_duration=total_duration,
+        )
         total_duration += duration
         width, height = _reference_video_shape(meta["width"], meta["height"])
         item_workdir = Path(workdir) / f"video_{index}"
@@ -382,6 +437,198 @@ def prepare_reference_videos(
             }
         )
     return prepared
+
+
+def prepare_reference_videos_official(
+    values: Any,
+    *,
+    target_frame_count: int,
+    start_time_seconds: Any = None,
+    audio_sample_rate: int = 32000,
+    target_fps: float = MINIMAX_H3_FPS,
+    truncate_to_target: bool = True,
+    audio_resample_mode: str = MINIMAX_H3_AUDIO_RESAMPLE_OFFICIAL,
+) -> list[dict[str, Any]]:
+    """Decode and normalize `ref2va` reference videos, official contract.
+
+    One lossless decode per reference feeds everything downstream: the video VAE
+    and the conditioner share the same normalized frames, and the soundtrack is
+    resampled exactly once. The legacy path instead re-encodes to H.264, reads
+    that back for the VAE, spawns one ffmpeg per conditioner frame, and lets
+    ffmpeg force the audio to 44.1 kHz before the VAE resamples it again.
+
+    Admission validation is deliberately left as it is: container, codec, size
+    and duration limits are a deployment policy, not the model contract, and the
+    official contract does not loosen them.
+
+    Args:
+        values: Reference video paths, or dicts carrying ``path``.
+        target_frame_count: The aligned frame count the request generates.
+        start_time_seconds: Optional per-reference offset, applied by slicing
+            the decoded media rather than by seeking a re-encode.
+        audio_sample_rate: The audio VAE's rate.
+        target_fps: MiniMax-H3's own frame rate.
+        truncate_to_target: Whether frames and soundtrack are cut to the
+            generated length. True is the official contract; False keeps the
+            whole reference, which changes how many packed rows it contributes
+            and exists so that difference can be attributed on its own.
+        audio_resample_mode: Single conversion (official) or the legacy chain
+            through 44.1 kHz, likewise separable from the truncation.
+
+    Returns:
+        One dict per reference, carrying the normalized ``frames`` and the
+        already-normalized ``audio`` (or None), in request order.
+    """
+    from .reference_audio import normalize_reference_audio
+    from .reference_media_decode import open_reference_video
+    from .reference_video_frames import normalize_reference_video_stream
+
+    if isinstance(values, (str, os.PathLike)):
+        values = [values]
+    if not isinstance(values, (list, tuple)) or not values:
+        raise OmniClientError("MiniMax H3 Ref2VA video input must be a path or a non-empty list of paths")
+    if isinstance(start_time_seconds, (list, tuple)):
+        start_times = list(start_time_seconds)
+    else:
+        start_times = [start_time_seconds] * len(values)
+    if len(start_times) != len(values):
+        raise OmniClientError("start_time_seconds must contain one value per reference video")
+
+    # The pinned Diffusers contract caps a soundtrack by the *generated request
+    # duration*, not by this reference video's decoded frame duration.  Those
+    # are intentionally different clocks: when a container's audio stream ends
+    # later than its picture, the audio condition may outlast the visual one.
+    # Clamping it again after frame normalization would be a new model contract,
+    # not an A/V alignment fix.
+    max_duration = (target_frame_count / target_fps) if truncate_to_target else None
+    truncate_frames_to = target_frame_count if truncate_to_target else None
+    prepared: list[dict[str, Any]] = []
+    total_duration = 0.0
+    for index, value in enumerate(values):
+        item_start = start_times[index]
+        if isinstance(value, dict):
+            item_start = value.get("start_time_seconds", item_start)
+            value = value.get("path", value.get("video_path", value.get("video_url")))
+        if not isinstance(value, (str, os.PathLike)):
+            raise OmniClientError(
+                f"MiniMax H3 Ref2VA video references require file paths, got item {index}: {type(value)!r}"
+            )
+        source = str(value)
+        meta = _probe_video(source)
+        _validate_reference_video_metadata(meta, index=index, source=source)
+
+        start = 0.0 if item_start is None else float(item_start)
+        # Admission runs on the segment as requested and accumulates that same
+        # duration, so a request is accepted or refused identically under both
+        # contracts — which is the stated policy. Counting the post-truncation
+        # contribution instead would be a looser rule for official only: every
+        # reference would shrink to at most `max_duration`, the 15-second total
+        # could rarely be reached, and a request legacy refuses would be
+        # admitted and then pack enough rows to exhaust the device.
+        total_duration += _admit_reference_video_segment(
+            meta,
+            index=index,
+            start=start,
+            total_duration=total_duration,
+        )
+
+        # Decoded frame by frame and put on the generated canvas as they come,
+        # so peak memory follows the *generated* geometry and not the source's.
+        # Buffering the source stream first is what the 50 MiB admission gate
+        # cannot bound: a compressed 4K 60 fps reference well under that limit
+        # expands to tens of GiB of RGB, and it is host RAM, so it takes the
+        # server down rather than failing the request.
+        with open_reference_video(source) as reader:
+            fps = reader.fps
+            frames = reader.iter_frames(start_seconds=start)
+            first = next(frames, None)
+            if first is None:
+                raise OmniClientError(f"reference video {index} has no frames after start_time_seconds")
+            # Where the video actually begins, which is not always where the
+            # request asked: `start` lands inside a frame's display interval and
+            # the reader hands over the frame on screen there. Cutting the
+            # soundtrack at the *requested* instant instead would offset the two
+            # conditions against each other by that remainder — and on a
+            # variable-rate source, by however far the two disagree.
+            video_start = float(first[0])
+            normalized_frames = normalize_reference_video_stream(
+                itertools.chain((first,), frames),
+                fps=fps,
+                num_frames=truncate_frames_to,
+                canvas_multiple=MINIMAX_H3_CANVAS_MULTIPLE,
+                canvas_short_edge=MINIMAX_H3_BASE_SHORT_EDGE,
+                canvas_max_pixels=MINIMAX_H3_MAX_PIXELS,
+                resolve_canvas=_resolve_reference_canvas,
+                target_fps=target_fps,
+            )
+            soundtrack = reader.soundtrack()
+
+        waveform = None
+        if soundtrack is not None:
+            audio, sample_rate = soundtrack.waveform, soundtrack.sample_rate
+            # Both clocks read absolute, so the cut is their *difference*.
+            # `video_start` is a container timestamp; the waveform's sample 0 is
+            # the audio stream's own first sample, which sits at
+            # `soundtrack.start_seconds` on that same clock. Cutting by
+            # `video_start` alone would take the stream offset off a waveform
+            # that never had it — on a container whose streams start at 5 s, a
+            # request starting at 0 would lose the first five seconds of sound,
+            # or all of it.
+            trim = video_start - soundtrack.start_seconds
+            if trim > 0:
+                audio = audio[:, int(trim * sample_rate) :]
+            elif trim < 0:
+                # The soundtrack begins *after* the video does. Nothing carries
+                # an offset past this point — the waveform goes straight into
+                # `encode_waveform`, where sample 0 is time 0 of the reference —
+                # so leaving it alone does not preserve the delay, it deletes
+                # it, pulling the sound earlier by exactly that much. The
+                # silence is not invented: it is what the container has there.
+                lead = torch.zeros(audio.shape[0], int(-trim * sample_rate), dtype=audio.dtype)
+                audio = torch.cat((lead, audio), dim=-1)
+            waveform = normalize_reference_audio(
+                audio,
+                int(sample_rate),
+                target_sample_rate=audio_sample_rate,
+                max_duration=max_duration,
+                resample_mode=audio_resample_mode,
+            )
+
+        prepared.append(
+            {
+                "original_path": source,
+                "prepared_path": None,
+                "frames": normalized_frames,
+                "audio": waveform,
+                "audio_sample_rate": None if waveform is None else audio_sample_rate,
+                "input_has_audio": waveform is not None,
+                "width": int(normalized_frames.shape[2]),
+                "height": int(normalized_frames.shape[1]),
+                "start_time_seconds": start,
+                "duration_seconds": normalized_frames.shape[0] / target_fps,
+            }
+        )
+    return prepared
+
+
+def _resolve_reference_canvas(
+    aspect_width: float,
+    aspect_height: float,
+    multiple: int,
+    short_edge: int,
+    max_pixels: int,
+) -> tuple[int, int]:
+    """`(height, width)` for a reference video, the same rule the target follows."""
+    ratio = float(aspect_width) / float(aspect_height)
+    if ratio >= 1.0:
+        width, height = short_edge * ratio, float(short_edge)
+    else:
+        width, height = float(short_edge), short_edge / ratio
+    area = width * height
+    if area > max_pixels:
+        scale = math.sqrt(max_pixels / area)
+        width, height = width * scale, height * scale
+    return _nearest_multiple(height, multiple), _nearest_multiple(width, multiple)
 
 
 def load_video_frames(path: str) -> np.ndarray:
@@ -553,6 +800,7 @@ __all__ = [
     "load_video_audio",
     "load_video_frames",
     "prepare_reference_videos",
+    "prepare_reference_videos_official",
     "sample_reference_video_frames",
     "validate_reference_audio_files",
     "validate_reference_audio_waveforms",

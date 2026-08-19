@@ -556,6 +556,21 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
+    # MiniMax-H3 contract selection. Declared here and not only on
+    # StageDeployConfig because this projection is what owns a diffusion
+    # stage's engine overrides: a deploy field with no owner here is rejected
+    # by _validate_stage_engine_override_ownership, so omitting it would make
+    # the documented YAML unusable rather than merely ineffective.
+    minimax_h3_inference_contract: str | None = None
+    minimax_h3_admission_policy: str | None = None
+    # The diffusion stage's own ``runtime.env``, carried as config rather than
+    # read from the environment. A stage-scoped variable is applied while the
+    # stage starts and restored afterwards, so it never reaches the process the
+    # serving layer answers from; and the contract knobs that exist ONLY as
+    # environment variables (reference geometry, RNG mode, condition-noise
+    # shape) have no other way across. Injected by _stage_engine_values for
+    # diffusion stages; not something a deploy file writes under `engine:`.
+    diffusion_runtime_environ: dict[str, Any] | None = None
     lora_path: str | None = None
     lora_scale: float = 1.0
     max_cpu_loras: int | None = None
@@ -944,6 +959,18 @@ def _stage_engine_values(
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
+    # A diffusion stage's own runtime env, as config. The variables themselves
+    # are applied to the stage process and restored afterwards, which leaves
+    # every other process — including the one serving HTTP — unable to see what
+    # this stage was configured with. Carrying the mapping alongside the engine
+    # args is what lets a capability probe answer for the instance the worker is
+    # actually running instead of for the default.
+    if topology.execution_type == StageExecutionType.DIFFUSION and stage_deploy is not None:
+        from vllm_omni.engine.stage_init_utils import stage_runtime_env_mapping
+
+        stage_environ = stage_runtime_env_mapping(topology.stage_id, {"env": stage_deploy.env})
+        if stage_environ:
+            engine["diffusion_runtime_environ"] = stage_environ
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
     if topology.omni_kv_config:

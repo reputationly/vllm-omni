@@ -15,7 +15,12 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.model_metadata import (
+    get_diffusion_model_metadata,
+    honours_explicit_reference_order,
+    reference_images_bind_output_canvas,
+    reference_video_decode_frame_cap,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -100,11 +105,24 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
+    def _diffusion_od_config(self) -> Any | None:
+        """The diffusion config the capability probes answer from, or ``None``.
+
+        Out of process this is a *view* of the worker's config rather than the
+        config itself, so it carries only what a probe needs. ``None`` means the
+        engine is unreachable from here, and every caller then keeps the answer
+        the serving layer has always given — a probe that cannot see the engine
+        must never invent a rejection.
+        """
+        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
+        if callable(get_od_config):
+            return get_od_config()
+        return getattr(self._engine_client, "od_config", None)
+
     @property
     def supports_mixed_reference_inputs(self) -> bool:
         """Return whether the configured diffusion model accepts mixed refs."""
-        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
-        od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
+        od_config = self._diffusion_od_config()
         if od_config is None:
             return False
 
@@ -114,6 +132,55 @@ class OmniOpenAIServingVideo:
 
         model_class_name = getattr(od_config, "model_class_name", None)
         return get_diffusion_model_metadata(model_class_name).supports_mixed_reference_inputs
+
+    @property
+    def reference_images_bind_output_canvas(self) -> bool:
+        """Whether reference images are put onto the generated canvas.
+
+        True for every model historically, and still the default. MiniMax-H3
+        under the official contract says False: its reference images carry a
+        geometry of their own, and stretching them onto the canvas changes what
+        the model conditions on.
+        """
+        od_config = self._diffusion_od_config()
+        if od_config is None:
+            return True
+        return reference_images_bind_output_canvas(getattr(od_config, "model_class_name", None), od_config)
+
+    @property
+    def honours_explicit_reference_order(self) -> bool:
+        """Whether an ordered ``references`` list can be served at all.
+
+        Asked by the route BEFORE it reserves a task: the order it derives from
+        ``references`` is rejected by a legacy MiniMax-H3 pipeline, and that
+        rejection currently arrives after the caller has been told PENDING.
+        Defaults to True when no config is reachable, so a probe that cannot see
+        the engine never invents a 400.
+        """
+        od_config = self._diffusion_od_config()
+        if od_config is None:
+            return True
+        return honours_explicit_reference_order(getattr(od_config, "model_class_name", None), od_config)
+
+    def reference_video_decode_frame_cap(self, num_frames: int | None) -> int | None:
+        """How many frames of a reference video to keep while decoding it.
+
+        Asked by the route because the decode happens there, before anything
+        model-specific runs, and the answer depends on the instance's contract:
+        under the official one the pipeline targets the ``17 * n + 5``-aligned
+        count, and a reference truncated to the *requested* count arrives one
+        VAE chunk short of what it carried. Falls through to the requested count
+        whenever the config is unreachable, which is what the route did before
+        any model could answer.
+        """
+        od_config = self._diffusion_od_config()
+        if od_config is None:
+            return num_frames
+        return reference_video_decode_frame_cap(
+            getattr(od_config, "model_class_name", None),
+            od_config,
+            num_frames=num_frames,
+        )
 
     @classmethod
     def for_diffusion(
@@ -154,7 +221,16 @@ class OmniOpenAIServingVideo:
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
-        if input_image is not None and vp.width is not None and vp.height is not None:
+        if (
+            input_image is not None
+            and vp.width is not None
+            and vp.height is not None
+            and self.reference_images_bind_output_canvas
+        ):
+            # Stretches, not cover-crops: a reference whose aspect ratio differs
+            # from the canvas is distorted here, and the model's own aspect-ratio
+            # validation then never sees the real ratio. Models whose reference
+            # images carry their own geometry opt out.
             target_size = (vp.width, vp.height)
             image_items = input_image if isinstance(input_image, list) else [input_image]
             resized_images = [
@@ -163,6 +239,18 @@ class OmniOpenAIServingVideo:
             ]
             input_image = resized_images if isinstance(input_image, list) else resized_images[0]
         multi_modal_data: dict[str, Any] = {}
+        # The order the caller asked for, when the request carried one. The
+        # media still travels in modality buckets; only the order rides
+        # alongside, so nothing downstream that reads the buckets changes.
+        # Entries are `ReferenceOrderEntry`, so the modality and the index were
+        # already validated at the protocol boundary. Reading them by attribute
+        # is what keeps that true: the previous `entry["type"]` accepted any
+        # dict and turned a malformed order into a KeyError here — in the
+        # background job, after the task had been reserved — instead of the 400
+        # the route raises for everything else it can check without a GPU.
+        reference_order = getattr(request, "reference_order", None)
+        if reference_order:
+            multi_modal_data["reference_order"] = [(entry.type, entry.index) for entry in reference_order]
         if input_image is not None:
             multi_modal_data["image"] = input_image
         if input_video is not None:

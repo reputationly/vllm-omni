@@ -1,0 +1,38 @@
+# MiniMax-H3 FL2VA Base/Turbo (BF16) — A100 PCIE 40G x4
+#
+# One topology serves all three FL2VA partitions in the 3+2 product matrix:
+# Base, Turbo4, and Turbo8.  The model path selects the weights.  Do not pin
+# num_inference_steps here: the partition metadata is authoritative (Base=20,
+# Turbo4=4, Turbo8=8), and an explicit request may still override it.
+pipeline: minimax_h3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    task_type: fl2va
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+
+    enable_cpu_offload: true
+    vae_use_tiling: true
+    diffusion_attention_backend: FLASH_ATTN
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+    enable_multithread_weight_load: false
+    enable_diffusion_pipeline_profiler: true
+
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1

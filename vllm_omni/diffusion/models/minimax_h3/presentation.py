@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from .ordered_references import render_condition_label
+
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -101,7 +103,7 @@ def _multi_image_presentation(
     for index, count in enumerate(image_token_counts, start=1):
         if int(count) <= 0:
             raise ValueError("image_token_count must be positive")
-        presentation.text(_text_ids(tokenizer, f"<Picture {index}>: "))
+        presentation.text(_text_ids(tokenizer, f"{render_condition_label('image', index)}: "))
         presentation.vision(_vision_block_ids(tokenizer, IMAGE_PAD, count))
     presentation.text(_text_ids(tokenizer, prompt))
     return presentation.build()
@@ -258,10 +260,10 @@ def minimax_h3_ref2va_video_presentation(
             count = int(image_token_counts[image_seen - 1])
             if count <= 0:
                 raise ValueError("image_token_count required for an image reference")
-            presentation.text(_text_ids(tokenizer, f"<Picture {ordinal}>: "))
+            presentation.text(_text_ids(tokenizer, f"{render_condition_label('image', ordinal)}: "))
             presentation.vision(_vision_block_ids(tokenizer, IMAGE_PAD, count))
         elif cond_type == "audio":
-            presentation.text(_text_ids(tokenizer, f"<Audio {ordinal}>: "))
+            presentation.text(_text_ids(tokenizer, f"{render_condition_label('audio', ordinal)}: "))
         elif cond_type == "video":
             video_seen += 1
             if video_seen > len(video_counts_by_ref):
@@ -270,7 +272,7 @@ def minimax_h3_ref2va_video_presentation(
             timestamps = video_timestamps_by_ref[video_seen - 1]
             if not counts or not timestamps:
                 raise ValueError("video reference requires block token counts and timestamps")
-            presentation.text(_text_ids(tokenizer, f"<Video {ordinal}>: "))
+            presentation.text(_text_ids(tokenizer, f"{render_condition_label('video', ordinal)}: "))
             _timestamped_video_blocks(
                 presentation,
                 tokenizer,

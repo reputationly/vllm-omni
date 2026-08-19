@@ -55,6 +55,7 @@ from vllm_omni.diffusion.progress import (
     PHASE_PREPARE,
     report_phase,
 )
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -68,13 +69,26 @@ from .condition_noise import (
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .keyframes import prepare_fl2va_keyframes
 from .minimax_h3_transformer import MiniMaxH3DiTModel
+from .ordered_references import (
+    MINIMAX_H3_ORDER_BUCKETS,
+    MINIMAX_H3_ORDER_REQUEST,
+    MiniMaxH3OrderedReference,
+    audio_bucket_slots,
+    canonical_order_from_buckets,
+    describe_order,
+    ordered_references_from_request,
+    visual_bucket_slots,
+)
+from .ordered_references import (
+    condition_labels as reference_condition_labels,
+)
 from .packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
 from .packed_tokens import (
-    minimax_h3_patchify_video_latent,
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
@@ -86,15 +100,35 @@ from .presentation import (
     minimax_h3_text_only_ids,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .reference_audio import (
+    normalize_standalone_reference_audios,
+    reference_audio_max_duration,
+)
+from .reference_image_geometry import (
+    MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET,
+    MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
+    MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+    MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV,
+    MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
+    parse_reference_image_max_pixels,
+    parse_reference_image_no_upscale,
+    parse_reference_image_short_edge,
+)
 from .reference_video import (
+    MINIMAX_H3_QWEN_TEMPORAL_PATCH,
+    MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
     load_audio_file,
     load_video_audio,
     load_video_frames,
     prepare_reference_videos,
+    prepare_reference_videos_official,
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
+from .reference_video_frames import sample_conditioner_frames, vae_chunk_frame_count
+from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
+from .strategy import contract_environ, legacy_strategy, resolve_strategy
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
@@ -108,20 +142,10 @@ MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
+MINIMAX_H3_DEFAULT_INFERENCE_STEPS = 20
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
-MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE"
-MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV = "VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE"
-# 归一**目标**短边的取值范围。刻意不复用 reference_video.py 的
-# MINIMAX_H3_{MIN,MAX}_REFERENCE_DIMENSION —— 那两个约束的是**用户上传原图**的边长
-# （reference_video.py:114/246），这里约束的是**缩放后的目标**，是两个概念，数值上碰巧沾边。
-# 下界取 patch 对齐粒度：小于它会被 _align_multiple 归零。
-# 上界取 5760：目标短边超过允许上传的最大边长没有实际意义。
-MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET = MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
-MINIMAX_H3_REFERENCE_IMAGE_MAX_TARGET = 5760
-MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV = "VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE"
-MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV = "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS"
 
 
 def _reference_image_max_pixels() -> int:
@@ -141,37 +165,7 @@ def _reference_image_max_pixels() -> int:
     与宽高比彻底解耦。默认不开启：封顶对极端比例的图是**真实降分辨率**（2560x1024 会被压到
     1600x640），不像 [[no_upscale]] 那样只是去掉插值，因此同样需要画质 A/B 才能翻默认值。
     """
-    raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV, "").strip()
-    if not raw:
-        return 0
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "%s=%r is not an integer; area cap stays disabled",
-            MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
-            raw,
-        )
-        return 0
-    if value < 0:
-        logger.warning(
-            "%s=%d is negative; area cap stays disabled",
-            MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
-            value,
-        )
-        return 0
-    # 下界是一个 patch 的面积：再小会被 _align_multiple 归零。
-    if 0 < value < MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE**2:
-        logger.warning(
-            "%s=%d is below one %dx%d patch; clamping to %d",
-            MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
-            value,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE**2,
-        )
-        return MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE**2
-    return value
+    return parse_reference_image_max_pixels(os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV, ""))
 
 
 def _reference_image_no_upscale() -> bool:
@@ -190,7 +184,7 @@ def _reference_image_no_upscale() -> bool:
     不排除是有意为之——把参考条件统一到某个规范分辨率。但图用 2048、视频用 768 的不对称又
     说明它不像是硬性要求。仅凭代码判不了，需要画质 A/B 才能决定是否翻默认值。
     """
-    return os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV, "").strip() in {"1", "true", "True"}
+    return parse_reference_image_no_upscale(os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV, ""))
 
 
 def _reference_image_short_edge() -> int:
@@ -227,41 +221,15 @@ def _reference_image_short_edge() -> int:
     **它也管不住宽高比**：短边固定后 rows 仍随比例线性涨（1.75 比例 7168 rows，
     2.5 比例 10240 rows）。要让单图代价与比例解耦，见
     MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV 的面积封顶。
+
+    解析规则本身住在 reference_image_geometry.py：strategy.py 的启动期解析走的是同一个
+    函数，两处曾经各有一份、答案不一致（其中一次分歧是越上界被放行，正好是这个旋钮要防的
+    那一档），所以现在全仓只有一个实现。
     """
     raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "").strip()
     if not raw:
-        return 2048
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "%s=%r is not an integer; falling back to 2048",
-            MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
-            raw,
-        )
-        return 2048
-    # 不变式：**任何非法输入都不得解析出比默认值更贵的目标**。
-    # 越下界夹取（16 -> 32）保住"调小省显存"的意图，且必定更省；越上界**不能**同样夹到 5760 ——
-    # 那是把手滑变成最贵的一档：2560x1024 在短边 5760 下是 14400x5760 = 81000 rows/图，
-    # 而 2048 档只有 10240，差 7.9 倍，正好制造这个开关要防的 OOM。所以越上界回落默认值。
-    if value < MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET:
-        logger.warning(
-            "%s=%d is below the %d-pixel patch alignment; clamping to %d",
-            MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
-            value,
-            MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET,
-            MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET,
-        )
-        return MINIMAX_H3_REFERENCE_IMAGE_MIN_TARGET
-    if value > MINIMAX_H3_REFERENCE_IMAGE_MAX_TARGET:
-        logger.warning(
-            "%s=%d exceeds the %d-pixel ceiling; falling back to 2048 rather than clamping up",
-            MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
-            value,
-            MINIMAX_H3_REFERENCE_IMAGE_MAX_TARGET,
-        )
-        return 2048
-    return value
+        return MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET
+    return parse_reference_image_short_edge(raw)
 
 
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
@@ -333,6 +301,23 @@ def _minimax_h3_partition_for_task(
     if task == "ref2va":
         return "ref2va"
     raise ValueError(f"MiniMax-H3 task_type must be one of auto, t2va, fl2va, or ref2va; got {task_type!r}")
+
+
+def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
+    """Read a partition-scoped distilled schedule from model metadata."""
+    return DMD2SigmaSchedule.from_metadata(release)
+
+
+def _resolve_minimax_h3_schedule(
+    schedule: DMD2SigmaSchedule | None,
+    requested_steps: int | None,
+) -> tuple[int, tuple[float, ...] | None]:
+    """Resolve the public NFE value and its N+1 unshifted sigma boundaries."""
+    if schedule is None:
+        steps = int(requested_steps) if requested_steps is not None else MINIMAX_H3_DEFAULT_INFERENCE_STEPS
+        return steps, None
+    steps = int(requested_steps) if requested_steps is not None else schedule.num_inference_steps
+    return steps, schedule.positions_for_num_inference_steps(steps)
 
 
 def _resolve_minimax_h3_model_root(
@@ -572,6 +557,112 @@ def _validate_ref2va_reference_counts(
         raise OmniClientError("ref2va accepts at most 12 total references")
 
 
+def _visual_condition_row_count(shape: Sequence[int]) -> int:
+    """Packed rows one visual condition occupies, from its latent shape."""
+    latent_t, latent_h, latent_w = (int(value) for value in shape)
+    _, patch_h, patch_w = MINIMAX_H3_PATCH_SIZE
+    return latent_t * (latent_h // patch_h) * (latent_w // patch_w)
+
+
+def _split_condition_rows(rows: torch.Tensor | None, counts: Sequence[int]) -> list[torch.Tensor]:
+    """Cut a concatenated conditioning tensor back into its per-reference parts.
+
+    The VAEs hand back one tensor for a whole bucket, so re-ordering references
+    means re-splitting it. The row counts are recomputed from the shapes the
+    packed layout will itself use, which makes a disagreement between what was
+    encoded and what will be packed fail here rather than silently shifting
+    every later reference by a few rows.
+    """
+    total = sum(int(count) for count in counts)
+    if rows is None:
+        if total:
+            raise ValueError(f"expected {total} conditioning rows but none were encoded")
+        return []
+    if int(rows.shape[0]) != total:
+        raise ValueError(f"encoded {int(rows.shape[0])} conditioning rows but the packed layout expects {total}")
+    parts: list[torch.Tensor] = []
+    cursor = 0
+    for count in counts:
+        parts.append(rows[cursor : cursor + int(count)])
+        cursor += int(count)
+    return parts
+
+
+def _order_reference_conditions(
+    references: Sequence[MiniMaxH3OrderedReference],
+    *,
+    visual_condition: torch.Tensor | None,
+    visual_shapes: list[tuple[int, int, int]],
+    num_images: int,
+    audio_condition: torch.Tensor | None,
+    audio_lengths: list[int],
+    video_has_audio: Sequence[bool],
+) -> tuple[torch.Tensor | None, list[tuple[int, int, int]], torch.Tensor | None, list[int], list[dict[str, Any]]]:
+    """Put every conditioning artifact into the request's reference order.
+
+    The order is semantic — it numbers the prompt's ``<Picture i>`` /
+    ``<Audio j>`` / ``<Video k>`` labels and drives the packed layout — so it
+    is not enough for the labels to follow it. The rows, their shapes, the
+    soundtrack lengths and ``ref_blocks`` all have to agree, or the model is
+    shown reference *A*'s pixels under reference *B*'s label.
+
+    Encoding still runs bucket by bucket (see ``visual_bucket_slots``); this
+    permutes the results afterwards, so the common bucketed order is the
+    identity permutation and costs nothing but a few tensor views.
+
+    Returns:
+        ``(visual_condition, visual_shapes, audio_condition, audio_lengths,
+        ref_blocks)``, all in packed order.
+    """
+    visual_parts = _split_condition_rows(
+        visual_condition, [_visual_condition_row_count(shape) for shape in visual_shapes]
+    )
+    audio_parts = _split_condition_rows(
+        audio_condition, [int(length) * MINIMAX_H3_AUDIO_CHANNELS for length in audio_lengths]
+    )
+
+    visual_slots = visual_bucket_slots(references, num_images=num_images)
+    audio_slots = audio_bucket_slots(references, video_has_audio=video_has_audio)
+    if len(visual_slots) != len(visual_parts) or len(audio_slots) != len(audio_parts):
+        raise ValueError(
+            f"the reference order names {len(visual_slots)} visual and {len(audio_slots)} audio conditions "
+            f"but {len(visual_parts)} and {len(audio_parts)} were encoded"
+        )
+
+    ordered_visual_shapes = [tuple(int(value) for value in visual_shapes[slot]) for slot in visual_slots]
+    ordered_audio_lengths = [int(audio_lengths[slot]) for slot in audio_slots]
+    ordered_visual = torch.cat([visual_parts[slot] for slot in visual_slots]) if visual_slots else None
+    ordered_audio = torch.cat([audio_parts[slot] for slot in audio_slots]) if audio_slots else None
+
+    ref_blocks: list[dict[str, Any]] = []
+    visual_iterator = iter(ordered_visual_shapes)
+    audio_iterator = iter(ordered_audio_lengths)
+    for reference in references:
+        if reference.kind == "audio":
+            ref_blocks.append({"kind": "audio", "ref_audio_t": next(audio_iterator)})
+            continue
+        latent_t, latent_h, latent_w = next(visual_iterator)
+        if reference.kind == "image":
+            ref_blocks.append({"kind": "image", "latent_h": latent_h, "latent_w": latent_w})
+            continue
+        # A video's soundtrack is packed immediately before its own rows, so it
+        # is consumed here rather than as a block of its own.
+        ref_audio_t = next(audio_iterator) if reference.has_audio else 0
+        ref_blocks.append(
+            {
+                "kind": "video_audio" if ref_audio_t else "video",
+                "ref_audio_t": ref_audio_t,
+                "latent_t": latent_t,
+                "latent_h": latent_h,
+                "latent_w": latent_w,
+            }
+        )
+    if next(visual_iterator, None) is not None or next(audio_iterator, None) is not None:
+        raise ValueError("the reference order left conditioning rows unpacked")
+
+    return ordered_visual, ordered_visual_shapes, ordered_audio, ordered_audio_lengths, ref_blocks
+
+
 def _resolve_minimax_h3_aspect_ratio(
     task: str,
     value: Any,
@@ -654,6 +745,13 @@ def _dit_rank_world() -> tuple[Any, int, int]:
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
+def _log_reference_order(references: Sequence[MiniMaxH3OrderedReference], mode: str) -> None:
+    """Record one auditable order per request, rather than once per DiT rank."""
+    _, rank, _ = _dit_rank_world()
+    if rank == 0:
+        logger.info("MiniMax H3 reference order: %s", describe_order(references, mode))
+
+
 def _broadcast_tensor(
     tensor: torch.Tensor | None,
     *,
@@ -686,21 +784,181 @@ def _broadcast_tensor(
     return output
 
 
-def _reference_image_shape(image: Image.Image) -> tuple[int, int]:
+def _broadcast_frame_array(
+    frames: np.ndarray | None,
+    shape: tuple[int, ...],
+    *,
+    group: Any,
+    device: torch.device,
+    chunk_frames: int,
+) -> np.ndarray:
+    """Broadcast one reference's ``uint8`` frames from rank 0, a chunk at a time.
+
+    A whole reference is up to ~1.1 GB, and a collective that stages it in one
+    piece needs that much *device* memory on every rank at once. Only the
+    receiving buffer has to be resident, so the frames move through a reusable
+    ``chunk_frames``-frame window and land in host memory, where the VAE's own
+    input conversion picks them up. Every rank walks the same chunk boundaries,
+    which is what keeps the collective symmetric.
+
+    Args:
+        frames: The source array on rank 0, ``None`` elsewhere.
+        shape: The full ``(num_frames, height, width, 3)`` shape, already agreed.
+        group: The DiT process group.
+        device: The device the collective stages through.
+        chunk_frames: Frames per collective.
+
+    Returns:
+        The frames, on every rank. Rank 0 gets its own array back unchanged.
+    """
+    total = int(shape[0])
+    output = frames if frames is not None else np.empty(shape, dtype=np.uint8)
+    if total == 0:
+        return output
+    window = max(1, int(chunk_frames))
+    buffer = torch.empty((min(window, total), *shape[1:]), dtype=torch.uint8, device=device)
+    for start in range(0, total, window):
+        stop = min(start + window, total)
+        view = buffer[: stop - start]
+        if frames is not None:
+            view.copy_(torch.from_numpy(np.ascontiguousarray(frames[start:stop])))
+        dist.broadcast(view, src=0, group=group)
+        if frames is None:
+            output[start:stop] = view.cpu().numpy()
+    return output
+
+
+MINIMAX_H3_PARITY_DUMP_ENV = "VLLM_OMNI_H3_PARITY_DUMP_DIR"
+
+
+def _parity_dump_prompt_embeds(ids, hidden, tags, *, task: str, strategy) -> None:
+    """Write the conditioning stage to disk when a parity run asks for it.
+
+    Off unless ``VLLM_OMNI_H3_PARITY_DUMP_DIR`` is set, and rank 0 only. The
+    alternative — reconstructing the TP-sharded conditioner outside the engine —
+    would compare a different execution than the one that serves, which is the
+    thing a parity dump exists to avoid.
+
+    A digest plus moments rather than the raw tensor: a 5120-wide hidden state
+    over a real prompt runs to tens of MB per request, and the comparison the
+    report needs is distance, not a second copy of the weights' output.
+    """
+    directory = os.environ.get(MINIMAX_H3_PARITY_DUMP_ENV, "").strip()
+    if not directory:
+        return
+    _, rank, _ = _dit_rank_world()
+    if rank != 0:
+        return
+    try:
+        import hashlib
+
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        detached = hidden.detach().float().cpu().contiguous()
+        flat = detached.flatten().to(torch.float64)
+        token_ids = [int(value) for value in ids.detach().cpu().flatten().tolist()]
+        payload = {
+            "task": task,
+            "inference_contract": strategy.name,
+            "token_ids": token_ids,
+            "text_encoder_layer": 50,
+            "hidden_shape": list(detached.shape),
+            "hidden": {
+                "dtype": "float32",
+                "shape": list(detached.shape),
+                "sha256": hashlib.sha256(detached.numpy().tobytes()).hexdigest(),
+                "head": flat[:16].tolist(),
+                "tail": flat[-16:].tolist(),
+                "mean": float(flat.mean()),
+                "std": float(flat.std()),
+            },
+            "token_tags": [int(value) for value in tags.detach().cpu().flatten().tolist()],
+        }
+        (target / "prompt_embeds.json").write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+        # The full tensor as well: `max_abs` / `mean_abs` / `max_rel` / cosine
+        # over 9M elements cannot be recovered from a 32-element sample, and a
+        # summary that hides where a difference concentrates is what makes an
+        # "observed but unattributed" result unresolvable. npy, not JSON — the
+        # same values are 37 MB instead of 200 MB.
+        np.save(target / "prompt_embeds.npy", detached.numpy())
+        logger.info("MiniMax H3 parity dump: wrote prompt_embeds to %s", target)
+    except Exception as exc:  # pragma: no cover - a dump must never fail a request
+        logger.warning("MiniMax H3 parity dump failed (ignored): %s", exc)
+
+
+def _parity_dump_vision_inputs(vision_kwargs: dict) -> None:
+    """The vision tower's input, for isolating preprocessing from execution.
+
+    A conditioning difference confined to the vision rows has exactly two
+    places it can come from: the pixels the tower is given, or what the tower
+    does with them. Dumping the input makes that a two-way test instead of a
+    guess — identical pixels move the question downstream, different pixels end
+    it upstream.
+    """
+    directory = os.environ.get(MINIMAX_H3_PARITY_DUMP_ENV, "").strip()
+    if not directory or not vision_kwargs:
+        return
+    _, rank, _ = _dit_rank_world()
+    if rank != 0:
+        return
+    try:
+        import hashlib
+
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        payload = {}
+        for name, value in vision_kwargs.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            detached = value.detach().float().cpu().contiguous()
+            flat = detached.flatten().to(torch.float64)
+            payload[name] = {
+                "dtype": str(value.dtype).removeprefix("torch."),
+                "shape": list(detached.shape),
+                "sha256": hashlib.sha256(detached.numpy().tobytes()).hexdigest(),
+                "head": flat[:8].tolist(),
+                "mean": float(flat.mean()),
+                "std": float(flat.std()),
+            }
+            if name.startswith("pixel_"):
+                np.save(target / f"{name}.npy", detached.numpy())
+        (target / "vision_inputs.json").write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+    except Exception as exc:  # pragma: no cover
+        logger.warning("MiniMax H3 parity vision dump failed (ignored): %s", exc)
+
+
+def _reference_image_shape(
+    image: Image.Image,
+    *,
+    aspect_ratio_range: tuple[float, float] = (0.4, 2.5),
+    short_edge: int | None = None,
+    no_upscale: bool | None = None,
+    max_pixels: int | None = None,
+) -> tuple[int, int]:
+    """The geometry a `ref2va` reference image is encoded at.
+
+    ``aspect_ratio_range`` is model semantics, not admission: the oracle accepts
+    1:4 to 4:1, and vLLM's legacy entry narrowed that to 0.4..2.5. The pixel
+    bounds below stay where they are — they guard resources, so they belong to
+    the admission policy and do not change with the inference contract.
+    """
     width, height = image.size
     ratio = width / height
-    if not 0.4 <= ratio <= 2.5:
-        raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
+    low, high = aspect_ratio_range
+    if not low <= ratio <= high:
+        raise OmniClientError(f"reference image aspect ratio must be in [{low:g}, {high:g}], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = _reference_image_short_edge() / min(width, height)
-    no_upscale = _reference_image_no_upscale()
+    scale = (short_edge or _reference_image_short_edge()) / min(width, height)
+    if no_upscale is None:
+        no_upscale = _reference_image_no_upscale()
     if no_upscale:
         scale = min(1.0, scale)
     target_width = width * scale
     target_height = height * scale
     # 面积封顶，与 _reference_video_shape / _resolve_output_canvas 同形；默认关闭。
-    max_pixels = _reference_image_max_pixels()
+    if max_pixels is None:
+        max_pixels = _reference_image_max_pixels()
     area = target_width * target_height
     if max_pixels and area > max_pixels:
         area_scale = math.sqrt(max_pixels / area)
@@ -807,6 +1065,11 @@ class MiniMaxH3Pipeline(
         "decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    # Class-level default so an instance built without `__init__` — the request
+    # helpers are exercised that way in tests — still resolves a contract, and
+    # resolves the safe one. `__init__` shadows this per instance.
+    strategy = legacy_strategy()
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -869,6 +1132,28 @@ class MiniMaxH3Pipeline(
         shifts = release.get("sigma_shift_scales") or {}
         self.default_video_shift = float(shifts.get("video", 12.0))
         self.default_audio_shift = float(shifts.get("audio", 3.0))
+        self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
+        if ref2va_model_path is not None:
+            self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
+
+        # Which contract this instance serves, resolved once here. Startup-level
+        # on purpose: a request may not pick, because switching contracts
+        # changes the output of every seed. Defaults to legacy, i.e. exactly
+        # what production runs today.
+        self.strategy = resolve_strategy(
+            inference_contract=getattr(od_config, "minimax_h3_inference_contract", None),
+            admission_policy=getattr(od_config, "minimax_h3_admission_policy", None),
+            # The same environment the serving layer's capability probes read,
+            # rather than this process's own. Both are correct here only by
+            # coincidence — the stage env IS applied to this process — and the
+            # coincidence is worth not depending on: if the two sides derive the
+            # contract differently they will eventually disagree, which is the
+            # failure this whole path exists to prevent.
+            environ=contract_environ(od_config),
+        )
+        self.rng_mode = self.strategy.rng_mode
+        self.condition_noise_shape_mode = self.strategy.visual_condition_noise_shape_mode
+        logger.info("MiniMax-H3 contract: %s", self.strategy.describe())
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -1002,6 +1287,10 @@ class MiniMaxH3Pipeline(
             return self.transformers_ref
         return self.transformer
 
+    def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._base_schedule_by_partition.get(partition)
+
     def _resolve_task(
         self,
         requested: str | None,
@@ -1040,6 +1329,13 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 extra_args['target'] must be an object")
         target = target if isinstance(target, Mapping) else {}
         duration = target.get("duration_seconds", extra.get("duration_seconds", extra.get("duration")))
+        # The window the contract admits, in FRAMES, because the ceiling has to
+        # hold for the aligned count and alignment is a fact about frames. Both
+        # checks below read this one window, so the number that is validated and
+        # the number that is generated can no longer come apart.
+        min_frames, max_frames = self.strategy.requested_frame_window(fps)
+        min_seconds = round(min_frames / fps, 3)
+        max_seconds = round(max_frames / fps, 3)
         if duration is not None:
             if isinstance(duration, bool):
                 raise OmniClientError(
@@ -1051,23 +1347,22 @@ class MiniMaxH3Pipeline(
                 raise OmniClientError(
                     f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, got {duration!r}"
                 ) from exc
-            if (
-                not math.isfinite(duration)
-                or not MINIMAX_H3_MIN_OUTPUT_SECONDS <= duration <= MINIMAX_H3_MAX_OUTPUT_SECONDS
-            ):
+            if not math.isfinite(duration) or not min_seconds <= duration <= max_seconds:
                 raise OmniClientError(
-                    f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, got {duration}"
+                    f"MiniMax H3 output duration must be in [{min_seconds:g}, {max_seconds:g}] seconds, got {duration}"
                 )
             requested_frames = int(round(duration * fps))
         elif int(sampling.num_frames or 1) > 1:
             requested_frames = int(sampling.num_frames)
         else:
-            requested_frames = 124 if task == "ref2va" else 209
+            # The oracle's workflow default is 124 for every task; legacy keeps
+            # its own 209 for t2va/fl2va.
+            requested_frames = self.strategy.default_num_frames(task)
             duration = requested_frames / fps
         requested_seconds = requested_frames / fps
-        if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= requested_seconds <= MINIMAX_H3_MAX_OUTPUT_SECONDS:
+        if not min_frames <= requested_frames <= max_frames:
             raise OmniClientError(
-                f"MiniMax H3 output duration must be in {MINIMAX_H3_OUTPUT_SECONDS_RANGE} seconds, "
+                f"MiniMax H3 output duration must be in [{min_seconds:g}, {max_seconds:g}] seconds, "
                 f"got {requested_seconds:.3f}"
             )
         num_frames = minimax_h3_align_frame_count(requested_frames)
@@ -1147,10 +1442,26 @@ class MiniMaxH3Pipeline(
                     videos = []
                     sampled_videos = []
                     for index, item in enumerate(prepared_videos):
-                        sampled = sample_reference_video_frames(
-                            item["prepared_path"],
-                            workdir=str(Path(item["prepared_path"]).parent / f"qwen_frames_{index}"),
-                        )
+                        if item.get("frames") is not None:
+                            # The conditioner reads the same normalized frames
+                            # the VAE does, off one decode, instead of one
+                            # ffmpeg process per sampled frame.
+                            frames = item["frames"]
+                            indices, block_timestamps = sample_conditioner_frames(
+                                int(frames.shape[0]),
+                                fps=float(MINIMAX_H3_FPS),
+                                sample_fps=MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                temporal_patch=MINIMAX_H3_QWEN_TEMPORAL_PATCH,
+                            )
+                            sampled = {
+                                "frames": [frames[position] for position in indices],
+                                "block_timestamps": block_timestamps,
+                            }
+                        else:
+                            sampled = sample_reference_video_frames(
+                                item["prepared_path"],
+                                workdir=str(Path(item["prepared_path"]).parent / f"qwen_frames_{index}"),
+                            )
                         videos.append(np.stack(sampled["frames"]))
                         sampled_videos.append(sampled)
                     vision = self.processor.video_processor(
@@ -1233,6 +1544,11 @@ class MiniMaxH3Pipeline(
             )
 
         if rank < self.text_encoder_tp_size:
+            # Dumped here, not after the encode: `_distribute_encode_inputs`
+            # casts for broadcast, and comparing a post-broadcast tensor against
+            # the oracle's pre-cast one measures the sampling point rather than
+            # the preprocessing.
+            _parity_dump_vision_inputs(vision_kwargs)
             # Distribute the encode inputs from the DiT main rank to the other
             # encoder TP ranks, then run the distributed encode on all of them.
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
@@ -1248,6 +1564,7 @@ class MiniMaxH3Pipeline(
             dtype=torch.long,
             device=self.device,
         )
+        _parity_dump_prompt_embeds(ids, hidden, tags, task=task, strategy=self.strategy)
         return hidden, tags
 
     def _build_text_encoder_group(self, text_encoder_tp_size: int) -> Any:
@@ -1356,6 +1673,21 @@ class MiniMaxH3Pipeline(
         _, rank, _ = _dit_rank_world()
         if rank != 0:
             return None
+        if self.strategy.reference_video_decode_mode == "official_lossless_frames":
+            # Decodes once, losslessly, and hands the normalized frames on in
+            # memory; nothing downstream reads a re-encoded intermediate.
+            return prepare_reference_videos_official(
+                values,
+                target_frame_count=target_frame_count,
+                start_time_seconds=start_time_seconds,
+                audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                # Truncation and the resample chain are separate axes from the
+                # decode itself; a lossless decode that still keeps the whole
+                # reference is a legitimate attribution run, so read them off
+                # the contract rather than assuming the official pairing.
+                truncate_to_target=self.strategy.reference_video_target_truncation,
+                audio_resample_mode=self.strategy.reference_audio_resample_mode,
+            )
         return prepare_reference_videos(
             values,
             target_frame_count=target_frame_count,
@@ -1505,6 +1837,98 @@ class MiniMaxH3Pipeline(
         with self._component_on_device(self.video_vae):
             return self._encode_video_conditions_resident(prepared_videos, count=count)
 
+    def _reference_video_vae_frames(self, item: dict[str, Any]) -> Any:
+        """The frames one prepared reference contributes to the video VAE.
+
+        The VAE consumes ``17 * n + 5`` frames. A reference longer than the clip
+        was already truncated to the clip's own count, which has that form; a
+        reference *shorter* than it keeps whatever the source ran to, and a 2 s
+        24 fps reference is 48 frames. The official encoder snaps such a
+        reference down to 39 before the VAE; handing it 48 pads inside the VAE
+        and produces a different latent temporal extent, i.e. a different packed
+        row count. Legacy has always handed everything over, and keeps doing so
+        — the snap is a contract axis, not a fix applied everywhere.
+        """
+        frames = item["frames"] if item.get("frames") is not None else load_video_frames(item["prepared_path"])
+        if self.strategy.reference_video_vae_frame_snap_mode != "official_vae_chunk":
+            return frames
+        # Slicing, not clamping: below 22 frames the official expression returns
+        # more than there are, and a slice past the end keeps everything, which
+        # is exactly what the reference does.
+        return frames[: vae_chunk_frame_count(int(len(frames)))]
+
+    def _broadcast_prepared_videos(
+        self,
+        prepared_videos: list[dict[str, Any]] | None,
+        *,
+        group: Any,
+        rank: int,
+        chunk_frames: int = 32,
+    ) -> list[dict[str, Any]] | None:
+        """Put rank 0's prepared references on every rank, without pickling pixels.
+
+        ``broadcast_object_list`` is the natural way to hand a list of dicts
+        around, and it was the right size when a prepared reference was a path
+        plus a few scalars. The official decode path carries the normalized
+        frames in memory instead, and pickling those turns a few hundred bytes
+        into up to ~1.1 GB — 15 s at 24 fps on a 1344x768 canvas — which the
+        collective materializes *twice* per rank: once as the serialized byte
+        tensor on the device, once as the unpickled array on the host.
+
+        So the two travel separately: the metadata stays on the object list, and
+        each reference's frames ride a plain ``uint8`` broadcast in bounded
+        chunks. Peak device residency becomes one chunk (~99 MB at 32 frames)
+        regardless of how long the references are, and the pickle copy is gone.
+
+        ``audio`` is dropped rather than chunked: only rank 0 encodes reference
+        soundtracks (``_encode_video_audio_conditions_resident``), so sending it
+        would be paying for something no other rank reads.
+        """
+        box: list[Any] = [None]
+        if rank == 0 and prepared_videos is not None:
+            box[0] = [
+                {
+                    **{key: value for key, value in item.items() if key not in ("frames", "audio")},
+                    "frames_shape": (
+                        None if item.get("frames") is None else tuple(int(size) for size in item["frames"].shape)
+                    ),
+                }
+                for item in prepared_videos
+            ]
+        dist.broadcast_object_list(box, src=0, group=group, device=self.device)
+        metadata = box[0]
+        if metadata is None:
+            return None
+
+        received: list[dict[str, Any]] = []
+        for index, item in enumerate(metadata):
+            # Read, never pop: on rank 0 ``metadata`` *is* the payload that was
+            # just handed to the collective, and mutating it would rewrite what
+            # the send looks like after the fact.
+            shape = item["frames_shape"]
+            frames = None
+            if shape is not None:
+                frames = _broadcast_frame_array(
+                    None if rank != 0 else prepared_videos[index]["frames"],
+                    shape,
+                    group=group,
+                    device=self.device,
+                    chunk_frames=chunk_frames,
+                )
+            if rank == 0:
+                # Rank 0 already holds the real dict, audio included. Returning
+                # the reconstruction instead would silently drop it.
+                received.append(prepared_videos[index])
+                continue
+            received.append(
+                {
+                    **{key: value for key, value in item.items() if key != "frames_shape"},
+                    "frames": frames,
+                    "audio": None,
+                }
+            )
+        return received
+
     def _encode_video_conditions_resident(
         self,
         prepared_videos: list[dict[str, Any]] | None,
@@ -1516,23 +1940,14 @@ class MiniMaxH3Pipeline(
         if distributed_encode:
             # Native tiled encode uses collectives, so every VPP rank must
             # enter each reference encode in the same input order.
-            prepared_videos_list = [prepared_videos]
-            dist.broadcast_object_list(
-                prepared_videos_list,
-                src=0,
-                group=group,
-                device=self.device,
-            )
-            prepared_videos = prepared_videos_list[0]
+            prepared_videos = self._broadcast_prepared_videos(prepared_videos, group=group, rank=rank)
 
         rows = None
         shapes = torch.zeros((count, 3), dtype=torch.long, device=self.device)
         if rank == 0 or distributed_encode:
             if prepared_videos is None or len(prepared_videos) != count:
                 raise ValueError("reference-video preparation is incomplete")
-            encoded = [
-                self.video_vae.encode_video(load_video_frames(item["prepared_path"])) for item in prepared_videos
-            ]
+            encoded = [self.video_vae.encode_video(self._reference_video_vae_frames(item)) for item in prepared_videos]
             rows = torch.cat([item[0] for item in encoded])
             shapes = torch.tensor(
                 [item[1] for item in encoded],
@@ -1578,6 +1993,13 @@ class MiniMaxH3Pipeline(
                 raise ValueError("rank 0 reference-video preparation is incomplete")
             encoded = [
                 self.audio_vae.encode_waveform(
+                    # Already at the VAE's rate under the official contract, so
+                    # `encode_waveform` resamples nothing — that is the point.
+                    item["audio"],
+                    int(item["audio_sample_rate"]),
+                )
+                if item.get("audio") is not None
+                else self.audio_vae.encode_waveform(
                     *load_video_audio(
                         item["original_path"],
                         start_time_seconds=float(item.get("start_time_seconds", 0.0)),
@@ -1600,38 +2022,6 @@ class MiniMaxH3Pipeline(
             _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
             [int(value) for value in lengths.tolist()],
         )
-
-    def _initial_noise(
-        self,
-        *,
-        seed: int,
-        latent_t: int,
-        latent_h: int,
-        latent_w: int,
-        audio_t: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        video_generator = torch.Generator(device="cpu").manual_seed(seed)
-        video = torch.randn(
-            1,
-            24,
-            latent_t,
-            latent_h,
-            latent_w,
-            generator=video_generator,
-            dtype=torch.float32,
-        )
-        video_rows = minimax_h3_patchify_video_latent(
-            video,
-            patch_size=(1, 2, 2),
-        )
-        audio_generator = torch.Generator(device="cpu").manual_seed(seed)
-        audio_rows = torch.randn(
-            audio_t * 2,
-            32,
-            generator=audio_generator,
-            dtype=torch.float32,
-        )
-        return video_rows, audio_rows
 
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled: bool = True):
@@ -1659,6 +2049,7 @@ class MiniMaxH3Pipeline(
         num_steps: int,
         video_shift: float,
         audio_shift: float,
+        base_schedule: Sequence[float] | None,
         visual_condition: torch.Tensor | None,
         visual_condition_shape: tuple[int, int, int] | None,
         audio_condition: torch.Tensor | None,
@@ -1668,8 +2059,28 @@ class MiniMaxH3Pipeline(
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        initial_video, initial_audio = self._initial_noise(
+        # One plan per request. The official contract consumes a single
+        # generator in block order — every visual condition, then the video
+        # latent, then the audio rows — so the conditioning noise has to be
+        # drawn here, before the generated rows, not lazily further down.
+        noise_plan = MiniMaxH3RequestNoisePlan(
+            rng_mode=self.rng_mode,
             seed=seed,
+            condition_shape_mode=self.condition_noise_shape_mode,
+        )
+        condition_shapes = None
+        if visual_condition is not None:
+            condition_shapes = visual_condition_shapes
+            if condition_shapes is None and visual_condition_shape is not None:
+                condition_shapes = [visual_condition_shape]
+            if not condition_shapes:
+                raise ValueError("visual condition shape is missing")
+        condition_noise = (
+            noise_plan.draw_visual_condition_noise(condition_shapes, target_latent_t=latent_t)
+            if condition_shapes
+            else None
+        )
+        initial_video, initial_audio = noise_plan.initial_rows(
             latent_t=latent_t,
             latent_h=latent_h,
             latent_w=latent_w,
@@ -1715,11 +2126,7 @@ class MiniMaxH3Pipeline(
 
         visual_anchor = visual_condition
         if visual_anchor is not None:
-            condition_shapes = visual_condition_shapes
-            if condition_shapes is None and visual_condition_shape is not None:
-                condition_shapes = [visual_condition_shape]
-            if not condition_shapes:
-                raise ValueError("visual condition shape is missing")
+            assert condition_shapes is not None  # resolved with the draw above
             visual_anchor = minimax_h3_imgvid_cond_noise_aug_rows(
                 visual_anchor,
                 condition_shapes=condition_shapes,
@@ -1727,6 +2134,7 @@ class MiniMaxH3Pipeline(
                 imgvid_cond_num_frames=len(condition_shapes),
                 seed=seed,
                 noise_aug=MINIMAX_H3_IMGVID_COND_TIMESTEP,
+                noise=condition_noise,
             )
             full_video = torch.zeros(
                 branch.img_pos.shape[0],
@@ -1760,10 +2168,12 @@ class MiniMaxH3Pipeline(
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
+            base_schedule=base_schedule,
         )
         audio_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=audio_shift,
+            base_schedule=base_schedule,
         )
         transformer = self._transformer_for_task(task)
         # The static DLO plan keeps leading blocks resident only for the
@@ -1931,12 +2341,25 @@ class MiniMaxH3Pipeline(
         if task == "fl2va":
             for item in images:
                 _validate_reference_image(item)
-            prepared_images = [item.resize((width, height), Image.Resampling.LANCZOS) for item in images]
+            # The follower keyframe is cover-cropped under the official
+            # contract and stretched under legacy; see keyframes.py.
+            prepared_images = prepare_fl2va_keyframes(
+                images,
+                width=width,
+                height=height,
+                mode=self.strategy.fl2va_keyframe_resize_mode,
+            )
             keyframe_frame_indices = _resolve_fl2va_keyframe_indices(extra, len(images))
         elif task == "ref2va":
             prepared_images = []
             for item in images:
-                ref_width, ref_height = _reference_image_shape(item)
+                ref_width, ref_height = _reference_image_shape(
+                    item,
+                    aspect_ratio_range=self.strategy.reference_image_aspect_ratio_range,
+                    short_edge=self.strategy.reference_image_short_edge,
+                    no_upscale=self.strategy.reference_image_no_upscale,
+                    max_pixels=self.strategy.reference_image_max_pixels,
+                )
                 prepared_images.append(item.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
             keyframe_frame_indices = None
         else:
@@ -1985,19 +2408,61 @@ class MiniMaxH3Pipeline(
             if raw_audio is not None:
                 validate_reference_audio_files(raw_audio)
             standalone_audios = _load_audios(raw_audio) if raw_audio is not None else []
+            # Admission first, on the clip as submitted: truncating to the
+            # generated duration would otherwise turn a 20-second upload into a
+            # request that passes the 15-second limit.
             validate_reference_audio_waveforms(standalone_audios)
-            condition_labels: list[tuple[str, int]] = []
-            for image_index in range(1, len(prepared_images) + 1):
-                condition_labels.append(("image", image_index))
-            audio_index = 0
-            for video_index, item in enumerate(prepared_videos or (), start=1):
-                if item["input_has_audio"]:
-                    audio_index += 1
-                    condition_labels.append(("audio", audio_index))
-                condition_labels.append(("video", video_index))
-            for _ in standalone_audios:
-                audio_index += 1
-                condition_labels.append(("audio", audio_index))
+            if standalone_audios and self.strategy.reference_audio_target_truncation:
+                # A standalone audio reference is packed exactly like a
+                # reference video's soundtrack, so it is normalized exactly
+                # like one: truncate at the source rate, upmix, resample once.
+                # Skipping this left the official contract contributing an
+                # untruncated clip's worth of audio rows.
+                standalone_audios = normalize_standalone_reference_audios(
+                    standalone_audios,
+                    target_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                    max_duration=reference_audio_max_duration(num_frames, MINIMAX_H3_FPS),
+                    resample_mode=self.strategy.reference_audio_resample_mode,
+                )
+            # The bucketed entry cannot express an arbitrary interleave, so the
+            # order is derived — named, recorded and testable rather than
+            # implied by the order of three loops. See ordered_references.py.
+            #
+            # ``has_audio`` and not ``prepared_videos``: preparation returns
+            # None off rank 0, so reading the soundtrack flags from it would
+            # leave every non-zero rank believing the request carried no video
+            # at all — the order would then be rejected there while rank 0
+            # proceeded. ``has_audio`` is the broadcast copy and agrees on
+            # every rank.
+            requested_order = multi_modal_data.get("reference_order")
+            if requested_order and self.strategy.reference_order_mode != MINIMAX_H3_ORDER_REQUEST:
+                # Refuse rather than drop it. An instance serving the legacy
+                # contract rebuilds the order from the buckets, so honouring a
+                # caller's interleave here would mean serving an order this
+                # contract does not carry; ignoring it silently would mean the
+                # caller believing it had been honoured.
+                raise OmniClientError(
+                    "this instance serves the legacy reference order "
+                    "(reference_order_mode=legacy_bucket_canonicalization) and cannot honour an explicit "
+                    "reference_order; deploy minimax_h3_inference_contract=official_diffusers_v1 to use one"
+                )
+            if requested_order:
+                # The caller supplied an order; it is the contract.
+                reference_order = ordered_references_from_request(
+                    requested_order,
+                    num_images=len(prepared_images),
+                    video_has_audio=has_audio,
+                    num_audios=len(standalone_audios),
+                )
+                reference_order_mode = MINIMAX_H3_ORDER_REQUEST
+            else:
+                reference_order = canonical_order_from_buckets(
+                    num_images=len(prepared_images),
+                    video_has_audio=has_audio,
+                    num_audios=len(standalone_audios),
+                )
+                reference_order_mode = MINIMAX_H3_ORDER_BUCKETS
+            condition_labels = reference_condition_labels(reference_order)
 
             report_phase(PHASE_ENCODE)
             text_embeddings, text_tags = self.encode_prompt(
@@ -2029,31 +2494,30 @@ class MiniMaxH3Pipeline(
                 ]
                 audio_condition = torch.cat(audio_parts) if audio_parts else None
                 audio_lengths = embedded_audio_lengths + external_audio_lengths
-                ref_blocks = []
-                image_shapes = visual_shapes[: len(prepared_images)]
-                video_shapes = visual_shapes[len(prepared_images) :]
-                for shape in image_shapes:
-                    ref_blocks.append(
-                        {
-                            "kind": "image",
-                            "latent_h": shape[1],
-                            "latent_w": shape[2],
-                        }
-                    )
-                audio_iterator = iter(embedded_audio_lengths)
-                for shape, contributes_audio in zip(video_shapes, has_audio, strict=True):
-                    ref_audio = next(audio_iterator) if contributes_audio else 0
-                    ref_blocks.append(
-                        {
-                            "kind": "video_audio" if ref_audio else "video",
-                            "ref_audio_t": ref_audio,
-                            "latent_t": shape[0],
-                            "latent_h": shape[1],
-                            "latent_w": shape[2],
-                        }
-                    )
-                for ref_audio_t in external_audio_lengths:
-                    ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t})
+                # Everything above is in bucket order, because that is the
+                # order the VAEs have to be driven in. Everything below is in
+                # the request's reference order, because that is the order the
+                # prompt labels, the packed layout and the rotary clock use.
+                # The two are the same permutation for a bucketed request and
+                # differ for an interleaved one; leaving the rows behind while
+                # only the labels moved is what made a non-canonical order
+                # silently show the model the wrong reference.
+                (
+                    visual_condition,
+                    visual_shapes,
+                    audio_condition,
+                    audio_lengths,
+                    ref_blocks,
+                ) = _order_reference_conditions(
+                    reference_order,
+                    visual_condition=visual_condition,
+                    visual_shapes=visual_shapes,
+                    num_images=len(prepared_images),
+                    audio_condition=audio_condition,
+                    audio_lengths=audio_lengths,
+                    video_has_audio=has_audio,
+                )
+                _log_reference_order(reference_order, reference_order_mode)
             elif standalone_audios:
                 raise OmniClientError("standalone audio references require a Ref2VA visual reference")
 
@@ -2068,7 +2532,15 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        num_steps = int(sampling.num_inference_steps or 50)
+        sigma_schedule = self._base_schedule_for_task(task)
+        # Turbo checkpoints recommend the NFE they were distilled on, but the
+        # official harness permits other step counts (for example Turbo4 at 8
+        # NFE).  Base checkpoints default to 20 NFE; all variants remain
+        # request-configurable.
+        num_steps, base_schedule = _resolve_minimax_h3_schedule(
+            sigma_schedule,
+            sampling.num_inference_steps,
+        )
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         quality_plan = self._quality_policy.resolve(
@@ -2096,6 +2568,7 @@ class MiniMaxH3Pipeline(
                 num_steps=num_steps,
                 video_shift=video_shift,
                 audio_shift=audio_shift,
+                base_schedule=base_schedule,
                 visual_condition=visual_condition,
                 visual_condition_shape=visual_shape,
                 audio_condition=audio_condition,

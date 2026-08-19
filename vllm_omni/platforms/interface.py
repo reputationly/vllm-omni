@@ -67,7 +67,19 @@ class OmniPlatform(Platform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        raise NotImplementedError
+        """Directory searched first for ``<model_type>.yaml``.
+
+        Answering this needs no accelerator: it is a path lookup on the source
+        tree, and ``resolve_model_config_path`` already falls through to this
+        same ``vllm_omni/deploy`` when the device-specific directory holds no
+        matching file. CUDA, ROCm, NPU and MUSA all return exactly that; only
+        XPU ships its own directory. So the base answer is the fall-through
+        rather than ``NotImplementedError``, which used to make config
+        resolution — a CPU-side, pre-device concern — unusable under
+        ``UnspecifiedOmniPlatform`` (no accelerator visible: CPU-only test
+        containers, doc tooling, config validation).
+        """
+        return "vllm_omni/deploy"
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:

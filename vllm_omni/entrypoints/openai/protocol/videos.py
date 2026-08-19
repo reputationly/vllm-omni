@@ -95,6 +95,30 @@ class UrlAudioReference(BaseModel):
 AudioReference = UrlAudioReference
 
 
+class ReferenceOrderEntry(BaseModel):
+    """One ``{type, index}`` pair of a semantic reference order.
+
+    Typed rather than a bare ``dict[str, Any]`` because of where it is read.
+    ``VideoTaskRequest`` allows extras, so a ``/v1/tasks/video/`` caller can put
+    ``reference_order`` in the body directly and it rides through untouched; a
+    loose dict then accepts a missing key, a misspelled modality or a
+    non-integer index, and the first thing that looks is
+    ``OmniOpenAIServingVideo`` — inside the background job, after ``reserve()``
+    has already spent a queue slot. The caller sees PENDING and then a KeyError
+    on the task record instead of the 400 the route promises for everything
+    knowable without a GPU.
+
+    Validating here moves that failure into ``to_video_request()``, whose
+    ``ValidationError`` the route already turns into a 400, and covers the
+    synchronous ``/v1/videos`` surface at the same time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["image", "video", "audio"] = Field(description="Reference modality.")
+    index: int = Field(ge=0, description="0-based position within that modality's bucket.")
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -108,6 +132,16 @@ class VideoGenerationRequest(BaseModel):
         description="Model to use (optional, uses server's configured model if omitted)",
     )
     prompt: str = Field(..., description="Text description of the desired video(s)")
+    reference_order: list[ReferenceOrderEntry] | None = Field(
+        default=None,
+        description=(
+            "Reference order as ``{type, index}`` per entry, for models where the order is "
+            "semantic. Derived by the route from whatever ordered list the caller sent — the "
+            "task route's `references`, or the `/v1/videos` multipart `input_references` "
+            "uploads; the media itself still travels in modality buckets, so only the order "
+            "rides here."
+        ),
+    )
     seconds: SecondStr | None = Field(
         default=None,
         description="Clip duration in seconds (OpenAI-compatible, e.g., 4, 8, 12)",

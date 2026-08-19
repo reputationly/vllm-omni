@@ -1,14 +1,18 @@
-# MiniMax-H3 Ref2VA (BF16) — A100 PCIE 40G x4
+# MiniMax-H3 Ref2VA Base/Turbo (BF16) — A100 PCIE 40G x4
 #
 # Ref2VA uses a different DiT partition from FL2VA.  The currently available
-# official weights are BF16 at:
-#   /nfs-data/models/MiniMax-H3/Ref2VA
+# official weights are BF16 at the persistent model mount:
+#   /nfs-models/wuhanjisuan894/models/MiniMax-H3/Ref2VA
 # Do not point this profile at MiniMax-H3-FL2VA-INT8: that checkpoint only
 # contains the FL2VA transformer and cannot serve reference-video tasks.
 #
-# Environment variables and startup timeouts intentionally remain in the
-# launch command; see minimax_h3_a100_40g.yaml for why they cannot be carried
-# reliably by a stage deploy file.
+# The model path selects Base or Turbo4.  The checkpoint metadata selects the
+# default NFE (20 or 4), so this profile deliberately does not pin a step count.
+#
+# The Ref2VA product profile preserves each reference image's aspect ratio,
+# avoids interpolation-only upscaling, and caps one image at the maximum H3
+# output canvas area.  These are stage-scoped because the serving capability
+# probe and worker must resolve exactly the same geometry.
 pipeline: minimax_h3_dit
 async_chunk: false
 trust_remote_code: true
@@ -20,6 +24,12 @@ stages:
     task_type: ref2va
     max_num_seqs: 1
     devices: "0,1,2,3"
+
+    env:
+      VLLM_OMNI_H3_INFERENCE_CONTRACT: legacy
+      VLLM_OMNI_H3_REF_IMAGE_GEOMETRY: official_short_edge
+      VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE: "1"
+      VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS: "1032192"
 
     enable_cpu_offload: true
     vae_use_tiling: true
@@ -47,6 +57,3 @@ stages:
       use_hsdp: false
       hsdp_shard_size: -1
       hsdp_replicate_size: 1
-
-    default_sampling_params:
-      num_inference_steps: 20

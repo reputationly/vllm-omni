@@ -722,18 +722,31 @@ def stage_runtime_setup(stage_id: int, runtime_cfg: Any) -> Generator[None, None
         yield
 
 
-@contextmanager
-def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
-    """Apply per-stage ``runtime.env`` for the duration of the context."""
+def stage_runtime_env_mapping(stage_id: int, runtime_cfg: Any) -> dict[str, str]:
+    """A stage's ``runtime.env`` as a plain ``str -> str`` mapping.
+
+    Split out of ``stage_runtime_env`` rather than re-derived, because the
+    mapping now has a second reader: a stage-scoped variable is invisible to the
+    orchestrator process, so anything outside the stage that must answer for
+    what the stage was configured with has to be handed this mapping. Two
+    parsers of one config surface is exactly how the two sides come to disagree.
+
+    Args:
+        stage_id: For the diagnostic on an unusable ``env`` value.
+        runtime_cfg: The stage's ``runtime`` section, in any of the shapes a
+            deploy config arrives in (``None``, dict, OmegaConf node, dataclass).
+
+    Returns:
+        The variables to apply, empty when the stage declares none.
+    """
     if runtime_cfg is None:
-        runtime_cfg = {}
-    elif not isinstance(runtime_cfg, dict):
+        return {}
+    if not isinstance(runtime_cfg, dict):
         runtime_cfg = cast(dict[str, Any], _to_dict(runtime_cfg))
 
     raw_env = runtime_cfg.get("env")
     if raw_env is None:
-        yield
-        return
+        return {}
     if isinstance(raw_env, dict):
         runtime_env = cast(dict[str, Any], raw_env)
     else:
@@ -744,14 +757,22 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
                 stage_id,
                 type(raw_env).__name__,
             )
-            yield
-            return
+            return {}
+    return {str(key): str(value) for key, value in runtime_env.items()}
+
+
+@contextmanager
+def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` for the duration of the context."""
+    runtime_env = stage_runtime_env_mapping(stage_id, runtime_cfg)
+    if not runtime_env:
+        yield
+        return
 
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
+    for env_key, value in runtime_env.items():
         previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
+        os.environ[env_key] = value
 
     if previous_env:
         logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))

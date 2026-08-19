@@ -397,6 +397,13 @@ class StageDeployConfig:
     diffusion_attention_backend: str | None = None
     diffusion_attention_config: dict[str, Any] | None = None
 
+    # MiniMax-H3 contract selection. Two orthogonal dimensions kept apart on
+    # purpose: the inference contract decides model semantics (RNG, reference
+    # order, geometry, defaults), the admission policy decides what media the
+    # deployment accepts. See models/minimax_h3/strategy.py.
+    minimax_h3_inference_contract: str | None = None
+    minimax_h3_admission_policy: str | None = None
+
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
@@ -864,6 +871,15 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
+        # ``env`` is reserved out of the loop above because it configures the
+        # stage *process*, not the engine. A diffusion stage needs it as an
+        # engine arg all the same: the variables are applied while the stage
+        # starts and restored afterwards, so a capability probe running anywhere
+        # else — the HTTP serving layer above all — cannot otherwise see which
+        # contract this stage was configured with, and answers for the default
+        # while the worker runs the configured one.
+        if ps.execution_type == StageExecutionType.DIFFUSION and ds.env:
+            engine_args["diffusion_runtime_environ"] = {str(k): str(v) for k, v in dict(ds.env).items()}
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
