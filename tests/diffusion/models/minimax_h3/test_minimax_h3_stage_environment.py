@@ -112,6 +112,17 @@ def test_a_stage_scoped_geometry_selection_reaches_the_probe():
     stage = _config(stage_env={_GEOMETRY: "official_short_edge"})
     assert reference_images_bind_output_canvas("MiniMaxH3Pipeline", stage) is False
 
+    turbo = _config(stage_env={_GEOMETRY: "match"})
+    assert reference_images_bind_output_canvas("MiniMaxH3Pipeline", turbo) is False
+
+    fixed = _config(
+        stage_env={
+            _GEOMETRY: "fixed_area",
+            "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+        }
+    )
+    assert reference_images_bind_output_canvas("MiniMaxH3Pipeline", fixed) is False
+
 
 def test_an_unusable_stage_value_does_not_become_a_serving_side_rejection():
     """It fails where it is applied, in the pipeline, with the pipeline's message."""

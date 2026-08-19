@@ -111,7 +111,37 @@ audio_vae / processor / tokenizer / model_index.json`。
 > 所以 BF16 烘完可直接起。代价是显存：BF16 权重 62 GB，FL2VA Turbo8 实测 480p/209 帧
 > 29.8 GiB/卡、768p/345 帧 36.66 GiB/卡（余量仅 2.8 GiB）。排不下再考虑量化。
 
-### 2.3 在 GPUStack 上起实例
+### 2.3 验证融合并组装 partition
+
+正式目录必须由组装工具生成，并传入**真实 LoRA 文件**；只写一个来源文件名不再允许：
+
+```bash
+python tools/minimax_h3_turbo/assemble_distilled_partition.py \
+  --base-partition <MiniMax-H3/FL2VA 或 Ref2VA> \
+  --fused-transformer <已烘焙目录>/transformer \
+  --output <正式的-vLLM目录> \
+  --num-inference-steps <4或8> \
+  --video-shift <6或12> \
+  --audio-shift 3 \
+  --source-lora <LoRA文件名> \
+  --lora-checkpoint <LoRA绝对路径>
+```
+
+组装前会重新读取 checkpoint 的 SHA256、rank 和 alpha，并对 208 个 native target
+逐个取确定性行，覆盖全部 312 对 A/B 因子。只有采样值逐个满足
+`BF16(base + (alpha/rank) × B@A)` 才创建输出目录。错误倍率、错误基座、错误 LoRA、
+`source_lora` 名称错配或缺失 alpha 都会失败，不能再生成“能加载但系统性偏移”的正式模型。
+
+通过后，`model_index.json` 的 `_minimax_h3.distilled` 会记录：
+
+- `source_lora_sha256 / lora_rank / lora_alpha / effective_lora_scale`；
+- 验证方法、目标数、因子对数、采样值数、变化值数和最大误差；
+- base/fused 的 index SHA256 与采样张量 SHA256。
+
+旧 partition 可用 `tools/minimax_h3_turbo/lora_provenance.py --write-model-index`
+在相同验证通过后原子回填；不得手工补数字。
+
+### 2.4 在 GPUStack 上起实例
 
 **模型路径**：填 §2.2 的产物目录。
 
@@ -230,6 +260,8 @@ ref2v 这份的烘焙自检：`patched 208 tensors`，`||delta||/||W||` 中位�
 |---|---|
 | 下载脚本（含清单与结构校验） | `scripts/download_minimax_h3_turbo_lora.sh` ⚠️ 见下 |
 | 烘焙工具 | `tools/minimax_h3/bake_turbo_lora.py` |
+| 融合验真与来源回填 | `tools/minimax_h3_turbo/lora_provenance.py` |
+| Partition 强约束组装 | `tools/minimax_h3_turbo/assemble_distilled_partition.py` |
 | 生产部署档（env / flag / 为什么是这个值） | `docs/实验报告/MiniMax-H3-GPUStack-生产部署档.md` |
 | Turbo8 压测数据 | `docs/实验报告/vLLM-Omni-MiniMax-H3-Turbo8-480p-768p-压测对比报告.md` |
 | 镜像构建（deploy-configs 固化位置） | `docker/Dockerfile.cuda` |

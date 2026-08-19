@@ -26,6 +26,10 @@ Ref2VA 暂无独立的上游 Turbo8，因此不是六个实例。
 决定，而请求中的显式值仍可覆盖它。这也是三个 FL2VA 复用一份 YAML、两个
 Ref2VA 复用一份 YAML 的原因。
 
+FL2VA YAML 还独立固定 `VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE=official_cover_crop`：首帧
+决定画布，异比例尾帧按官方方式保持比例后居中裁剪，不再直接拉伸；这不会启用完整
+`official_diffusers_v1` contract，也不会改变步数、RNG 或 Ref2VA。
+
 ## 3. GPUStack 页面逐个新建
 
 在“模型”→“部署模型”中选本地路径，然后对表中每一行各建一个模型。
@@ -78,8 +82,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
 灰度期可再加 `VLLM_OMNI_H3_LOG_STEP_MEMORY=1`；稳定后改为 `0` 或删除，避免长期打印
-每步显存。Ref2VA 的保比例、不无效放大和面积上限已放在 Ref2VA YAML 的 stage
-env 中，新版引擎会将它透传给 worker，不需要在页面重复配。
+每步显存。Ref2VA YAML 保留 Base 的固定面积策略；选择带 `distilled` 元数据的 Ref
+Turbo 模型时，引擎自动切到 Turbo `match`，让参考图像素预算跟随每次请求的输出画布。
+两种策略都保持参考图比例，且不需要在 GPUStack 页面重复配置。
 
 GPUStack worker 进程的管理员环境变量（不是模型 env）：
 
@@ -125,6 +130,9 @@ new-api 只在请求没有 `num_inference_steps` 时补 `defaultSteps`；用户�
 2. 运行 `.github/workflows/build-arm64.yml`，保留 CI 生成的不可变 tag 与 digest。
 3. 在 A100 上从该镜像直接启动，不挂载本地源码或 deploy-config overlay。
 4. 五个实例分别核对分区和默认 NFE：Base 20、Turbo4 4、Turbo8 8。
+5. 三个 Turbo 实例的 `model_index.json` 必须同时含有 `source_lora_sha256`、
+   `lora_rank`、`lora_alpha`、`effective_lora_scale` 和 `fusion_verification`；缺一项都说明
+   该目录没有经过当前强校验组装流程，不应部署。
 5. 先灰度一个 FL2VA 和一个 Ref2VA，健康检查 `/ready` 为 200，再建齐五个模型。
 
 启动日志必须能确认 `partition=fl2va/ref2va`、TP4、text encoder TP4、VAE patch4 和

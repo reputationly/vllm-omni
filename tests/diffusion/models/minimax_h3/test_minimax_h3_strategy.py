@@ -62,6 +62,33 @@ def test_official_contract_resolves_every_field_to_the_oracle():
     }
 
 
+def test_fl2va_keyframe_resize_can_match_official_without_moving_the_contract():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    strategy = resolve_strategy(
+        inference_contract="legacy",
+        admission_policy=None,
+        environ={"VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE": "official_cover_crop"},
+    )
+
+    assert strategy.name == "legacy"
+    assert strategy.fl2va_keyframe_resize_mode == "official_cover_crop"
+    assert strategy.rng_mode == "legacy"
+    assert strategy.default_num_frames("fl2va") == 209
+    assert strategy.reference_image_geometry_mode == "legacy_canvas_prestretch"
+
+
+def test_unknown_fl2va_keyframe_resize_mode_fails_at_startup():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    with pytest.raises(ValueError, match="VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE"):
+        resolve_strategy(
+            inference_contract="legacy",
+            admission_policy=None,
+            environ={"VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE": "stretch_if_convenient"},
+        )
+
+
 def test_unknown_contract_fails_loudly_rather_than_falling_back():
     from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
 
@@ -381,6 +408,25 @@ def test_dropping_the_prestretch_widens_the_admission_envelope():
     low, high = preserved.reference_image_aspect_ratio_range
     assert low < 1664 / 656 < high
 
+    matched = resolve_strategy(
+        inference_contract="legacy",
+        admission_policy=None,
+        environ={"VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "match"},
+    )
+    assert matched.reference_image_geometry_mode == "match"
+    assert matched.reference_image_aspect_ratio_range == (0.25, 4.0)
+
+    fixed = resolve_strategy(
+        inference_contract="legacy",
+        admission_policy=None,
+        environ={
+            "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area",
+            "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+        },
+    )
+    assert fixed.reference_image_geometry_mode == "fixed_area"
+    assert fixed.reference_image_aspect_ratio_range == (0.25, 4.0)
+
     # Explicitly asking for the legacy geometry keeps the legacy envelope.
     explicit = resolve_strategy(
         inference_contract="legacy",
@@ -388,6 +434,17 @@ def test_dropping_the_prestretch_widens_the_admission_envelope():
         environ={"VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "legacy_canvas_prestretch"},
     )
     assert explicit.reference_image_aspect_ratio_range == (0.4, 2.5)
+
+
+def test_fixed_area_requires_an_explicit_positive_budget():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    with pytest.raises(ValueError, match="REF_IMAGE_MAX_PIXELS"):
+        resolve_strategy(
+            inference_contract="legacy",
+            admission_policy=None,
+            environ={"VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area"},
+        )
 
 
 def test_the_legacy_short_edge_knob_is_not_shadowed_by_the_strategy():

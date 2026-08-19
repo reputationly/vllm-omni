@@ -390,6 +390,85 @@ def test_area_cap_defaults_off(monkeypatch):
     assert _shape(2560, 1024) == (5120, 2048)
 
 
+# --------------------------------------------------------- Turbo `match` policy
+
+
+@pytest.mark.parametrize(
+    ("target_width", "target_height", "expected"),
+    [
+        (832, 480, (992, 384)),
+        (864, 480, (1024, 416)),
+        (1344, 768, (1632, 640)),
+    ],
+)
+def test_match_follows_each_request_canvas(target_width, target_height, expected):
+    """Pin ModelTC's formula and nearest-32 rounding at common product tiers."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    actual = _reference_image_shape(
+        _SizeOnlyImage(1664, 656),
+        aspect_ratio_range=(0.25, 4.0),
+        target_canvas=(target_width, target_height),
+    )
+    assert actual == expected
+
+
+def test_match_never_intentionally_upscales_a_small_reference():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    assert _reference_image_shape(
+        _SizeOnlyImage(512, 512),
+        aspect_ratio_range=(0.25, 4.0),
+        target_canvas=(1344, 768),
+    ) == (512, 512)
+
+
+def test_match_480p_is_not_the_old_fixed_768p_cap():
+    """The regression this change fixes: these policies coincide only at 768p."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    image = _SizeOnlyImage(1664, 656)
+    matched = _reference_image_shape(
+        image,
+        aspect_ratio_range=(0.25, 4.0),
+        target_canvas=(832, 480),
+    )
+    fixed = _reference_image_shape(
+        image,
+        aspect_ratio_range=(0.25, 4.0),
+        short_edge=2048,
+        no_upscale=True,
+        max_pixels=768 * 1344,
+    )
+    assert matched == (992, 384)
+    assert fixed == (1600, 608)
+    assert _rows(*fixed) > 2.5 * _rows(*matched)
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(256, 256), (512, 512), (1024, 1024), (1664, 656), (2560, 1024), (1024, 2560)],
+)
+def test_fixed_area_is_behaviorally_identical_to_the_previous_base_profile(width, height):
+    """Remove the redundant 2048 term without changing Base image geometry."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    image = _SizeOnlyImage(width, height)
+    previous = _reference_image_shape(
+        image,
+        aspect_ratio_range=(0.25, 4.0),
+        short_edge=2048,
+        no_upscale=True,
+        max_pixels=768 * 1344,
+    )
+    fixed_area = _reference_image_shape(
+        image,
+        aspect_ratio_range=(0.25, 4.0),
+        fixed_area_pixels=768 * 1344,
+    )
+    assert fixed_area == previous
+
+
 def test_worst_case_nine_images_within_validated_envelope(monkeypatch):
     """9 张最坏比例的图，封顶后总 rows 回到已验证包络之内。
 

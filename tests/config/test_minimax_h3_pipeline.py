@@ -198,8 +198,7 @@ def test_ref2va_a100_profile_pins_partition_and_bf16_runtime():
     assert stage.default_sampling_params is None
     assert stage.env == {
         "VLLM_OMNI_H3_INFERENCE_CONTRACT": "legacy",
-        "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "official_short_edge",
-        "VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE": "1",
+        "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area",
         "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
     }
     assert merged_stage.yaml_engine_args["diffusion_runtime_environ"] == stage.env
@@ -212,7 +211,10 @@ def test_ref2va_a100_profile_pins_partition_and_bf16_runtime():
 
     from PIL import Image
 
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _reference_image_shape_for_strategy,
+        _reference_image_strategy_for_release,
+    )
     from vllm_omni.diffusion.models.minimax_h3.strategy import contract_environ, resolve_strategy
 
     od_config = SimpleNamespace(diffusion_runtime_environ=merged_stage.yaml_engine_args["diffusion_runtime_environ"])
@@ -221,15 +223,56 @@ def test_ref2va_a100_profile_pins_partition_and_bf16_runtime():
         admission_policy=None,
         environ=contract_environ(od_config),
     )
-    assert strategy.reference_image_no_upscale is True
+    assert strategy.reference_image_geometry_mode == "fixed_area"
+    assert strategy.reference_image_no_upscale is False
     assert strategy.reference_image_max_pixels == 768 * 1344
-    assert _reference_image_shape(
-        Image.new("RGB", (1024, 1024)),
-        aspect_ratio_range=strategy.reference_image_aspect_ratio_range,
-        short_edge=strategy.reference_image_short_edge,
-        no_upscale=strategy.reference_image_no_upscale,
-        max_pixels=strategy.reference_image_max_pixels,
-    ) == (992, 992)
+    # The Base model keeps the pre-existing fixed-area production behavior.
+    base_shape = _reference_image_shape_for_strategy(
+        Image.new("RGB", (1664, 656)),
+        strategy=strategy,
+        output_width=832,
+        output_height=480,
+    )
+    assert base_shape == (1600, 608)
+
+    # The same YAML becomes true request-level `match` only when the selected
+    # Ref partition carries Turbo's distilled metadata.
+    turbo_strategy = _reference_image_strategy_for_release(
+        strategy,
+        partition="ref2va",
+        release={"partition": "ref2va", "distilled": {"num_inference_steps": 4}},
+    )
+    assert turbo_strategy.reference_image_geometry_mode == "match"
+    assert turbo_strategy.reference_image_max_pixels == 0
+    assert _reference_image_shape_for_strategy(
+        Image.new("RGB", (1664, 656)),
+        strategy=turbo_strategy,
+        output_width=832,
+        output_height=480,
+    ) == (992, 384)
+    assert _reference_image_shape_for_strategy(
+        Image.new("RGB", (1664, 656)),
+        strategy=turbo_strategy,
+        output_width=1344,
+        output_height=768,
+    ) == (1632, 640)
+
+    assert (
+        _reference_image_strategy_for_release(
+            strategy,
+            partition="ref2va",
+            release={"partition": "ref2va"},
+        ).reference_image_geometry_mode
+        == "fixed_area"
+    )
+    assert (
+        _reference_image_strategy_for_release(
+            strategy,
+            partition="fl2va",
+            release={"partition": "fl2va", "distilled": {"num_inference_steps": 4}},
+        ).reference_image_geometry_mode
+        == "fixed_area"
+    )
 
     with (
         patch.object(StageConfigFactory, "get_hf_config", return_value=None),
@@ -258,6 +301,23 @@ def test_fl2va_bf16_profile_uses_partition_metadata_for_base_and_turbo_defaults(
     assert stage.default_sampling_params is None
     assert merged_stage.yaml_engine_args["task_type"] == "fl2va"
     assert merged_stage.yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 4
+    assert stage.env == {"VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE": "official_cover_crop"}
+    assert merged_stage.yaml_engine_args["diffusion_runtime_environ"] == stage.env
+
+    # The production profile selects only the official FL2VA follower geometry;
+    # it must not silently opt Base/Turbo into the full Diffusers contract.
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.strategy import contract_environ, resolve_strategy
+
+    strategy = resolve_strategy(
+        inference_contract=None,
+        admission_policy=None,
+        environ=contract_environ(SimpleNamespace(diffusion_runtime_environ=stage.env)),
+    )
+    assert strategy.name == "legacy"
+    assert strategy.fl2va_keyframe_resize_mode == "official_cover_crop"
+    assert strategy.rng_mode == "legacy"
 
 
 def test_ref2va_w8a8_profile_uses_checkpoint_quantization_only():
