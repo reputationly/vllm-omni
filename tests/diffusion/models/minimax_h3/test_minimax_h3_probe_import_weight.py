@@ -77,6 +77,39 @@ def test_the_capability_probe_does_not_import_the_pipeline():
     # actually keep out, and it is the part that costs seconds.
 
 
+def test_the_capability_probe_does_not_initialize_the_scheduler_package():
+    """Frame-count planning must not pull request schedulers into HTTP.
+
+    Importing ``sched.sigma_schedule`` looks light when that file is read in
+    isolation, but Python executes ``sched/__init__.py`` first; that module
+    eagerly imports the request and step schedulers. The probe only needs the
+    integer frame-alignment helper, so none of that package belongs here.
+    """
+    reported = _in_a_fresh_interpreter(
+        """
+        import sys
+        from vllm_omni.diffusion.model_metadata import reference_video_decode_frame_cap
+
+        class _Config:
+            minimax_h3_inference_contract = "official_diffusers_v1"
+            minimax_h3_admission_policy = None
+            diffusion_runtime_environ = None
+
+        assert reference_video_decode_frame_cap(
+            "MiniMaxH3Pipeline", _Config(), num_frames=120
+        ) == 124
+        print("::sched", "vllm_omni.diffusion.sched" in sys.modules)
+        print(
+            "::request_scheduler",
+            "vllm_omni.diffusion.sched.request_scheduler" in sys.modules,
+        )
+        """
+    )
+
+    assert "::sched False" in reported
+    assert "::request_scheduler False" in reported
+
+
 def test_the_package_still_exports_the_pipeline_to_whoever_asks_for_it():
     """Laziness must not become a missing name — the registry imports by attribute."""
     reported = _in_a_fresh_interpreter(

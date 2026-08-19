@@ -92,16 +92,19 @@ def test_sigma_schedule_matches_official(oracle):
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
     for case in oracle["scheduler"]:
+        # The fixture records the raw Diffusers scheduler API, where the
+        # argument is the number of sigma grid points.  vLLM-Omni's public
+        # parameter is NFE, matching the Turbo harness, so it is one smaller.
+        requested_nfe = case["num_inference_steps"] - 1
         sigmas = torch.tensor(
-            minimax_h3_time_shift_sigmas(num_steps=case["num_inference_steps"], shift_scale=case["shift"]),
+            minimax_h3_time_shift_sigmas(num_steps=requested_nfe, shift_scale=case["shift"]),
             dtype=torch.float32,
         )
         expected = _as_tensor(case["sigmas"])
         assert torch.equal(sigmas, expected), (
             f"shift={case['shift']} steps={case['num_inference_steps']}: sigma grid differs"
         )
-        # N sigma nodes drive N-1 forward passes, exposed as t = 1 - sigma.
-        assert sigmas.numel() - 1 == case["num_forward_passes"]
+        assert sigmas.numel() - 1 == requested_nfe == case["num_forward_passes"]
         torch.testing.assert_close(1.0 - sigmas[:-1], _as_tensor(case["timesteps"]), rtol=0, atol=0)
 
 

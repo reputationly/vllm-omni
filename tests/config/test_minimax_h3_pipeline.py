@@ -132,6 +132,7 @@ def test_deploy_yaml_pipeline_field_selects_h3():
     [
         (Path(get_deploy_config_path("minimax_h3_dit.yaml")), 1, 1),
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_a100_40g.yaml", 4, 4),
+        (_REPO_ROOT / "deploy-configs" / "minimax_h3_fl2va_bf16_a100_40g.yaml", 4, 4),
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_bf16_a100_40g.yaml", 4, 4),
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_w8a8_a100_40g.yaml", 4, 4),
     ],
@@ -194,6 +195,41 @@ def test_ref2va_a100_profile_pins_partition_and_bf16_runtime():
     assert stage.enable_cpu_offload is True
     assert stage.vae_use_tiling is True
     assert stage.max_num_seqs == 1
+    assert stage.default_sampling_params is None
+    assert stage.env == {
+        "VLLM_OMNI_H3_INFERENCE_CONTRACT": "legacy",
+        "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "official_short_edge",
+        "VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE": "1",
+        "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+    }
+    assert merged_stage.yaml_engine_args["diffusion_runtime_environ"] == stage.env
+
+    # Transport is not enough: these values used to arrive here and then die
+    # because the shape helpers re-read the worker process's bare os.environ.
+    # Resolve the actual carried mapping and prove that the production profile
+    # changes the geometry it was written to bound.
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+    from vllm_omni.diffusion.models.minimax_h3.strategy import contract_environ, resolve_strategy
+
+    od_config = SimpleNamespace(diffusion_runtime_environ=merged_stage.yaml_engine_args["diffusion_runtime_environ"])
+    strategy = resolve_strategy(
+        inference_contract=None,
+        admission_policy=None,
+        environ=contract_environ(od_config),
+    )
+    assert strategy.reference_image_no_upscale is True
+    assert strategy.reference_image_max_pixels == 768 * 1344
+    assert _reference_image_shape(
+        Image.new("RGB", (1024, 1024)),
+        aspect_ratio_range=strategy.reference_image_aspect_ratio_range,
+        short_edge=strategy.reference_image_short_edge,
+        no_upscale=strategy.reference_image_no_upscale,
+        max_pixels=strategy.reference_image_max_pixels,
+    ) == (992, 992)
 
     with (
         patch.object(StageConfigFactory, "get_hf_config", return_value=None),
@@ -210,6 +246,18 @@ def test_ref2va_a100_profile_pins_partition_and_bf16_runtime():
 
     assert pipeline is not None
     assert pipeline.model_type == _PIPELINE_KEY
+
+
+def test_fl2va_bf16_profile_uses_partition_metadata_for_base_and_turbo_defaults():
+    deploy_path = _REPO_ROOT / "deploy-configs" / "minimax_h3_fl2va_bf16_a100_40g.yaml"
+    deploy = load_deploy_config(deploy_path)
+    (stage,) = deploy.stages
+    (merged_stage,) = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+
+    assert stage.engine_extras["task_type"] == "fl2va"
+    assert stage.default_sampling_params is None
+    assert merged_stage.yaml_engine_args["task_type"] == "fl2va"
+    assert merged_stage.yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 4
 
 
 def test_ref2va_w8a8_profile_uses_checkpoint_quantization_only():

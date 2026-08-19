@@ -342,6 +342,21 @@ def test_the_reader_skips_leading_frames_and_uprights_them():
     assert np.array_equal(np.stack([frame for _, frame in read]), np.rot90(frames[2:], k=-1, axes=(1, 2)))
 
 
+def test_the_reader_applies_offsets_relative_to_a_nonzero_container_pts():
+    """The request offset is relative even though yielded timestamps are absolute."""
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import ReferenceVideoReader
+
+    frames = _source_frames(6, height=4, width=8)
+    origin = 5.0
+    times = [origin + index / 25.0 for index in range(len(frames))]
+    container, _ = _fake_container(frames, rate=25.0, times=times)
+
+    read = list(ReferenceVideoReader(object(), container).iter_frames(start_seconds=2 / 25.0))
+
+    assert [stamp for stamp, _ in read] == pytest.approx(times[2:])
+    assert int(read[0][1][-1, -1, 0]) == 2
+
+
 def test_the_reader_refuses_a_container_without_a_video_stream():
     from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import ReferenceVideoReader
 
@@ -646,6 +661,36 @@ def offset_video(tmp_path_factory) -> Path:
     return path
 
 
+@pytest.fixture(scope="module")
+def offset_video_with_audio_marker(tmp_path_factory) -> Path:
+    """A shifted clock with a source-relative, content-visible audio marker.
+
+    Both streams begin together five seconds up the container clock.  The
+    soundtrack itself is silent for 0.9 seconds and then carries a tone, so a
+    request beginning at relative 0.4 seconds must hear that transition about
+    0.5 seconds into the prepared condition.  Unlike comparing against a slice
+    of the decoded waveform, that fact comes from the fixture, not production's
+    timestamp arithmetic.
+    """
+    if not _HAS_FFMPEG:
+        pytest.skip("ffmpeg is not available")
+    pytest.importorskip("av")
+    path = tmp_path_factory.mktemp("h3_stream_offset_marker") / "reference.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=512x288:rate=30:duration=3.0",
+            "-f", "lavfi", "-i",
+            "aevalsrc=if(lt(t\\,0.9)\\,0\\,0.8*sin(2*PI*440*t)):s=48000:d=3.0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-output_ts_offset", "5.0", "-muxdelay", "0", "-muxpreload", "0",
+            str(path),
+        ],
+        check=True,
+    )  # fmt: skip
+    return path
+
+
 def test_a_container_that_does_not_start_at_zero_keeps_its_whole_soundtrack(offset_video):
     """The cut is the difference of two clocks, not one of them.
 
@@ -675,6 +720,71 @@ def test_a_container_that_does_not_start_at_zero_keeps_its_whole_soundtrack(offs
     # from the start, so essentially nothing should have been trimmed.
     assert audio.shape[-1] >= 16000, f"only {audio.shape[-1]} samples survived"
     assert torch.count_nonzero(audio) > 0, "the surviving samples are silence"
+
+
+def test_a_relative_start_cuts_both_streams_inside_a_nonzero_container_clock(offset_video):
+    """A non-zero request offset must not be compared directly with absolute PTS."""
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
+
+    start = 0.37  # deliberately between two 30 fps presentation timestamps
+    with open_reference_video(str(offset_video)) as reader:
+        origin, _ = next(reader.iter_frames())
+        soundtrack = reader.soundtrack()
+    assert soundtrack is not None
+    with open_reference_video(str(offset_video)) as reader:
+        video_start, _ = next(reader.iter_frames(start_seconds=start))
+
+    assert 0.0 < video_start - origin <= start
+    assert start - (video_start - origin) < 1.0 / 30.0 + 1e-6
+
+    prepared = prepare_reference_videos_official(
+        [str(offset_video)],
+        target_frame_count=25,
+        start_time_seconds=start,
+        audio_sample_rate=16000,
+    )[0]
+    trim = video_start - soundtrack.start_seconds
+    expected = normalize_reference_audio(
+        soundtrack.waveform[:, int(trim * soundtrack.sample_rate) :],
+        soundtrack.sample_rate,
+        target_sample_rate=16000,
+        max_duration=25 / 24.0,
+    )
+
+    assert torch.equal(prepared["audio"], expected)
+
+
+def test_a_relative_start_places_known_audio_content_without_reusing_the_trim_formula(
+    offset_video_with_audio_marker,
+):
+    """The requested media-relative cut is observable in the audio content."""
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
+
+    sample_rate = 48000
+    prepared = prepare_reference_videos_official(
+        [str(offset_video_with_audio_marker)],
+        target_frame_count=49,
+        start_time_seconds=0.4,
+        audio_sample_rate=sample_rate,
+    )[0]
+    audio = prepared["audio"][0]
+
+    # Inspect 10 ms windows. AAC may smear the transition by a packet, but it
+    # cannot move a marker authored at source-relative 0.9 s anywhere near the
+    # 0.9 s position it would retain if the requested 0.4 s cut were ignored.
+    window = sample_rate // 100
+    rms = audio[: audio.numel() // window * window].reshape(-1, window).square().mean(dim=1).sqrt()
+    audible = torch.nonzero(rms > 0.05).flatten()
+
+    assert audible.numel() > 0, "the known tone disappeared"
+    onset_seconds = int(audible[0]) * window / sample_rate
+    assert 0.4 <= onset_seconds <= 0.6, f"the tone began at {onset_seconds:.3f}s instead of about 0.5s"
 
 
 @pytest.fixture(scope="module")

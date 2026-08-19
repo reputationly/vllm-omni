@@ -105,9 +105,71 @@ def test_describe_records_which_order_was_used():
     described = describe_order(ordered, MINIMAX_H3_ORDER_BUCKETS)
 
     assert described["reference_order_mode"] == MINIMAX_H3_ORDER_BUCKETS
-    assert described["labels"] == ["<Image 1>", "<Audio 1>", "<Video 1>"]
+    assert described["labels"] == ["<Picture 1>", "<Audio 1>", "<Video 1>"]
     with pytest.raises(ValueError, match="order mode"):
         describe_order(ordered, "official")
+
+
+def test_metadata_and_prompt_share_the_condition_label_vocabulary(monkeypatch):
+    """A label rename must reach both the artifact and the actual Qwen text.
+
+    The exact spelling assertion above pins the public vocabulary.  This
+    mutation pins its single source: inlining ``<Picture ...>`` in the
+    presentation again would leave the artifact correct while silently feeding
+    different text to Qwen, and this test would fail.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import ordered_references, presentation
+
+    texts: list[str] = []
+
+    class RecordingTokenizer:
+        def __call__(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            texts.append(text)
+            return {"input_ids": [len(texts)]}
+
+        def convert_tokens_to_ids(self, _token):
+            return 1000
+
+    monkeypatch.setitem(ordered_references._PROMPT_KIND_NAMES, "image", "Still")
+    ordered = ordered_references.canonical_order_from_buckets(
+        num_images=1,
+        video_has_audio=[True],
+        num_audios=0,
+    )
+
+    described = ordered_references.describe_order(ordered, ordered_references.MINIMAX_H3_ORDER_BUCKETS)
+    presentation.minimax_h3_ref2va_video_presentation(
+        RecordingTokenizer(),
+        prompt="animate it",
+        condition_labels=ordered_references.condition_labels(ordered),
+        image_token_count=1,
+        video_block_token_counts=[1],
+        video_block_timestamps=[0.0],
+    )
+
+    assert described["labels"][0] == "<Still 1>"
+    assert texts[0] == "<Still 1>: "
+
+
+@pytest.mark.parametrize("rank, expected_calls", [(0, 1), (1, 0), (3, 0)])
+def test_reference_order_is_logged_only_by_dit_rank_zero(monkeypatch, rank, expected_calls):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline
+    from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
+        MINIMAX_H3_ORDER_BUCKETS,
+        canonical_order_from_buckets,
+    )
+
+    calls = []
+    monkeypatch.setattr(pipeline, "_dit_rank_world", lambda: (None, rank, 4))
+    monkeypatch.setattr(pipeline.logger, "info", lambda *args: calls.append(args))
+
+    pipeline._log_reference_order(
+        canonical_order_from_buckets(num_images=1, video_has_audio=[], num_audios=0),
+        MINIMAX_H3_ORDER_BUCKETS,
+    )
+
+    assert len(calls) == expected_calls
 
 
 def test_requested_order_is_validated_against_the_media_that_arrived():

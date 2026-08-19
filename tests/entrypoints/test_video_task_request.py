@@ -162,6 +162,15 @@ def test_generation_params_ride_through_extras():
     assert video_request.quality == "high"
 
 
+@pytest.mark.parametrize("steps", [1, 4, 8, 20, 25, 30, 50, 200])
+def test_request_can_override_inference_steps_with_any_supported_positive_integer(steps):
+    """Base and distilled checkpoints choose different defaults, but the HTTP
+    contract deliberately remains request-overridable.  The product UI may
+    advertise a few recommended values; it must not turn those suggestions into
+    an engine-side enum (25 is the regression case)."""
+    assert _req(num_inference_steps=steps).to_video_request().num_inference_steps == steps
+
+
 def test_extra_params_survives_as_a_nested_object():
     """H3 selects its task through extra_params.task + extra_params.frame_indices
     (there is no top-level `task` field); the facade backfills both."""

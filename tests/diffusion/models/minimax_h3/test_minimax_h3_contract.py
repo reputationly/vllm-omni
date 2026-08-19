@@ -529,12 +529,38 @@ def test_shifted_sigma_schedule_matches_reference_values():
         minimax_h3_time_shift_sigmas,
     )
 
-    sigmas = minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=12.0)
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=12.0)
 
     assert sigmas == pytest.approx(
         [1.0, 0.9729729891, 0.9230769277, 0.8000000119, 0.0],
         abs=1e-7,
     )
+
+
+def test_base_defaults_to_twenty_nfe_but_accepts_other_deployment_steps():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_minimax_h3_schedule,
+    )
+
+    assert _resolve_minimax_h3_schedule(None, None) == (20, None)
+    assert _resolve_minimax_h3_schedule(None, 30) == (30, None)
+    assert _resolve_minimax_h3_schedule(None, 50) == (50, None)
+
+
+def test_turbo_four_defaults_to_four_nfe_and_accepts_eight():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_minimax_h3_schedule,
+    )
+    from vllm_omni.diffusion.sched import DMD2SigmaSchedule
+
+    turbo4 = DMD2SigmaSchedule.from_positions([1.0, 0.75, 0.5, 0.25, 0.0])
+    steps, positions = _resolve_minimax_h3_schedule(turbo4, None)
+    assert steps == 4
+    assert positions == turbo4.base_schedule
+
+    steps, positions = _resolve_minimax_h3_schedule(turbo4, 8)
+    assert steps == 8
+    assert len(positions) == 9
 
 
 def test_cudnn_packed_attention_uses_python_length_without_padding_mask():

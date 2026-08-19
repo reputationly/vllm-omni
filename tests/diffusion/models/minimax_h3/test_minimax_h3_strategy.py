@@ -29,6 +29,8 @@ def test_default_is_legacy_and_matches_production_today():
     assert strategy.reference_video_vae_frame_snap_mode == "legacy_no_snap"
     assert strategy.reference_audio_resample_mode == "legacy_double_resample"
     assert strategy.reference_audio_target_truncation is False
+    assert strategy.reference_image_no_upscale is False
+    assert strategy.reference_image_max_pixels == 0
     assert strategy.model_validation_semantics == "legacy"
     assert strategy.default_num_frames("t2va") == 209
     assert strategy.default_num_frames("fl2va") == 209
@@ -101,9 +103,18 @@ def test_legacy_keeps_the_reference_image_switches_usable():
     strategy = resolve_strategy(
         inference_contract="legacy",
         admission_policy=None,
-        environ={"VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": "768"},
+        environ={
+            "VLLM_OMNI_H3_REF_IMAGE_SHORT_EDGE": "768",
+            "VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE": "1",
+            "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+        },
     )
     assert strategy.name == "legacy"
+    assert strategy.reference_image_short_edge == 768
+    assert strategy.reference_image_no_upscale is True
+    assert strategy.reference_image_max_pixels == 1032192
+    assert strategy.describe()["reference_image_no_upscale"] is True
+    assert strategy.describe()["reference_image_max_pixels"] == 1032192
 
 
 def test_describe_reports_the_resolved_contract():
