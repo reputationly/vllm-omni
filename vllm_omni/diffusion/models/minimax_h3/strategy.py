@@ -31,6 +31,7 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .keyframes import MINIMAX_H3_KEYFRAME_RESIZE_MODES
 from .reference_image_geometry import (
     MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET,
     MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
@@ -67,7 +68,12 @@ MINIMAX_H3_ADMISSION_ENV = "VLLM_OMNI_H3_ADMISSION_POLICY"
 #    squashed. Fixing only that is a much smaller change than adopting the whole
 #    official contract, which alters every seed's output.
 MINIMAX_H3_GEOMETRY_ENV = "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY"
-MINIMAX_H3_GEOMETRY_MODES = frozenset({"official_short_edge", "legacy_canvas_prestretch"})
+MINIMAX_H3_GEOMETRY_MODES = frozenset({"fixed_area", "match", "official_short_edge", "legacy_canvas_prestretch"})
+
+# FL2VA keyframe geometry is independent from the rest of the inference
+# contract. Production can fix a distorted follower frame without also moving
+# RNG, default frame count, duration validation, or any Ref2VA behavior.
+MINIMAX_H3_FL2VA_KEYFRAME_RESIZE_ENV = "VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE"
 
 # The two noise axes, selectable on their own, for the same reason the geometry
 # is: `official` moves both at once, so a quality difference between contracts
@@ -127,7 +133,9 @@ class MiniMaxH3InferenceStrategy:
     # ref2va reference images: official encodes at a short edge of their own and
     # never binds the generated canvas. See P-C1 in the problem log — today the
     # serving layer pre-stretches them onto the canvas.
-    reference_image_geometry_mode: str  # "official_short_edge" | "legacy_canvas_prestretch"
+    # ``fixed_area`` is the production Base policy; ``match`` is selected from
+    # Ref Turbo checkpoint metadata and follows the request canvas.
+    reference_image_geometry_mode: str  # "fixed_area" | "match" | "official_short_edge" | legacy
 
     # Whether an ordered heterogeneous reference list is carried end to end, or
     # rebuilt from modality buckets in a fixed image/video/audio order.
@@ -427,6 +435,13 @@ def resolve_strategy(
             raise ValueError(
                 f"{MINIMAX_H3_GEOMETRY_ENV} must be one of {sorted(MINIMAX_H3_GEOMETRY_MODES)}, got {geometry!r}"
             )
+        if strategy.is_official and geometry == "fixed_area":
+            raise ValueError(
+                f"inference_contract={MINIMAX_H3_CONTRACT_OFFICIAL_V1} cannot use "
+                f"{MINIMAX_H3_GEOMETRY_ENV}=fixed_area: it requires a positive "
+                f"{MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV}, but that resource cap conflicts with the "
+                "official contract"
+            )
         strategy = replace(strategy, reference_image_geometry_mode=geometry)
         # The admission envelope describes what the *validator* sees, and that
         # depends on the geometry mode rather than on the contract name. Legacy's
@@ -437,7 +452,7 @@ def resolve_strategy(
         # would hard-reject images that production accepts today. The envelope
         # gates admission only — widening it cannot change any result that was
         # already admitted — so it follows the geometry it is validating.
-        if geometry == "official_short_edge":
+        if geometry != "legacy_canvas_prestretch":
             strategy = replace(
                 strategy,
                 reference_image_aspect_ratio_range=(
@@ -460,6 +475,15 @@ def resolve_strategy(
             )
         strategy = replace(strategy, visual_condition_noise_shape_mode=condition_noise)
 
+    fl2va_keyframe_resize = str(environ.get(MINIMAX_H3_FL2VA_KEYFRAME_RESIZE_ENV, "")).strip()
+    if fl2va_keyframe_resize:
+        if fl2va_keyframe_resize not in MINIMAX_H3_KEYFRAME_RESIZE_MODES:
+            raise ValueError(
+                f"{MINIMAX_H3_FL2VA_KEYFRAME_RESIZE_ENV} must be one of "
+                f"{sorted(MINIMAX_H3_KEYFRAME_RESIZE_MODES)}, got {fl2va_keyframe_resize!r}"
+            )
+        strategy = replace(strategy, fl2va_keyframe_resize_mode=fl2va_keyframe_resize)
+
     if not strategy.is_official:
         # The short edge predates this strategy and has always been usable under
         # legacy. It stopped working the moment the strategy began supplying an
@@ -471,7 +495,7 @@ def resolve_strategy(
         raw = str(environ.get(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "")).strip()
         if raw:
             strategy = replace(strategy, reference_image_short_edge=_parse_short_edge(raw))
-        return replace(
+        strategy = replace(
             strategy,
             reference_image_no_upscale=parse_reference_image_no_upscale(
                 environ.get(MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV, "")
@@ -480,6 +504,11 @@ def resolve_strategy(
                 environ.get(MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV, "")
             ),
         )
+        if strategy.reference_image_geometry_mode == "fixed_area" and strategy.reference_image_max_pixels <= 0:
+            raise ValueError(
+                f"{MINIMAX_H3_GEOMETRY_ENV}=fixed_area requires a positive {MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV}"
+            )
+        return strategy
 
     conflicting = [key for key in _CONFLICTING_REFERENCE_IMAGE_ENVS if str(environ.get(key, "")).strip()]
     if not conflicting:
@@ -524,6 +553,7 @@ __all__ = [
     "MINIMAX_H3_CONTRACT_ENV",
     "MINIMAX_H3_CONDITION_NOISE_ENV",
     "MINIMAX_H3_CONDITION_NOISE_MODES",
+    "MINIMAX_H3_FL2VA_KEYFRAME_RESIZE_ENV",
     "MINIMAX_H3_GEOMETRY_ENV",
     "MINIMAX_H3_GEOMETRY_MODES",
     "MINIMAX_H3_RNG_ENV",

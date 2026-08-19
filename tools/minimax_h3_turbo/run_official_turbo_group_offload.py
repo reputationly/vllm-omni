@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import torch
 from diffusers import ComponentsManager
 from diffusers.hooks import apply_group_offloading
+
+try:
+    from .lora_provenance import read_lora_checkpoint_metadata
+except ImportError:  # direct `python tools/.../run_official_turbo_group_offload.py`
+    from lora_provenance import read_lora_checkpoint_metadata
 
 UPSTREAM_SCRIPT = Path(
     os.environ.get(
@@ -81,7 +87,68 @@ def main() -> None:
         return pipe
 
     upstream.load_pipeline = load_pipeline_with_group_offload
+    sys.argv[1:] = resolve_lora_alpha_argv(sys.argv[1:])
     upstream.main()
+
+
+def _option_values(argv: list[str], name: str) -> list[str]:
+    values: list[str] = []
+    for index, item in enumerate(argv):
+        if item == name:
+            if index + 1 >= len(argv):
+                raise ValueError(f"{name} requires a value")
+            values.append(argv[index + 1])
+        elif item.startswith(f"{name}="):
+            values.append(item.split("=", 1)[1])
+    return values
+
+
+def resolve_lora_alpha_argv(argv: list[str]) -> list[str]:
+    """Bind upstream ``--lora-alpha`` to the exact checkpoint metadata.
+
+    The upstream CLI defaults this to 8 and applies it silently, while the
+    released checkpoints do *not* agree on one value: at rank 128,
+    ``fl2v_turbo_4step_v1.0_768p`` declares alpha 128 and the other two declare
+    8. Since the merge is scaled by ``alpha / rank``, accepting the default for
+    the 768p checkpoint applies its LoRA at 1/16 strength — no error, and the
+    result looks like an ordinary under-distilled sample rather than a
+    misconfiguration.
+
+    An explicit value is accepted only when it agrees.  This wrapper is an
+    oracle: silently overriding the checkpoint would make the comparison
+    neither the released adapter nor a reproducible local variant.
+    """
+    paths = _option_values(argv, "--lora-path")
+    if not paths:
+        return list(argv)
+    if len(paths) != 1:
+        raise ValueError("the official Turbo oracle accepts exactly one --lora-path")
+    resolved = Path(paths[0]).expanduser().resolve()
+    metadata = read_lora_checkpoint_metadata(resolved, with_sha256=False)
+    if not metadata.lora_alpha.is_integer():
+        raise ValueError(
+            f"upstream --lora-alpha accepts an integer, but {resolved.name} declares {metadata.lora_alpha!r}"
+        )
+    declared = int(metadata.lora_alpha)
+
+    explicit = _option_values(argv, "--lora-alpha")
+    if len(explicit) > 1:
+        raise ValueError("the official Turbo oracle accepts at most one --lora-alpha")
+    if explicit:
+        try:
+            requested = int(explicit[0])
+        except ValueError as exc:
+            raise ValueError(f"--lora-alpha must be an integer, got {explicit[0]!r}") from exc
+        if requested != declared:
+            raise ValueError(
+                f"--lora-alpha={requested} disagrees with {resolved.name} metadata alpha={declared}; "
+                "refusing a non-reproducible oracle run"
+            )
+        return list(argv)
+
+    resolved_argv = [*argv, "--lora-alpha", str(declared)]
+    print(f"Using LoRA alpha {declared} declared by {resolved.name}", flush=True)
+    return resolved_argv
 
 
 if __name__ == "__main__":

@@ -336,6 +336,11 @@ class AsyncOmniEngine:
     _DIFFUSION_CONTRACT_VIEW_FIELDS = (
         "minimax_h3_inference_contract",
         "minimax_h3_admission_policy",
+        # The image role is request-inferable for combined FL2VA/Ref2VA except
+        # for an image-only standalone Ref2VA partition. The serving-side
+        # canvas-binding probe needs the stage's pinned task to distinguish
+        # that case without guessing from media buckets.
+        "task_type",
         # Not a contract field but the transport for the ones that have no
         # config field at all: a stage's `runtime.env` is applied to the stage
         # and restored, so this process never has those variables in its own

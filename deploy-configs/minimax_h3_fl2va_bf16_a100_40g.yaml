@@ -4,6 +4,9 @@
 # Base, Turbo4, and Turbo8.  The model path selects the weights.  Do not pin
 # num_inference_steps here: the partition metadata is authoritative (Base=20,
 # Turbo4=4, Turbo8=8), and an explicit request may still override it.
+# All three partitions use the released FL2VA keyframe preprocessing: the first
+# image anchors the canvas; a differently shaped last image is cover-scaled and
+# centre-cropped instead of being stretched out of proportion.
 pipeline: minimax_h3_dit
 async_chunk: false
 trust_remote_code: true
@@ -13,6 +16,9 @@ stages:
     task_type: fl2va
     max_num_seqs: 1
     devices: "0,1,2,3"
+
+    env:
+      VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE: official_cover_crop
 
     enable_cpu_offload: true
     vae_use_tiling: true

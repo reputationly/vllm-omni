@@ -147,6 +147,38 @@ class OmniOpenAIServingVideo:
             return True
         return reference_images_bind_output_canvas(getattr(od_config, "model_class_name", None), od_config)
 
+    def _reference_images_bind_output_canvas_for_request(
+        self,
+        *,
+        reference_video: ReferenceVideo | None,
+        reference_audio: ReferenceAudio | None,
+        requested_task: Any = None,
+    ) -> bool:
+        """Resolve the H3 image role before performing a destructive resize.
+
+        A combined H3 instance treats an image-only request as FL2VA, while a
+        video/audio-bearing request is Ref2VA. Its two image policies can differ,
+        so the old instance-wide capability is not precise enough here.
+        """
+        od_config = self._diffusion_od_config()
+        if od_config is None:
+            return True
+        configured_task = str(getattr(od_config, "task_type", None) or "auto").lower()
+        if requested_task is not None:
+            # This is the same highest-priority selector consumed later by
+            # MiniMaxH3Pipeline._resolve_task from sampling.extra_args. Geometry
+            # must be decided from it before the route mutates the input image.
+            image_task = str(requested_task).lower()
+        elif configured_task == "ref2va" or reference_video is not None or reference_audio is not None:
+            image_task = "ref2va"
+        else:
+            image_task = "fl2va"
+        return reference_images_bind_output_canvas(
+            getattr(od_config, "model_class_name", None),
+            od_config,
+            task_type=image_task,
+        )
+
     @property
     def honours_explicit_reference_order(self) -> bool:
         """Whether an ordered ``references`` list can be served at all.
@@ -225,7 +257,11 @@ class OmniOpenAIServingVideo:
             input_image is not None
             and vp.width is not None
             and vp.height is not None
-            and self.reference_images_bind_output_canvas
+            and self._reference_images_bind_output_canvas_for_request(
+                reference_video=reference_video,
+                reference_audio=reference_audio,
+                requested_task=(request.extra_params or {}).get("task"),
+            )
         ):
             # Stretches, not cover-crops: a reference whose aspect ratio differs
             # from the canvas is distorted here, and the model's own aspect-ratio

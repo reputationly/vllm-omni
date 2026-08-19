@@ -326,6 +326,21 @@ def test_backfill_refuses_incomplete_or_nonzero_error_evidence(tmp_path):
         update_distilled_model_index(model_index, incomplete)
 
 
+def test_safetensors_row_reader_supports_noncontiguous_caller_order(tmp_path):
+    from safetensors import safe_open
+
+    from tools.minimax_h3_turbo.lora_provenance import _slice_rows
+
+    matrix = torch.arange(30, dtype=torch.float32).reshape(6, 5).to(torch.bfloat16)
+    checkpoint = tmp_path / "rows.safetensors"
+    save_file({"matrix": matrix}, checkpoint)
+
+    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+        sampled = _slice_rows(handle.get_slice("matrix"), [5, 1, 3, 1])
+
+    assert torch.equal(sampled, matrix[[5, 1, 3, 1], :])
+
+
 def test_verifier_samples_qkv_interleave_and_both_swiglu_halves(tmp_path):
     from safetensors import safe_open
 

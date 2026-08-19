@@ -138,18 +138,21 @@ def test_minimax_h3_postprocess_writes_owned_bitwise_equivalent_video(dtype):
     np.testing.assert_array_equal(result["audio"], audio.numpy())
 
 
-def _write_partition_index(path, *, partition, tasks):
+def _write_partition_index(path, *, partition, tasks, distilled=None):
     path.mkdir(parents=True)
+    release = {
+        "partition": partition,
+        "tasks": tasks,
+        "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+    }
+    if distilled is not None:
+        release["distilled"] = distilled
     (path / "model_index.json").write_text(
         json.dumps(
             {
                 "_class_name": "MiniMaxH3Pipeline",
                 "_diffusers_version": "0.32.2",
-                "_minimax_h3": {
-                    "partition": partition,
-                    "tasks": tasks,
-                    "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
-                },
+                "_minimax_h3": release,
             }
         ),
         encoding="utf-8",
@@ -266,11 +269,23 @@ def test_combined_task_inference_and_transformer_routing():
         "component_partition",
         "source_partitions",
         "expected_tasks",
+        "ref_distilled",
+        "expected_geometry",
     ),
     [
-        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}),
-        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}),
-        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
+        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}, True, "match"),
+        (
+            "combined",
+            "combined",
+            2,
+            "FL2VA",
+            ["FL2VA", "Ref2VA"],
+            {"t2va", "fl2va", "ref2va"},
+            False,
+            "fixed_area",
+        ),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}, False, "fixed_area"),
+        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}, False, "fixed_area"),
     ],
 )
 def test_pipeline_loads_task_selected_dits_and_shared_components_once(
@@ -282,6 +297,8 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     component_partition,
     source_partitions,
     expected_tasks,
+    ref_distilled,
+    expected_geometry,
 ):
     from vllm_omni.diffusion.data import (
         DiffusionParallelConfig,
@@ -300,6 +317,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
         tmp_path / "Ref2VA",
         partition="ref2va",
         tasks=["ref2va"],
+        distilled={"num_inference_steps": 4} if ref_distilled else None,
     )
     for partition_name in ("FL2VA", "Ref2VA"):
         for component in (
@@ -398,10 +416,15 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
             text_encoder_tp_size=1,
         ),
     )
+    od_config.diffusion_runtime_environ = {
+        "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area",
+        "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+    }
     pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
 
     assert pipeline.partition == expected_partition
     assert pipeline.supported_tasks == expected_tasks
+    assert pipeline.strategy.reference_image_geometry_mode == expected_geometry
     assert len(created["dit"]) == expected_dits
     component_path = tmp_path / component_partition
     assert created["text_encoder"] == [str(component_path / "text_encoder")]

@@ -122,14 +122,18 @@ def _minimax_h3_strategy(od_config: object | None) -> object | None:
         return None
 
 
-def reference_images_bind_output_canvas(model_class_name: str | None, od_config: object | None = None) -> bool:
+def reference_images_bind_output_canvas(
+    model_class_name: str | None,
+    od_config: object | None = None,
+    *,
+    task_type: str | None = None,
+) -> bool:
     """Whether the serving layer should put reference images on the canvas.
 
-    Default True, which is what every model has always done. MiniMax-H3 under
-    the ``official_diffusers_v1`` contract answers False: the official image
-    reference "never binds the generated geometry", it is encoded at a short
-    edge of its own, and stretching it onto the canvas both distorts it and
-    makes the model's own aspect-ratio validation unreachable.
+    Default True, which is what every model has always done. MiniMax-H3 answers
+    False for every aspect-preserving H3 policy: official short-edge, Base's
+    fixed-area ceiling, and Turbo's ``match``. Stretching a reference onto the
+    canvas would destroy any of those policies before the model applies it.
 
     The contract is resolved from the same startup inputs the pipeline reads, so
     this answers identically in an inline or an out-of-process deployment.
@@ -137,6 +141,9 @@ def reference_images_bind_output_canvas(model_class_name: str | None, od_config:
     Args:
         model_class_name: The resolved pipeline class name.
         od_config: The diffusion config, when the caller has one.
+        task_type: The request's resolved image role when the serving layer can
+            distinguish it. This matters for a combined H3 instance: FL2VA
+            keyframes and Ref2VA references have independent resize policies.
 
     Returns:
         Whether reference images are bound to the generated canvas.
@@ -150,7 +157,12 @@ def reference_images_bind_output_canvas(model_class_name: str | None, od_config:
     strategy = _minimax_h3_strategy(od_config)
     if strategy is None:
         return True
-    return strategy.reference_image_geometry_mode != "official_short_edge"
+    if str(task_type or "").lower() == "fl2va" and strategy.fl2va_keyframe_resize_mode == "official_cover_crop":
+        # The follower must reach ``prepare_fl2va_keyframes`` with its source
+        # aspect ratio intact. A route-level stretch makes it equal the output
+        # canvas and turns the official cover-crop into a no-op.
+        return False
+    return strategy.reference_image_geometry_mode == "legacy_canvas_prestretch"
 
 
 def honours_explicit_reference_order(model_class_name: str | None, od_config: object | None = None) -> bool:

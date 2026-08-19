@@ -9,10 +9,11 @@
 # The model path selects Base or Turbo4.  The checkpoint metadata selects the
 # default NFE (20 or 4), so this profile deliberately does not pin a step count.
 #
-# The Ref2VA product profile preserves each reference image's aspect ratio,
-# avoids interpolation-only upscaling, and caps one image at the maximum H3
-# output canvas area.  These are stage-scoped because the serving capability
-# probe and worker must resolve exactly the same geometry.
+# The shared Ref2VA profile preserves Base's existing production policy: keep
+# aspect ratio, do not intentionally upscale, and cap one image at 768x1344.
+# A Ref Turbo partition carries `distilled` metadata; the pipeline detects it
+# and replaces only that instance's fixed ceiling with training-time `match`,
+# whose pixel budget follows each request's output canvas.
 pipeline: minimax_h3_dit
 async_chunk: false
 trust_remote_code: true
@@ -27,8 +28,7 @@ stages:
 
     env:
       VLLM_OMNI_H3_INFERENCE_CONTRACT: legacy
-      VLLM_OMNI_H3_REF_IMAGE_GEOMETRY: official_short_edge
-      VLLM_OMNI_H3_REF_IMAGE_NO_UPSCALE: "1"
+      VLLM_OMNI_H3_REF_IMAGE_GEOMETRY: fixed_area
       VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS: "1032192"
 
     enable_cpu_offload: true

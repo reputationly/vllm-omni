@@ -447,6 +447,42 @@ def test_fixed_area_requires_an_explicit_positive_budget():
         )
 
 
+def test_official_contract_rejects_fixed_area_with_a_budget_at_startup():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    with pytest.raises(ValueError, match="cannot use.*fixed_area"):
+        resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy=None,
+            environ={
+                "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area",
+                "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+            },
+        )
+
+
+def test_official_fixed_area_without_a_budget_fails_at_startup_too():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    with pytest.raises(ValueError, match="cannot use.*fixed_area"):
+        resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy=None,
+            environ={"VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area"},
+        )
+
+
+def test_official_geometry_may_be_pinned_idempotently():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    strategy = resolve_strategy(
+        inference_contract="official_diffusers_v1",
+        admission_policy=None,
+        environ={"VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "official_short_edge"},
+    )
+    assert strategy.reference_image_geometry_mode == "official_short_edge"
+
+
 def test_the_legacy_short_edge_knob_is_not_shadowed_by_the_strategy():
     """A knob that silently stops working is worse than one that was removed.
 

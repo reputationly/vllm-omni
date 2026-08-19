@@ -10,6 +10,7 @@ import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from itertools import groupby
 from pathlib import Path
 from typing import Any, ClassVar
@@ -128,7 +129,7 @@ from .reference_video import (
 )
 from .reference_video_frames import sample_conditioner_frames, vae_chunk_frame_count
 from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
-from .strategy import contract_environ, legacy_strategy, resolve_strategy
+from .strategy import MiniMaxH3InferenceStrategy, contract_environ, legacy_strategy, resolve_strategy
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
@@ -934,6 +935,8 @@ def _reference_image_shape(
     short_edge: int | None = None,
     no_upscale: bool | None = None,
     max_pixels: int | None = None,
+    target_canvas: tuple[int, int] | None = None,
+    fixed_area_pixels: int | None = None,
 ) -> tuple[int, int]:
     """The geometry a `ref2va` reference image is encoded at.
 
@@ -949,11 +952,37 @@ def _reference_image_shape(
         raise OmniClientError(f"reference image aspect ratio must be in [{low:g}, {high:g}], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = (short_edge or _reference_image_short_edge()) / min(width, height)
-    if no_upscale is None:
-        no_upscale = _reference_image_no_upscale()
-    if no_upscale:
-        scale = min(1.0, scale)
+    if target_canvas is not None and fixed_area_pixels is not None:
+        raise ValueError("reference-image target_canvas and fixed_area_pixels are mutually exclusive")
+    if target_canvas is not None:
+        target_width, target_height = target_canvas
+        if target_width <= 0 or target_height <= 0:
+            raise ValueError(f"reference-image target canvas must be positive, got {target_width}x{target_height}")
+        # MiniMax-H3-Turbo's `match` policy. The adapter was distilled with
+        # reference images whose pixel budget followed the request canvas, so a
+        # fixed 768p cap is not equivalent for 480p/544p requests. Keep this
+        # expression and the nearest-32 rounding below in lockstep with
+        # ModelTC/Minimax-H3-Turbo.resolve_reference_image_size(mode="match").
+        scale = min(1.0, math.sqrt((target_width * target_height) / (width * height)))
+        match_mode = True
+    elif fixed_area_pixels is not None:
+        if fixed_area_pixels <= 0:
+            raise ValueError(f"reference-image fixed area must be positive, got {fixed_area_pixels}")
+        # The pre-Turbo production profile's *effective* Base policy. Its
+        # short-edge=2048 term was redundant beside no-upscale plus this 768p
+        # area ceiling, so express the behavior directly and keep its strict
+        # post-rounding cap below.
+        scale = min(1.0, math.sqrt(fixed_area_pixels / (width * height)))
+        no_upscale = True
+        max_pixels = fixed_area_pixels
+        match_mode = False
+    else:
+        scale = (short_edge or _reference_image_short_edge()) / min(width, height)
+        if no_upscale is None:
+            no_upscale = _reference_image_no_upscale()
+        if no_upscale:
+            scale = min(1.0, scale)
+        match_mode = False
     target_width = width * scale
     target_height = height * scale
     # 面积封顶，与 _reference_video_shape / _resolve_output_canvas 同形；默认关闭。
@@ -979,13 +1008,57 @@ def _reference_image_shape(
                 out_width -= MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
             else:
                 out_height -= MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
-    if no_upscale:
+    if no_upscale and not match_mode:
         # min(1.0, scale) 还不够：_align_multiple 是最近取整，会把 1008 抬成 1024、
         # 把 1080x1440 抬成 1088x1440（顺带改掉比例）。按源尺寸向下对齐再取小，
         # 才真正兑现"绝不放大"。源边长下限 256 >> 32，向下对齐不会归零。
         out_width = min(out_width, _align_multiple_down(width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE))
         out_height = min(out_height, _align_multiple_down(height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE))
     return (out_width, out_height)
+
+
+def _reference_image_shape_for_strategy(
+    image: Image.Image,
+    *,
+    strategy: MiniMaxH3InferenceStrategy,
+    output_width: int,
+    output_height: int,
+) -> tuple[int, int]:
+    """Resolve one reference image using the instance's recorded policy."""
+    mode = strategy.reference_image_geometry_mode
+    return _reference_image_shape(
+        image,
+        aspect_ratio_range=strategy.reference_image_aspect_ratio_range,
+        short_edge=strategy.reference_image_short_edge,
+        no_upscale=strategy.reference_image_no_upscale,
+        max_pixels=strategy.reference_image_max_pixels,
+        target_canvas=(output_width, output_height) if mode == "match" else None,
+        fixed_area_pixels=strategy.reference_image_max_pixels if mode == "fixed_area" else None,
+    )
+
+
+def _reference_image_strategy_for_release(
+    strategy: MiniMaxH3InferenceStrategy,
+    *,
+    partition: str,
+    release: Mapping[str, Any],
+) -> MiniMaxH3InferenceStrategy:
+    """Select Turbo ``match`` without changing the shared Base deployment."""
+    if (
+        partition == "ref2va"
+        and strategy.reference_image_geometry_mode == "fixed_area"
+        and isinstance(release.get("distilled"), Mapping)
+    ):
+        # The fixed ceiling belongs to Base. Carrying it into `match` would
+        # pull a nearest-32 result back under 768x1344 and cease to match the
+        # released Turbo helper at the 768p boundary.
+        return replace(
+            strategy,
+            reference_image_geometry_mode="match",
+            reference_image_no_upscale=False,
+            reference_image_max_pixels=0,
+        )
+    return strategy
 
 
 def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
@@ -1117,6 +1190,7 @@ class MiniMaxH3Pipeline(
         if not supported_tasks:
             supported_tasks = {"ref2va"} if partition == "ref2va" else {"t2va", "fl2va"}
         ref2va_model_path = None
+        ref2va_release: Mapping[str, Any] | None = None
         if self.partition == "combined":
             ref2va_model_path = model_root / "Ref2VA"
             ref2va_index_path = ref2va_model_path / "model_index.json"
@@ -1150,6 +1224,13 @@ class MiniMaxH3Pipeline(
             # contract differently they will eventually disagree, which is the
             # failure this whole path exists to prevent.
             environ=contract_environ(od_config),
+        )
+        reference_partition = "ref2va" if ref2va_release is not None else expected_partition
+        reference_release = ref2va_release if ref2va_release is not None else release
+        self.strategy = _reference_image_strategy_for_release(
+            self.strategy,
+            partition=reference_partition,
+            release=reference_release,
         )
         self.rng_mode = self.strategy.rng_mode
         self.condition_noise_shape_mode = self.strategy.visual_condition_noise_shape_mode
@@ -2353,12 +2434,11 @@ class MiniMaxH3Pipeline(
         elif task == "ref2va":
             prepared_images = []
             for item in images:
-                ref_width, ref_height = _reference_image_shape(
+                ref_width, ref_height = _reference_image_shape_for_strategy(
                     item,
-                    aspect_ratio_range=self.strategy.reference_image_aspect_ratio_range,
-                    short_edge=self.strategy.reference_image_short_edge,
-                    no_upscale=self.strategy.reference_image_no_upscale,
-                    max_pixels=self.strategy.reference_image_max_pixels,
+                    strategy=self.strategy,
+                    output_width=width,
+                    output_height=height,
                 )
                 prepared_images.append(item.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
             keyframe_frame_indices = None

@@ -15,6 +15,11 @@ import json
 import os
 from pathlib import Path
 
+try:
+    from .lora_provenance import fusion_provenance, read_lora_checkpoint_metadata
+except ImportError:  # direct `python tools/.../assemble_distilled_partition.py`
+    from lora_provenance import fusion_provenance, read_lora_checkpoint_metadata
+
 COMPONENTS = ("audio_vae", "processor", "text_encoder", "tokenizer", "video_vae")
 
 
@@ -22,6 +27,17 @@ def uniform_base_schedule(num_inference_steps: int) -> list[float]:
     if num_inference_steps < 1:
         raise ValueError("num_inference_steps must be at least 1")
     return [float(num_inference_steps - index) / num_inference_steps for index in range(num_inference_steps + 1)]
+
+
+def lora_merge_scale(path: Path) -> dict[str, float | int]:
+    """Compatibility helper for callers that only need declared scale metadata."""
+    metadata = read_lora_checkpoint_metadata(path, with_sha256=False)
+    alpha: int | float = int(metadata.lora_alpha) if metadata.lora_alpha.is_integer() else metadata.lora_alpha
+    return {
+        "lora_alpha": alpha,
+        "lora_rank": metadata.lora_rank,
+        "effective_lora_scale": metadata.effective_lora_scale,
+    }
 
 
 def _relative_symlink(target: Path, link: Path) -> None:
@@ -39,6 +55,7 @@ def assemble(
     video_shift: float,
     audio_shift: float,
     source_lora: str | None,
+    lora_checkpoint: Path,
 ) -> None:
     index_path = base_partition / "model_index.json"
     if not index_path.is_file():
@@ -47,6 +64,14 @@ def assemble(
         raise FileNotFoundError(f"fused transformer directory is missing: {fused_transformer}")
     if output.exists():
         raise FileExistsError(f"refusing to modify existing output: {output}")
+
+    provenance = fusion_provenance(
+        base_transformer=base_partition / "transformer",
+        fused_transformer=fused_transformer,
+        lora_checkpoint=lora_checkpoint,
+    )
+    if source_lora is not None and Path(source_lora).name != provenance["source_lora"]:
+        raise ValueError(f"--source-lora names {source_lora!r}, but --lora-checkpoint is {provenance['source_lora']!r}")
 
     model_index = json.loads(index_path.read_text(encoding="utf-8"))
     release = model_index.get("_minimax_h3")
@@ -60,9 +85,10 @@ def assemble(
         "num_inference_steps": num_inference_steps,
         "recommended_num_inference_steps": num_inference_steps,
         "supports_num_inference_steps_override": True,
-        "source_lora": source_lora,
+        "source_lora": provenance["source_lora"],
         "schedule_semantics": "recommended N+1 sigma boundaries for N transformer evaluations",
     }
+    release["distilled"].update({key: value for key, value in provenance.items() if key != "source_lora"})
 
     output.mkdir(parents=True)
     for component in COMPONENTS:
@@ -86,6 +112,12 @@ def main() -> None:
     parser.add_argument("--video-shift", type=float, required=True)
     parser.add_argument("--audio-shift", type=float, default=3.0)
     parser.add_argument("--source-lora")
+    parser.add_argument(
+        "--lora-checkpoint",
+        type=Path,
+        required=True,
+        help="The exact LoRA fused into the transformer; its SHA, scale and sampled tensor math are verified.",
+    )
     args = parser.parse_args()
     assemble(**vars(args))
 

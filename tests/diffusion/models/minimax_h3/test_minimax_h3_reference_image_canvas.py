@@ -23,10 +23,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 class _Config:
     """The few attributes the capability probe reads off a diffusion config."""
 
-    def __init__(self, model_class_name, contract=None):
+    def __init__(self, model_class_name, contract=None, *, stage_env=None, task_type=None):
         self.model_class_name = model_class_name
         self.minimax_h3_inference_contract = contract
         self.minimax_h3_admission_policy = None
+        self.diffusion_runtime_environ = stage_env
+        self.task_type = task_type
 
 
 def test_other_video_models_keep_binding_the_canvas():
@@ -52,6 +54,64 @@ def test_h3_official_contract_releases_the_canvas_binding():
 
     for model in ("MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"):
         assert reference_images_bind_output_canvas(model, _Config(model, "official_diffusers_v1")) is False
+
+
+def test_fl2va_cover_crop_releases_keyframes_without_changing_ref2va_legacy():
+    """The route must not erase the follower's ratio before cover-crop runs."""
+    from vllm_omni.diffusion.model_metadata import reference_images_bind_output_canvas
+
+    config = _Config(
+        "MiniMaxH3Pipeline",
+        "legacy",
+        stage_env={"VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE": "official_cover_crop"},
+    )
+
+    assert reference_images_bind_output_canvas(config.model_class_name, config, task_type="fl2va") is False
+    # The two policies are independent in a combined deployment. A legacy
+    # Ref2VA request still receives its historical canvas pre-stretch.
+    assert reference_images_bind_output_canvas(config.model_class_name, config, task_type="ref2va") is True
+
+
+def test_combined_serving_resolves_the_image_role_before_canvas_binding():
+    from types import SimpleNamespace
+
+    from vllm_omni.entrypoints.openai.serving_video import (
+        OmniOpenAIServingVideo,
+        ReferenceVideo,
+    )
+
+    config = _Config(
+        "MiniMaxH3Pipeline",
+        "legacy",
+        stage_env={"VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE": "official_cover_crop"},
+        task_type="combined",
+    )
+    handler = object.__new__(OmniOpenAIServingVideo)
+    handler._engine_client = SimpleNamespace(get_diffusion_od_config=lambda: config)
+
+    # Image-only is FL2VA on a combined root, so the raw follower is released.
+    assert not handler._reference_images_bind_output_canvas_for_request(
+        reference_video=None,
+        reference_audio=None,
+    )
+    # A video-bearing request is Ref2VA and retains this instance's legacy
+    # pre-stretch, proving that fixing FL2VA does not globally flip the root.
+    assert handler._reference_images_bind_output_canvas_for_request(
+        reference_video=ReferenceVideo(data=[]),
+        reference_audio=None,
+    )
+    # An explicit request task outranks both the startup selection and media
+    # inference, exactly as it does later in MiniMaxH3Pipeline._resolve_task.
+    assert handler._reference_images_bind_output_canvas_for_request(
+        reference_video=None,
+        reference_audio=None,
+        requested_task="ref2va",
+    )
+    assert not handler._reference_images_bind_output_canvas_for_request(
+        reference_video=ReferenceVideo(data=[]),
+        reference_audio=None,
+        requested_task="fl2va",
+    )
 
 
 def test_a_bad_contract_does_not_silently_change_the_capability():
@@ -137,6 +197,15 @@ def test_the_contract_reaches_the_serving_process(monkeypatch):
 
     assert view.minimax_h3_inference_contract == "official_diffusers_v1"
     assert reference_images_bind_output_canvas(view.model_class_name, view) is False
+
+
+def test_the_partition_task_reaches_the_request_level_canvas_probe(monkeypatch):
+    view = _out_of_process_view(
+        [_StageConfig("diffusion", {"task_type": "ref2va"})],
+        monkeypatch,
+    )
+
+    assert view.task_type == "ref2va"
 
 
 def test_a_yaml_that_says_nothing_is_still_legacy(monkeypatch):
