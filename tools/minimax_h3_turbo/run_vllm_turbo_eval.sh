@@ -51,7 +51,7 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 } >"$LOG"
 
 docker run -d --name "$NAME" --gpus all --ipc=host --network host --shm-size 64g \
-  -v /nfs-models:/nfs-models -v /nfs-output:/nfs-output -v /nfs-data:/nfs-data \
+  -v /nfs-models:/nfs-models -v /nfs-output:/nfs-output \
   -v "$REPO/vllm_omni/diffusion/models/minimax_h3:$PKG/diffusion/models/minimax_h3:ro" \
   -v "$REPO/vllm_omni/diffusion/sched/sigma_schedule.py:$PKG/diffusion/sched/sigma_schedule.py:ro" \
   -v "$REPO/vllm_omni/diffusion/model_metadata.py:$PKG/diffusion/model_metadata.py:ro" \

@@ -191,6 +191,59 @@ def test_model_load_weights_transforms_before_calling_vllm_loader():
     ]
 
 
+def test_model_load_weights_accepts_diffusers_split_qkv_and_up_gate():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTArchConfig,
+        MiniMaxH3DiTModel,
+    )
+
+    qkv_calls = []
+    fc1_calls = []
+
+    def qkv_loader(param, loaded_weight, shard_id):
+        del param
+        qkv_calls.append((shard_id, loaded_weight.clone()))
+
+    def fc1_loader(param, loaded_weight, shard_id):
+        del param
+        fc1_calls.append((shard_id, loaded_weight.clone()))
+
+    model = object.__new__(MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = MiniMaxH3DiTArchConfig(
+        hidden_size=1,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=1,
+        ffn_hidden_size=2,
+    )
+    model.blocks = nn.ModuleList([nn.Module()])
+    model.blocks[0].attn = nn.Module()
+    model.blocks[0].attn.qkv_proj = _WeightTarget(qkv_loader)
+    model.blocks[0].mlp = nn.Module()
+    model.blocks[0].mlp.fc1 = _WeightTarget(fc1_loader)
+
+    q = torch.arange(2, dtype=torch.float32).reshape(2, 1)
+    # Diffusers stores the two SwiGLU halves as [up, gate].
+    up_gate = torch.tensor([[10.0], [11.0], [20.0], [21.0]])
+    loaded = model.load_weights(
+        [
+            ("transformer_blocks.0.attn.to_q.weight", q),
+            ("transformer_blocks.0.ff.net.0.proj.weight", up_gate),
+        ]
+    )
+
+    assert loaded == {
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.0.mlp.fc1.weight",
+    }
+    assert [(shard_id, tensor[:, 0].tolist()) for shard_id, tensor in qkv_calls] == [("q", [0.0, 1.0])]
+    assert [(shard_id, tensor[:, 0].tolist()) for shard_id, tensor in fc1_calls] == [
+        (0, [20.0, 21.0]),
+        (1, [10.0, 11.0]),
+    ]
+
+
 def test_pipeline_resolves_transformer_component_quant_config():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_component_quant_config,

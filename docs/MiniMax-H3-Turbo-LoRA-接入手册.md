@@ -3,7 +3,7 @@
 > 面向执行者（人或 agent）。目标是：**上游发布一份新的 Turbo 步数蒸馏 LoRA 之后，
 > 不重新构建镜像、不新增 deploy-config，把它变成 GPUStack 上一个可用的加速档。**
 >
-> 最近一次执行：2026-08-15，ref2v 4-step v0.1，已烘焙、未压测（见 §5）。
+> 最近一次执行：2026-08-20，fl2v 4-step **v1.1** 768p，已烘焙组装、未压测（见 §5）。
 
 ---
 
@@ -208,13 +208,45 @@ attention backend 之类）。步数、权重、LoRA 版本都不算。
 
 ---
 
-## 5. 当前状态（2026-08-15）
+## 5. 当前状态（2026-08-20）
 
 | 档位 | LoRA | 缩放 | 基座 | 产物 | 状态 |
 |---|---|---|---|---|---|
 | fl2va 480p | `fl2v_turbo_8step_v1.0` | 0.0625 | FL2VA | `MiniMax-H3-FL2VA-Turbo8-BF16` | 线上，实测 1.76x |
-| fl2va 768p | `fl2v_turbo_4step_v1.0_768p` | 1.0 | FL2VA | `MiniMax-H3-FL2VA-Turbo4-768p-BF16` | 已烘 |
-| **ref2va** | **`ref2v_turbo_4step_v0.1`** | **0.0625** | **Ref2VA** | **`MiniMax-H3-Ref2VA-Turbo4-BF16`** | **已烘，未压测** |
+| fl2va 768p | `fl2v_turbo_4step_v1.0_768p` | 1.0 | FL2VA | `MiniMax-H3-FL2VA-Turbo4-768p-BF16` | 已烘，作 v1.1 的 A/B 基线 |
+| **fl2va 768p** | **`fl2v_turbo_4step_v1.1_768p`** | **1.0** | **FL2VA** | **`MiniMax-H3-FL2VA-Turbo4-768p-v1.1-BF16-vLLM`** | **已烘已组装，未压测** |
+| ref2va | `ref2v_turbo_4step_v0.1` | 0.0625 | Ref2VA | `MiniMax-H3-Ref2VA-Turbo4-BF16` | 已烘，未压测 |
+
+### 5.1 v1.1 768p（2026-08-20 执行记录）
+
+上游 08-20 07:35 UTC 只传了这一份权重的两种格式，**GitHub README 与 HF/魔搭提交信息都没有
+任何 release note**，别对外引用一个不存在的 changelog。权重层面能确认的是：结构与 v1.0_768p
+完全同构（624 tensors / blocks 50 / refiner 2 / rank 128 / alpha 128 → 缩放仍是 1.0），
+312 对 A/B 因子逐个比过 ΔW=B@A，与 v1.0 的余弦中位数 0.885（p25 0.858 / min 0.608）、
+范数中位比 1.158，**没有一层是原样搬过来的**。方向一致、幅度普遍变大 ~16%，是同配方继续
+训练出的新检查点，不是换结构或换 recipe。
+
+执行在 0036（当时 GPU 全空、239 GB 可用内存），vllm-omni 镜像里跑，烘焙 62 GB→62 GB 约
+5 分钟。验收数字：
+
+```
+patched 208 tensors
+||delta|| / ||W|| :  min=0.0006  median=0.0015  max=0.0069
+fusion_verification: max_abs_error=0.0  verified_target_tensors=208
+                     verified_factor_pairs=312  changed_values=3311777   （v1.0 同位置是 2960753）
+sigma_shift_scales: video=6.0 audio=3.0   base_schedule: [1, .75, .5, .25, 0]
+```
+
+两个执行上的坑，重跑时照做：
+
+1. **烘焙不要传 `--partition-out`。** 它顺手生成的可服务目录 shift 写死 12/3，而 768p 这档
+   应是 6/3 —— v1.0 那次就在 `MiniMax-H3-FL2VA-Turbo4-768p-BF16/model_index.json` 留下了
+   这么一份没有 `distilled` 块、shift 还是 12/3 的误导性目录（至今还在盘上，别拿它起服务，
+   正式目录是同名带 `-vLLM` 后缀那个）。正式 partition 只由 `assemble_distilled_partition.py` 出。
+2. **组装工具必须在仓库目录结构下跑。** `lora_provenance.py` 里 `from tools.minimax_h3.bake_turbo_lora
+   import build_plan` 是绝对包路径，把三个 .py 拍平拷到同一个目录会 `ModuleNotFoundError:
+   No module named 'tools'`（烘焙工具本身没这个依赖，所以只有第 3 步会挂）。节点上要摆成
+   `<root>/tools/minimax_h3/` + `<root>/tools/minimax_h3_turbo/`，`cd <root>` 再跑。
 
 ref2v 这份的烘焙自检：`patched 208 tensors`，`||delta||/||W||` 中位数 0.0002、
 最大 0.0019（最大值在 `blocks.49.attn.qkv_proj.weight`）。

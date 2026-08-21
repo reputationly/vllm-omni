@@ -40,6 +40,9 @@ _RENAMES = (
     (r"^audio_proj_in\.", "audio_patch_proj."),
     (r"^audio_proj_out\.", "final_layer.audio_out."),
     (r"^context_embedder\.", "condition_proj."),
+    # AdaLN-pruned checkpoints only: the folded bias sits beside norm_out rather
+    # than inside its linear, so the linear rule below cannot reach it.
+    (r"^norm_out\.folded_bias$", "final_layer.adaln_proj.folded_bias"),
     (r"^norm_out\.linear\.", "final_layer.adaln_proj.linear."),
     (r"^norm_out\.norm\.", "final_layer.norm."),
     (r"^proj_in\.", "video_patch_proj."),

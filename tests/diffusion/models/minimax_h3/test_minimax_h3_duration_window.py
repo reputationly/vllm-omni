@@ -212,3 +212,90 @@ def test_the_latent_shapes_follow_the_aligned_count_not_the_requested_one():
     )
     assert (num_frames, latent_t) == (362, 107)
     assert audio_t == round(362 / FPS * 40)
+
+
+# ---------------------------------------------------- deployment-level ceiling
+
+
+def test_deployment_can_lower_the_output_ceiling():
+    """A memory-tight instance shrinks the admission window without touching
+    model semantics: 8 s requests 192 frames, which sits on the alignment
+    lattice, so the pipeline's enforced ceiling is exactly 192."""
+    from vllm_omni.diffusion.models.minimax_h3.strategy import (
+        MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV,
+        resolve_strategy,
+    )
+
+    strategy = resolve_strategy(
+        inference_contract="official_diffusers_v1",
+        admission_policy=None,
+        environ={MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV: "8"},
+    )
+    assert strategy.output_duration_seconds == (5.0, 8.0)
+    assert strategy.requested_frame_window(FPS) == (108, 192)
+
+
+def test_deployment_ceiling_must_stay_above_the_contract_floor():
+    from vllm_omni.diffusion.models.minimax_h3.strategy import (
+        MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV,
+        resolve_strategy,
+    )
+
+    with pytest.raises(ValueError, match="below the contract minimum"):
+        resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy=None,
+            environ={MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV: "3"},
+        )
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "0", "inf", "nan"])
+def test_deployment_ceiling_rejects_unusable_values(raw):
+    from vllm_omni.diffusion.models.minimax_h3.strategy import (
+        MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV,
+        resolve_strategy,
+    )
+
+    with pytest.raises(ValueError):
+        resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy=None,
+            environ={MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV: raw},
+        )
+
+
+def test_deployment_ceiling_warns_when_it_widens_past_the_contract(caplog):
+    import logging
+
+    from vllm_omni.diffusion.models.minimax_h3.strategy import (
+        MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV,
+        resolve_strategy,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        strategy = resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy=None,
+            environ={MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV: "30"},
+        )
+
+    assert strategy.output_duration_seconds[1] == 30.0
+    assert "widens the admission window past the contract maximum" in caplog.text
+
+
+def test_deployment_ceiling_is_quiet_when_it_narrows(caplog):
+    import logging
+
+    from vllm_omni.diffusion.models.minimax_h3.strategy import (
+        MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV,
+        resolve_strategy,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        resolve_strategy(
+            inference_contract="official_diffusers_v1",
+            admission_policy=None,
+            environ={MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV: "5.5"},
+        )
+
+    assert "widens the admission window" not in caplog.text

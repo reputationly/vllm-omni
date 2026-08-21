@@ -25,6 +25,96 @@ def test_grouped_qkv_checkpoint_reorder():
     assert reordered[:, 0].tolist() == [0, 3, 1, 4, 2, 5]
 
 
+def test_pruned_diffusers_config_aliases_and_timestep_interpolation():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTArchConfig,
+        MiniMaxH3TimeEmbedder,
+    )
+
+    arch = MiniMaxH3DiTArchConfig.from_mapping(
+        {
+            "hidden_size": 8,
+            "num_refiner_layers": 3,
+            "ffn_dim": 16,
+            "in_channels": 2,
+            "audio_in_channels": 4,
+            "freq_dim": 6,
+            "time_embed_hidden_dim": 12,
+            "rope_freq_dim": 5,
+            "time_embed_dim": 10,
+            "adaln_rank": 2,
+            "time_table_size": 3,
+        }
+    )
+    assert arch.token_refiner_num_layers == 3
+    assert arch.ffn_hidden_size == 16
+    assert arch.latents_dim == 2
+    assert arch.audio_latents_dim == 4
+    assert arch.timestep_input_dim == 6
+    assert arch.time_embed_hidden_size == 12
+    assert arch.rope_inv_freq_len == 5
+    assert arch.adaln_out_features == 18 * 8
+    assert arch.final_adaln_out_features == 2 * 8
+
+    embedder = MiniMaxH3TimeEmbedder(arch, prefix="time_embedder")
+    embedder.table.copy_(torch.tensor([[0.0, 2.0], [10.0, 12.0], [20.0, 22.0]]))
+    actual = embedder(torch.tensor([-1.0, 0.25, 1.0, 2.0]))
+    expected = torch.tensor([[0.0, 2.0], [5.0, 7.0], [20.0, 22.0], [20.0, 22.0]])
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_diffusers_name_mapping_covers_pruned_adaln_and_split_qkv():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _diffusers_qkv_target,
+        _diffusers_to_partition_name,
+    )
+
+    assert _diffusers_to_partition_name("transformer_blocks.7.adaln_proj.folded_bias") == (
+        "blocks.7.adaln_proj.folded_bias"
+    )
+    assert _diffusers_to_partition_name("norm_out.folded_bias") == "final_layer.adaln_proj.folded_bias"
+    assert _diffusers_qkv_target("token_refiner.refiner_blocks.1.attn.to_k.weight") == (
+        "token_refiner.blocks.1.attn.qkv_proj.weight",
+        "k",
+    )
+
+
+def test_pruned_adaln_skips_silu_and_adds_folded_bias_in_fp32():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3AdalnProj
+
+    class CaptureLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input = None
+
+        def forward(self, value):
+            self.input = value.clone()
+            return torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16), None
+
+    projection = object.__new__(MiniMaxH3AdalnProj)
+    nn.Module.__init__(projection)
+    projection.expand_ratio = 2
+    projection.modality_num = 1
+    projection.hidden_size = 1
+    projection.pruned = True
+    projection.linear = CaptureLinear()
+    projection.register_buffer("folded_bias", torch.tensor([0.0039, 0.0079], dtype=torch.float32))
+
+    timestep_coordinates = torch.tensor([[2.0, -3.0]], dtype=torch.float32)
+    shift, scale = projection(timestep_coordinates)
+
+    # The table is already activated, so its coordinates reach the projection
+    # directly rather than through SiLU.
+    torch.testing.assert_close(
+        projection.linear.input,
+        timestep_coordinates.to(torch.bfloat16),
+        atol=0,
+        rtol=0,
+    )
+    expected = (torch.tensor([[1.0, 2.0]]).float() + projection.folded_bias).to(torch.bfloat16)
+    torch.testing.assert_close(torch.cat((shift, scale), dim=-1), expected, atol=0, rtol=0)
+
+
 def test_qkv_checkpoint_loader_reorders_serialized_channel_scales():
     from types import SimpleNamespace
 
@@ -158,3 +248,83 @@ def test_tp_accepts_checkpoint_supported_sizes():
     arch = MiniMaxH3DiTArchConfig()
     for tp_size in (1, 2, 4, 7):
         model._validate_tp_config(arch=arch, tp_size=tp_size)
+
+
+def test_rope_inv_freq_is_initialized_without_a_checkpoint():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Rope
+
+    inv_freq_len = 16
+    rope = MiniMaxH3Rope(inv_freq_len)
+
+    # The buffer is persistent, so a released checkpoint overwrites it. A
+    # checkpoint that omits it (a pruned export, say) must still get the
+    # reference curve rather than whatever ``torch.empty`` left behind.
+    rot_dim = inv_freq_len * 2
+    expected = 1.0 / (10000.0 ** (torch.arange(0, rot_dim, 2, dtype=torch.float32) / rot_dim))
+    torch.testing.assert_close(rope.inv_freq, expected, atol=0, rtol=0)
+    assert rope.inv_freq.dtype is torch.float32
+    assert torch.isfinite(rope.inv_freq).all()
+
+
+def test_swiglu_half_order_keys_off_the_source_name():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+
+    def build_model() -> tuple[MiniMaxH3DiTModel, dict[int, torch.Tensor]]:
+        captured: dict[int, torch.Tensor] = {}
+        parameter = nn.Parameter(torch.empty((4, 1)), requires_grad=False)
+
+        def loader(_param, value, shard_id):
+            captured[shard_id] = value.clone()
+
+        parameter.weight_loader = loader
+        model = object.__new__(MiniMaxH3DiTModel)
+        nn.Module.__init__(model)
+        model.arch = SimpleNamespace(num_attention_heads=2, attention_head_dim=1, adaln_rank=None)
+        block = nn.Module()
+        block.mlp = nn.Module()
+        block.mlp.fc1 = nn.Module()
+        block.mlp.fc1.register_parameter("weight", parameter)
+        model.blocks = nn.ModuleList([block])
+        return model, captured
+
+    packed = torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+
+    # Released partition naming: rows are already [gate, up].
+    model, captured = build_model()
+    model.load_weights([("blocks.0.mlp.fc1.weight", packed)])
+    assert captured[0][:, 0].tolist() == [0.0, 1.0]
+    assert captured[1][:, 0].tolist() == [2.0, 3.0]
+
+    # Diffusers naming: rows are [up, gate] and must be swapped. A wrong order
+    # here loads and runs, so the decision may not rest on the rename table.
+    model, captured = build_model()
+    model.load_weights([("transformer_blocks.0.ff.net.0.proj.weight", packed)])
+    assert captured[0][:, 0].tolist() == [2.0, 3.0]
+    assert captured[1][:, 0].tolist() == [0.0, 1.0]
+
+
+def test_pruned_buffer_check_only_runs_when_load_weights_did():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+
+    model = object.__new__(MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = SimpleNamespace(adaln_rank=8, num_layers=0)
+
+    # Weights arrived by another route (mmap under DLO+AllGather skips
+    # load_weights but still calls this hook): nothing to verify, no error.
+    # Both shapes of "load_weights did not run here" must be tolerated: the
+    # attribute left at its declared None, and an object built without
+    # __init__ that never got the declaration at all.
+    assert not hasattr(model, "_loaded_pruned_buffers")
+    model.post_load_weights()
+    model._loaded_pruned_buffers = None
+    model.post_load_weights()
+
+    # load_weights ran and the checkpoint was short: that is a real failure.
+    model._loaded_pruned_buffers = {"time_embedder.table"}
+    with pytest.raises(ValueError, match="missing required FP32 buffers"):
+        model.post_load_weights()
