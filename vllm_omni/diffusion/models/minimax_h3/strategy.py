@@ -31,6 +31,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any
 
+from vllm.logger import init_logger
+
 from .keyframes import MINIMAX_H3_KEYFRAME_RESIZE_MODES
 from .reference_image_geometry import (
     MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET,
@@ -43,6 +45,8 @@ from .reference_image_geometry import (
 )
 from .request_noise import MINIMAX_H3_RNG_LEGACY, MINIMAX_H3_RNG_MODES, MINIMAX_H3_RNG_OFFICIAL_V1
 from .time_request import minimax_h3_align_frame_count
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_CONTRACT_LEGACY = "legacy"
 MINIMAX_H3_CONTRACT_OFFICIAL_V1 = "official_diffusers_v1"
@@ -74,6 +78,19 @@ MINIMAX_H3_GEOMETRY_MODES = frozenset({"fixed_area", "match", "official_short_ed
 # contract. Production can fix a distorted follower frame without also moving
 # RNG, default frame count, duration validation, or any Ref2VA behavior.
 MINIMAX_H3_FL2VA_KEYFRAME_RESIZE_ENV = "VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE"
+
+# Deployment-level output duration ceiling, applied to every contract. It moves
+# the admission window's upper bound in either direction and does not change
+# model semantics: a deployment whose canvas is memory-hungry (Ref2VA at
+# 1344x768, say) can lower it to refuse requests its card budget cannot serve,
+# and a pruned sibling with headroom can raise it past the contract default.
+#
+# Raising is deliberately not capped here — how long a deployment can actually
+# serve depends on card count, resolution and offload settings, none of which
+# this module knows — so the caller takes on the OOM/timeout risk and the
+# resolver logs a warning. The contract minimum is still enforced: a ceiling
+# below it would leave an empty window. Unset keeps the contract default.
+MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV = "VLLM_OMNI_H3_MAX_OUTPUT_SECONDS"
 
 # The two noise axes, selectable on their own, for the same reason the geometry
 # is: `official` moves both at once, so a quality difference between contracts
@@ -428,6 +445,38 @@ def resolve_strategy(
         raise ValueError(f"MiniMax-H3 inference_contract must be one of {sorted(MINIMAX_H3_CONTRACTS)}, got {name!r}")
 
     strategy = _BUILDERS[name](admission_policy=policy)
+
+    max_seconds_raw = str(environ.get(MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV, "")).strip()
+    if max_seconds_raw:
+        try:
+            max_seconds = float(max_seconds_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV} must be a number of seconds, got {max_seconds_raw!r}"
+            ) from exc
+        if not math.isfinite(max_seconds) or max_seconds <= 0:
+            raise ValueError(
+                f"{MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV} must be a positive finite number of seconds, "
+                f"got {max_seconds_raw!r}"
+            )
+        min_seconds, contract_max = strategy.output_duration_seconds
+        if max_seconds < min_seconds:
+            raise ValueError(
+                f"{MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV}={max_seconds:g} is below the contract minimum "
+                f"{min_seconds:g} seconds"
+            )
+        if max_seconds > contract_max:
+            # Past the contract default nothing upstream has been validated:
+            # frame count, sequence length and peak memory all grow with it.
+            logger.warning(
+                "%s=%g widens the admission window past the contract maximum %g s. "
+                "Longer outputs are unvalidated for this contract; verify memory headroom "
+                "and request timeouts for the deployed resolution.",
+                MINIMAX_H3_MAX_OUTPUT_SECONDS_ENV,
+                max_seconds,
+                contract_max,
+            )
+        strategy = replace(strategy, output_duration_seconds=(min_seconds, max_seconds))
 
     geometry = str(environ.get(MINIMAX_H3_GEOMETRY_ENV, "")).strip()
     if geometry:
