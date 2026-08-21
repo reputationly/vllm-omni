@@ -24,6 +24,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `FLASH_ATTN_HUB` | FlashAttention 2 from HuggingFace `kernels` library. Useful for train/rollout alignment. |
 | `FLASH_ATTN_3_HUB` | FlashAttention 3 from HuggingFace `kernels` library. CUDA Hopper (sm_90+) only; falls back to `FLASH_ATTN_HUB` on older GPUs. |
 | `RAINFUSION_ATTN` | MindIE-SD **RainFusion** block-sparse video attention — see [below](#rainfusion_attn-backend-and-block-sparse-video-attention). Ascend NPU only; requires `mindiesd`. Delegates to `FLASH_ATTN` for anything that is not a packed video sequence. |
+| `SLA_ATTN` | **SLA** (Sparse-Linear Attention) top-k block-sparse attention — see [below](#sla_attn-backend-and-sparsity-distilled-checkpoints). CUDA, pure Triton; requires `sparse_linear_attention`, and **refuses to start without it** rather than falling back. For checkpoints distilled under the same sparsity; delegates to `FLASH_ATTN` for short sequences and exempt layers. |
 
 
 ## Configuration
@@ -358,6 +359,71 @@ Defaulting to diffusion attention backend SDPA           # nothing else availabl
 ```
 
 If you don't see one of these, the model didn't reach diffusion stage init — check earlier logs for failures.
+
+## SLA_ATTN Backend and Sparsity-Distilled Checkpoints
+
+`SLA_ATTN` runs [SLA](https://github.com/thu-ml/SLA) (Sparse-Linear Attention, arXiv 2509.24006)
+on CUDA. It mean-pools each 64-row block of queries and keys, ranks key blocks per query block,
+and attends only to the top `1 - sparsity` fraction. The kernel is pure Triton, so it needs no CUDA
+build and runs anywhere Triton does, including Ampere.
+
+**This backend is for checkpoints distilled under the same sparsity.** Weights trained for dense
+attention lose quality when blocks are dropped, and a sparsity-distilled adapter run densely wastes
+what it was trained for. `lightx2v/Minimax-h3-Turbo-SLA` is the first released MiniMax-H3 adapter
+distilled this way, at an 85% sparsity ratio.
+
+Two deliberate differences from `RAINFUSION_ATTN`, both to match how these adapters were trained:
+
+- **No prefix exemption.** Selection covers the whole packed sequence, text and audio rows
+  included, because upstream distilled and serves the adapter that way. `RAINFUSION_ATTN` keeps
+  the prefix dense, so its realized sparsity is lower than nominal; here it is not.
+- **No alignment requirement.** The kernel masks partial blocks, so any geometry runs sparse.
+
+The reference `SparseLinearAttention` module also adds a linear-attention branch through a
+trainable `proj_l`, which its own `init_weights_` zero-initialises. No released MiniMax-H3 adapter
+carries `proj_l`, so this backend skips that branch — it would contribute exactly zero at the cost
+of two matmuls per layer. LightX2V's own `dynamic_sparse_attn` makes the same choice.
+
+Configuration uses the shared `block_sparse` block (same keys as `RAINFUSION_ATTN`):
+
+```bash
+vllm-omni serve /path/to/MiniMax-H3-FL2VA-Turbo4-768p-SLA-BF16 \
+  --diffusion-attention-config '{"default": {"backend": "SLA_ATTN",
+      "block_sparse": {"sparsity": 0.85, "start_step": 0}}}'
+```
+
+Layers the kernel cannot pay for — fewer than 32 key blocks, an exempt layer, a warmup denoise
+step, a layer that does not declare `qkv_layout="BSND"`, or non-bf16/fp16 activations — delegate to
+`FLASH_ATTN`. On MiniMax-H3 this means the token refiner (76 rows) stays dense automatically while
+the main trunk runs sparse. Confirm from the engine's own log lines:
+
+```
+SLA_ATTN active: sparsity=0.85 (keeps 98 of 654 key blocks), rows=41827
+SLA_ATTN staying dense: 76 rows is 2 key blocks, under the 32-block threshold
+```
+
+Incompatible with ring sequence parallelism (block ranking needs the whole key sequence) — use
+Ulysses SP with `ring_degree=1`.
+
+**Selecting `SLA_ATTN` without the package aborts startup**, unlike the optional kernels that warn
+and fall back. A sparsity-distilled checkpoint served on a dense path still returns valid video —
+just slower and off-distribution — so a fallback would be invisible to callers and to monitoring.
+Install the package, or select a different backend explicitly.
+
+### Choosing `sparsity`
+
+The optimum moves with sequence length, because block selection's own cost (pooling, top-k, LUT)
+is fixed per layer while the attention work it removes grows with the block count. Measured on
+MiniMax-H3 768p (1344×768, TP4 on A100-40G, warm steady-state, versus the same weights run dense):
+
+| Clip length | Key blocks | Best `sparsity` | Wall-clock vs dense |
+|---|---|---|---|
+| 5 s | 654 | 0.7 | −11% |
+| 15 s | 1716 | 0.85 | −23% |
+
+At 5 s, `0.85` is slightly worse than `0.7` on quality and `0.5` is worse than both on *speed* —
+it keeps 327 of 654 blocks, which is close enough to dense that a tuned FlashAttention wins. Treat
+these as two data points, not a curve: re-measure for other resolutions and durations.
 
 ## SageAttention Installation
 
