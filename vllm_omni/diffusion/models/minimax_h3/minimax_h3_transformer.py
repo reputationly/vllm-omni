@@ -213,7 +213,7 @@ class MiniMaxH3Rope(nn.Module):
         super().__init__()
         self.register_buffer(
             "inv_freq",
-            torch.empty(inv_freq_len, dtype=_FP32_DTYPE),
+            1.0 / (10000.0 ** (torch.arange(0, inv_freq_len * 2, 2, dtype=_FP32_DTYPE) / (inv_freq_len * 2))),
             persistent=True,
         )
 
