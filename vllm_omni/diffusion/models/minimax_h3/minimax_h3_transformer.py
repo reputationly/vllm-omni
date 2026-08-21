@@ -9,6 +9,7 @@ layout.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -46,6 +47,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Modulation tensors each AdaLN projection emits per hidden_size: 18 inside a
+# DiT block (shift/scale/gate for the two norms across the three modalities),
+# 2 in the final layer. Both the dataclass defaults and the config-derived
+# fallbacks below are these ratios times hidden_size.
+MINIMAX_H3_ADALN_EXPAND_RATIO = 18
+MINIMAX_H3_FINAL_ADALN_EXPAND_RATIO = 2
+
+
 @dataclass
 class MiniMaxH3DiTArchConfig:
     num_layers: int = 50
@@ -61,8 +70,13 @@ class MiniMaxH3DiTArchConfig:
     timestep_input_dim: int = 256
     time_embed_hidden_size: int = 5376
     time_embed_dim: int = 2688
-    adaln_out_features: int = 18 * 5376
-    final_adaln_out_features: int = 2 * 5376
+    # Present only on AdaLN-pruned checkpoints.  The released checkpoint feeds
+    # every AdaLN projection with ``time_embed_dim`` values; the pruned one
+    # stores coordinates in a checkpoint-defined affine subspace instead.
+    adaln_rank: int | None = None
+    time_table_size: int | None = None
+    adaln_out_features: int = MINIMAX_H3_ADALN_EXPAND_RATIO * 5376
+    final_adaln_out_features: int = MINIMAX_H3_FINAL_ADALN_EXPAND_RATIO * 5376
     rope_inv_freq_len: int = 16
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
@@ -70,13 +84,38 @@ class MiniMaxH3DiTArchConfig:
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> MiniMaxH3DiTArchConfig:
+        # The released partition and the Modular Diffusers checkpoint describe
+        # the same architecture with different field names.  Accept both here
+        # so the loader can consume the pruned Diffusers shards directly while
+        # preserving the existing partition path byte-for-byte.
+        aliases = {
+            "num_refiner_layers": "token_refiner_num_layers",
+            "ffn_dim": "ffn_hidden_size",
+            "in_channels": "latents_dim",
+            "audio_in_channels": "audio_latents_dim",
+            "freq_dim": "timestep_input_dim",
+            "time_embed_hidden_dim": "time_embed_hidden_size",
+            "rope_freq_dim": "rope_inv_freq_len",
+        }
+        normalized = dict(config)
+        for source, target in aliases.items():
+            if target not in normalized and source in normalized:
+                normalized[target] = normalized[source]
+        hidden_size = int(normalized.get("hidden_size", cls.hidden_size))
+        normalized.setdefault("adaln_out_features", MINIMAX_H3_ADALN_EXPAND_RATIO * hidden_size)
+        normalized.setdefault("final_adaln_out_features", MINIMAX_H3_FINAL_ADALN_EXPAND_RATIO * hidden_size)
         fields = cls.__dataclass_fields__
-        values = {name: config[name] for name in fields if name in config}
+        values = {name: normalized[name] for name in fields if name in normalized}
         if "patch_size" in values:
             values["patch_size"] = tuple(values["patch_size"])
         arch = cls(**values)
         if len(arch.patch_size) != 3:
             raise ValueError(f"patch_size must contain three values, got {arch.patch_size!r}")
+        if arch.adaln_rank is not None:
+            if arch.adaln_rank <= 0:
+                raise ValueError(f"adaln_rank must be positive, got {arch.adaln_rank}")
+            if arch.time_table_size is None or arch.time_table_size < 2:
+                raise ValueError(f"AdaLN-pruned checkpoints require time_table_size >= 2, got {arch.time_table_size!r}")
         return arch
 
 
@@ -100,12 +139,61 @@ MINIMAX_H3_FP32_PARAM_NAMES = frozenset(
         "final_layer.audio_out.bias",
     }
 )
-MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
+MINIMAX_H3_FP32_BUFFER_NAMES = frozenset(
+    {
+        "rope.inv_freq",
+        "time_embedder.table",
+        "adaln_basis",
+        "adaln_mean",
+    }
+)
 
 # AdaLN modality count: token tags carry -1 for padding and 0/1/2 for
 # video/text/audio tokens (padding is clamped to 0 before the embedding
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+
+
+# Modular Diffusers name -> released partition/vLLM name.  These mappings and
+# the two packed orders below are covered by the bit-identical checkpoint
+# parity audit in ``tools/minimax_h3_parity/verify_checkpoint_conversion.py``.
+_DIFFUSERS_NAME_RENAMES = (
+    (r"^audio_proj_in\.", "audio_patch_proj."),
+    (r"^audio_proj_out\.", "final_layer.audio_out."),
+    (r"^context_embedder\.", "condition_proj."),
+    (r"^norm_out\.folded_bias$", "final_layer.adaln_proj.folded_bias"),
+    (r"^norm_out\.linear\.", "final_layer.adaln_proj.linear."),
+    (r"^norm_out\.norm\.", "final_layer.norm."),
+    (r"^proj_in\.", "video_patch_proj."),
+    (r"^proj_out\.", "final_layer.video_out."),
+    (r"^time_embedder\.linear_1\.", "time_embedder.proj_in."),
+    (r"^time_embedder\.linear_2\.", "time_embedder.proj_out."),
+    (r"^transformer_blocks\.(\d+)\.", r"blocks.\1."),
+    (r"^token_refiner\.refiner_blocks\.(\d+)\.", r"token_refiner.blocks.\1."),
+    (r"\.attn\.norm_q\.", ".attn.q_norm."),
+    (r"\.attn\.norm_k\.", ".attn.k_norm."),
+    (r"\.attn\.to_out\.0\.", ".attn.out_proj."),
+    (r"\.ff\.net\.0\.proj\.", ".mlp.fc1."),
+    (r"\.ff\.net\.2\.", ".mlp.fc2."),
+)
+_DIFFUSERS_QKV_NAME = re.compile(r"^(.*)\.attn\.to_([qkv])\.(weight|bias)$")
+# Diffusers' SwiGLU input projection. Its packed half order is the mirror of the
+# released checkpoint's, so the loader keys the swap off this name directly.
+_DIFFUSERS_SWIGLU_NAME = re.compile(r"\.ff\.net\.0\.proj\.weight$")
+
+
+def _diffusers_to_partition_name(name: str) -> str:
+    for pattern, replacement in _DIFFUSERS_NAME_RENAMES:
+        name = re.sub(pattern, replacement, name)
+    return name
+
+
+def _diffusers_qkv_target(name: str) -> tuple[str, str] | None:
+    match = _DIFFUSERS_QKV_NAME.match(name)
+    if match is None:
+        return None
+    target = _diffusers_to_partition_name(f"{match.group(1)}.attn.qkv_proj.{match.group(3)}")
+    return target, match.group(2)
 
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
@@ -236,6 +324,19 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
+        self.adaln_rank = arch.adaln_rank
+        if self.adaln_rank is not None:
+            assert arch.time_table_size is not None
+            self.register_buffer(
+                "table",
+                torch.zeros(
+                    arch.time_table_size,
+                    self.adaln_rank,
+                    dtype=_FP32_DTYPE,
+                ),
+                persistent=True,
+            )
+            return
         self.frequency_embedding_size = arch.timestep_input_dim
         self.proj_in = ColumnParallelLinear(
             arch.timestep_input_dim,
@@ -262,6 +363,19 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         The sinusoidal embedding stays fp32 throughout and concatenates cosine
         values before sine values.
         """
+        if self.adaln_rank is not None:
+            # The table already contains coordinates of the activated released
+            # timestep curve.  Do not apply the released MLP or SiLU again.
+            steps = self.table.shape[0] - 1
+            position = t.to(self.table.dtype).flatten().clamp(0.0, 1.0) * steps
+            lower = position.floor().clamp(max=steps - 1).long()
+            weight = (position - lower).unsqueeze(-1)
+            return torch.lerp(
+                self.table.index_select(0, lower),
+                self.table.index_select(0, lower + 1),
+                weight,
+            )
+
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=_FP32_DTYPE, device=t.device) / half)
         args = t.to(_FP32_DTYPE)[:, None] * freqs[None]
@@ -546,20 +660,34 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        self.pruned = arch.adaln_rank is not None
         self.linear = ColumnParallelLinear(
-            arch.time_embed_dim,
+            arch.adaln_rank if self.pruned else arch.time_embed_dim,
             out_features,
-            bias=True,
+            bias=not self.pruned,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
+        if self.pruned:
+            self.register_buffer(
+                "folded_bias",
+                torch.zeros(out_features, dtype=_FP32_DTYPE),
+                persistent=True,
+            )
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
-        x = nn.functional.silu(t_emb)
+        # The pruned table contains the coordinates of silu(time_embedder(t)),
+        # whereas the released path still needs the activation here.
+        x = t_emb if self.pruned else nn.functional.silu(t_emb)
         x, _ = self.linear(x.to(_BF16_DTYPE))
+        if self.pruned:
+            # This order is part of the checkpoint semantics: the folded bias
+            # carries most of the modulation and must not be rounded to BF16
+            # before addition.
+            x = (x.float() + self.folded_bias).to(x.dtype)
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
         return tuple(x.chunk(self.expand_ratio, dim=-1))
@@ -937,6 +1065,24 @@ class MiniMaxH3DiTModel(nn.Module):
             arch,
             prefix="time_embedder",
         )
+        # Set by ``load_weights``; stays None when weights arrive by another
+        # route (mmap under DLO+AllGather), which ``post_load_weights`` reads as
+        # "this module has nothing to verify" rather than "nothing was loaded".
+        self._loaded_pruned_buffers: set[str] | None = None
+        if arch.adaln_rank is not None:
+            # Kept for provenance and for projecting released-checkpoint LoRAs
+            # onto the checkpoint's own affine coordinates.  Inference reads
+            # the already-folded table/projections, exactly like upstream.
+            self.register_buffer(
+                "adaln_basis",
+                torch.zeros(arch.adaln_rank, arch.time_embed_dim, dtype=_FP32_DTYPE),
+                persistent=True,
+            )
+            self.register_buffer(
+                "adaln_mean",
+                torch.zeros(arch.time_embed_dim, dtype=_FP32_DTYPE),
+                persistent=True,
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -971,8 +1117,30 @@ class MiniMaxH3DiTModel(nn.Module):
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {param.dtype}.")
         for name, buffer in self.named_buffers():
-            if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
+            keep_fp32 = name in MINIMAX_H3_FP32_BUFFER_NAMES or (
+                self.arch.adaln_rank is not None and name.endswith(".adaln_proj.folded_bias")
+            )
+            if keep_fp32 and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
+        # ``None`` means ``load_weights`` never ran on this module, which is a
+        # legitimate state: the DLO+AllGather path loads via mmap in
+        # ``DistributedLayerwiseOffloadBackend.enable()`` and skips
+        # ``load_weights`` entirely (see diffusers_loader.py), yet still calls
+        # this hook. Reporting every buffer as missing there would fail a model
+        # that did load. Only a run that went through ``load_weights`` can say
+        # what the checkpoint actually carried.
+        loaded_pruned_buffers = getattr(self, "_loaded_pruned_buffers", None)
+        if self.arch.adaln_rank is not None and loaded_pruned_buffers is not None:
+            required_buffers = {
+                "time_embedder.table",
+                "adaln_basis",
+                "adaln_mean",
+                "final_layer.adaln_proj.folded_bias",
+                *(f"blocks.{index}.adaln_proj.folded_bias" for index in range(self.arch.num_layers)),
+            }
+            missing = required_buffers - loaded_pruned_buffers
+            if missing:
+                raise ValueError(f"AdaLN-pruned checkpoint is missing required FP32 buffers: {sorted(missing)}")
 
     def load_weights(
         self,
@@ -982,13 +1150,30 @@ class MiniMaxH3DiTModel(nn.Module):
         params = dict(self.named_parameters())
         params.update(dict(self.named_buffers()))
         loaded: set[str] = set()
-        for name, loaded_weight in weights:
+        loaded_pruned_buffers: set[str] = set()
+        for source_name, loaded_weight in weights:
+            qkv_target = _diffusers_qkv_target(source_name)
+            if qkv_target is not None:
+                name, shard_id = qkv_target
+                param = params.get(name)
+                if param is None:
+                    logger.warning("Skipping MiniMax H3 weight not present in model: %s", source_name)
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # Split Diffusers q/k/v tensors are already in logical head
+                # order.  Let QKVParallelLinear place and TP-shard each part;
+                # only the released fused checkpoint needs grouped reordering.
+                weight_loader(param, loaded_weight, shard_id)
+                loaded.add(name)
+                continue
+
+            name = _diffusers_to_partition_name(source_name)
             param = params.get(name)
             if param is None:
-                logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
+                logger.warning("Skipping MiniMax H3 weight not present in model: %s", source_name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
+            if name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")) and source_name == name:
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost. A
                 # serialized per-channel INT8 scale has the same row layout as
@@ -1006,12 +1191,28 @@ class MiniMaxH3DiTModel(nn.Module):
                         "MiniMax H3 fc1 checkpoint rows must split evenly into "
                         f"gate/up matrices, got {tuple(loaded_weight.shape)}"
                     )
-                gate, up = loaded_weight.chunk(2, dim=0)
+                first, second = loaded_weight.chunk(2, dim=0)
+                if _DIFFUSERS_SWIGLU_NAME.search(source_name):
+                    # Diffusers stores [up, gate]; the released partition and
+                    # vLLM MergedColumnParallelLinear use [gate, up]. Decide on
+                    # the source name itself rather than on "a rename happened":
+                    # a wrong order loads and runs, and only shows up as bad
+                    # output, so this must not depend on the rename table
+                    # staying exhaustive.
+                    gate, up = second, first
+                else:
+                    gate, up = first, second
                 weight_loader(param, gate, 0)
                 weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
             loaded.add(name)
+            if name in MINIMAX_H3_FP32_BUFFER_NAMES or name.endswith(".adaln_proj.folded_bias"):
+                loaded_pruned_buffers.add(name)
+        # Record the set unconditionally: it marks "load_weights ran here", which
+        # is what ``post_load_weights`` needs to tell an incomplete checkpoint
+        # apart from a path that never loaded through this method.
+        self._loaded_pruned_buffers = loaded_pruned_buffers
         return loaded
 
     @staticmethod
@@ -1204,5 +1405,7 @@ __all__ = [
     "MINIMAX_H3_FP32_BUFFER_NAMES",
     "MINIMAX_H3_FP32_PARAM_NAMES",
     "MiniMaxH3DiTModel",
+    "_diffusers_qkv_target",
+    "_diffusers_to_partition_name",
     "_reorder_grouped_qkv_to_qkv",
 ]
