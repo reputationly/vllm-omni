@@ -581,7 +581,11 @@ class _DiffusionConfigProjection:
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
     pin_cpu_memory: bool = True
-    diffusion_compile_granularity: Literal["regional", "full"] = "regional"
+    # ``none`` serves the transformer eagerly. Compilation had no off switch:
+    # a quantization method whose ``apply`` re-enters the compiled graph could
+    # only be diagnosed by rebuilding the image, and there was no way to tell a
+    # compile-induced failure from a real one by flipping a flag.
+    diffusion_compile_granularity: Literal["regional", "full", "none"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
     fa_deterministic: bool = False
     vae_use_slicing: bool = False

@@ -427,12 +427,13 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
-            choices=["regional", "full"],
+            choices=["regional", "full", "none"],
             default=None,
             help=(
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
-                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload; "
+                "'none' serves eagerly, which is the only way to tell a compile-induced failure from a real one."
             ),
         )
         omni_config_group.add_argument(

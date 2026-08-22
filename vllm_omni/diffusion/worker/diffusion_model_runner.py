@@ -163,6 +163,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
+        if compile_granularity == "none":
+            logger.info("Model runner: torch.compile disabled for %s (compile granularity 'none')", attr_name)
+            return
         try:
             if compile_granularity == "full":
                 model.compile(dynamic=compile_dynamic)

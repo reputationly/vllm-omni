@@ -927,9 +927,9 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        if self.diffusion_compile_granularity not in {"regional", "full"}:
+        if self.diffusion_compile_granularity not in {"regional", "full", "none"}:
             raise ValueError(
-                "diffusion_compile_granularity must be 'regional' or 'full', "
+                "diffusion_compile_granularity must be 'regional', 'full' or 'none', "
                 f"got {self.diffusion_compile_granularity!r}"
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):

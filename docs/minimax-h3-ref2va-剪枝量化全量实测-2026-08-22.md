@@ -8,13 +8,20 @@
 
 ## 1. 一句话结论
 
-**推荐配置：剪枝 r8 + DiT INT8 + 编码器 INT8 + Turbo4**
-显存峰值从满血的 34529 MiB 降到 **23759 MiB（−31%）**，耗时从 217s 降到 **174s**，
-把官方规格上限（9 图 + 3 视频 15 秒）从**全线 OOM**变成**可跑**，肉眼未见画质差异。
+**推荐配置：剪枝 r8 + DiT Int8 权重量化（W8A16）+ 编码器 Int8**
+显存峰值从满血的 34529 MiB 降到 **25087 MiB（−27%）**，耗时 651s 对 624s（慢 4%），
+两个官方 case 的肉眼比较均**回到基准水平**。
 
-serve 根目录：`/nfs-models/wuhanjisuan894/models/MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-encINT8-vLLM`
+> **不要用 W8A8（激活也量化）。**它更省（23759 MiB，−31%）也更快，但会**削掉高动态瞬态
+> 事件与运动细节**——实测 case1 中段动作丢失、case2 窗外的闪电退化成一次亮光。
+> 同一份 Int8 权重，仅把 `activation_scheme` 从 `dynamic` 换成 `weight_only`，问题即消失。
+> 详见 §8。
 
-**但 15 秒档只剩 0.51 GiB 余量**，属于"每次恰好没爆"，不建议直接对外开放（见 §7）。
+serve 根目录：`/nfs-models/wuhanjisuan894/models/MiniMax-H3-Ref2VA-Pruned-r8-INT8-W8A16-encINT8-vLLM`
+
+**关于输入上限**：§5.3 的包络是在 W8A8 上测的。W8A16 权重体积相同、峰值高约 1.3 GiB，
+9 图 + 3 视频 15 秒那档在 W8A8 下就只剩 0.51 GiB 余量，**换成 W8A16 后大概率不再可跑**，
+该档需要按 W8A16 重测后才能对外开放（见 §10）。
 
 ---
 
@@ -77,10 +84,18 @@ FL2VA 与 Ref2VA 是同一基座的两个微调分支，主干几乎相同（flo
 | `MiniMax-H3-Ref2VA-Pruned-r8-INT8-vLLM` | 无 | 剪枝 INT8 | BF16 | 19.5 GiB |
 | `MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-BF16-v2-vLLM` | 4 步 | 剪枝 BF16 | BF16 | 37.5 GiB |
 | `MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-vLLM` | 4 步 | 剪枝 INT8 | BF16 | 19.5 GiB |
-| **`MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-encINT8-vLLM`** | **4 步** | **剪枝 INT8** | **INT8** | **19.5 GiB** |
+| `MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-encINT8-vLLM` | 4 步 | 剪枝 INT8 **W8A8** | INT8 | 19.5 GiB |
+| **`MiniMax-H3-Ref2VA-Pruned-r8-INT8-W8A16-encINT8-vLLM`** | **无** | **剪枝 INT8 W8A16** | **INT8** | **19.5 GiB** |
+| `MiniMax-H3-Ref2VA-Pruned-r8-BF16-encINT8-vLLM` | 无 | 剪枝 BF16 | INT8 | 37.5 GiB |
 | `MiniMax-H3-Ref2VA-INT8-vLLM` | 无 | 满血 INT8 | BF16 | 43.8 GiB |
+| `MiniMax-H3-Ref2VA-INT8-encINT8-vLLM` | 无 | 满血 INT8 | INT8 | 43.8 GiB |
 | `MiniMax-H3-Ref2VA-encINT8-vLLM` | 无 | 满血 BF16 | INT8 | 61.7 GiB |
 | `Qwen3-VL-32B-H3Encoder-INT8` | — | — | INT8 编码器本体 | 25.3 GiB |
+
+**推荐的是 W8A16 那一行**（§1、§8）。它与 W8A8 版**共用同一份 Int8 张量文件**——
+`-W8A16-partition/transformer` 里的 safetensors 是指向 `-INT8-partition` 的符号链接，
+只有 `config.json` 的 `activation_scheme` 不同。所以两者磁盘占用不叠加。
+Turbo4 档的 W8A16 版尚未组装（见 §10）。
 
 ### 3.1 DiT 量化
 
@@ -193,6 +208,23 @@ max_abs_error: 0.0
 12s 与 15s 各独立跑了 **3 次**，峰值分别是 39785/39785/39785 与 40405/40405/40405——**完全一致**，
 说明该负载显存占用是确定性的。
 
+### 5.3b 成分归因矩阵（NFE20，官方 case1 / case2，同种子）
+
+用于 §8 的画质归因，也给出各成分的显存代价。
+
+| 配置 | case1 峰值 | case1 耗时 | case2 峰值 | case2 耗时 | 画质 |
+|---|---:|---:|---:|---:|---|
+| 满血 BF16（基准） | 34529 | 624s | 34747 | 680s | ✅ |
+| 只剪枝（DiT BF16） | 29555 | 622s | 29837 | 650s | ✅ |
+| 只 DiT W8A8（不剪枝） | 29555 | 627s | 29837 | 634s | ❌ case2 丢闪电 |
+| 剪枝 + DiT W8A8 | 29555 | 616s | — | — | ❌ case1 丢动作 |
+| 剪枝 + 编码器 Int8（DiT 不量化） | 28363 | 619s | 28563 | 661s | ✅ |
+| 无剪枝 + DiT W8A8 + 编码器 Int8 | 28613 | 593s | 28733 | 642s | ❌ |
+| 剪枝 + DiT W8A8 + 编码器 Int8 | 23759 | — | 24043 | 606s | ❌ |
+| **剪枝 + DiT W8A16 + 编码器 Int8** | **25087** | 651s | **24227** | 674s | ✅ **无损** |
+
+W8A16 那一行是关掉 torch.compile 跑的（见 §5.7）；开编译为 24807 MiB / 670s。
+
 ### 5.4 满血 BF16 的包络（NFE20）
 
 | 输入 | 峰值 MiB | 结果 |
@@ -235,7 +267,22 @@ max_abs_error: 0.0
 
 ---
 
-## 6. 六条可复用的规律
+### 5.7 W8A16 与 torch.compile
+
+W8A16 此前**只要开着编译就必然启动失败**，栈是 AOT autograd 里的 `RecursionError`：
+`regionally_compile` 把 DiT 每个 block 包成编译函数，block 的线性层进入
+`Int8WeightOnlyLinearMethod.apply`，`apply` 里对 `nn.Parameter` 取值触发
+`__torch_function__` 分发，又重入同一段编译图。
+
+已修（提交见 §9）：权重与 scale 改为 detach 后的普通张量、按当前 storage 惰性缓存
+（CPU offload 会搬运权重，加载期固化的视图会让 Triton 报 "cannot be accessed from
+Triton (cpu tensor?)"），并给 `apply` 加 `@torch._dynamo.disable`。
+
+代价：DiT 每个线性层成为图断点，**开编译反而比 eager 慢 19 秒**（670s vs 651s）。
+所以这个修复不是提速，是让 W8A16 在默认配置下不再崩溃。**当前建议 W8A16 配
+`--diffusion-compile-granularity none` 运行**（该取值同批新增）。
+
+## 6. 七条可复用的规律
 
 **① 显存峰值只由最高的那个阶段决定，其余阶段省多少都不进账。**
 这是下面所有现象的总根源。
@@ -244,10 +291,24 @@ max_abs_error: 0.0
 满血 DiT 时峰值在 **denoise**；DiT 一旦压轻（剪枝或量化，**任一即可**），峰值就落回 **encode**。
 实测：case1 满血 34529 出现在 261s（denoise）；剪枝/量化各臂 29555 出现在 21s（encode，全程平台）。
 
-**③ 剪枝与 DiT 量化在 GPU 峰值上互相替代，在宿主内存/磁盘上才互补。**
-case1：只量化 29555、只剪枝 29555、都上 29555（**一 MiB 不差**）；
-但宿主内存 144.8 → 126.4 → 115.6 G，DiT 磁盘 43.8 → 37.5 → 19.5 GiB。
-根因：剪枝砍 AdaLN（INT8 不碰），INT8 压 attn/MLP（剪枝不碰），权重上真互补——只是被激活地板吃掉了。
+**③ 剪枝与 DiT 量化在 GPU 峰值上互相替代——但只在峰值仍落于 encode 平台时成立。**
+case1（编码器仍为 BF16 时）：只量化 29555、只剪枝 29555、都上 29555（**一 MiB 不差**）；
+case2 同样：只剪枝 29837、只量化 29837。
+根因：剪枝砍 AdaLN（Int8 不碰），Int8 压 attn/MLP（剪枝不碰），权重上真互补——
+但那时**峰值由 encode 平台决定**，DiT 权重省多少都不进账。
+
+**前提一旦失效，替代关系就不成立。**编码器量化把 encode 平台压到约 24k 之后，
+DiT 权重重新露出水面，剪枝省的部分变回可见：
+
+| case | 剪枝 + 编码器 Int8（DiT 不量化） | 无剪枝 + DiT W8A8 + 编码器 Int8 | 差值 |
+|---|---:|---:|---:|
+| case1 | 28363 | 28613 | 250 |
+| case2 | 28563 | 28733 | 170 |
+
+而"剪枝 + DiT W8A8 + 编码器 Int8"是 23759 / 24043——比上面两者各低约 4600 MiB。
+也就是说**三者都上时才是真叠加**，此时谁都不能省。
+
+宿主内存与磁盘上的互补始终成立：宿主 144.8 → 126.4 → 115.6 G，DiT 磁盘 43.8 → 37.5 → 19.5 GiB。
 
 **④ 编码器量化必须搭配 DiT 压缩，否则显存零收益。**
 
@@ -269,6 +330,18 @@ case1：只量化 29555、只剪枝 29555、都上 29555（**一 MiB 不差**）
 case1：624s（20 步）→ 217s（Turbo4），快 **2.9 倍**，峰值只差 22 MiB。
 case7：2050s → 543s，快 **3.8 倍**。
 
+**⑦ 权重量化与激活量化必须分开评估——省显存的是前者，伤画质的是后者。**
+DiT 的 Int8 有两档，权重完全相同，只差 `activation_scheme`：
+
+| | 峰值(case1) | 耗时 | 画质 |
+|---|---:|---:|---|
+| W8A8（`dynamic`，权重+激活） | 23759 | 616s | ❌ 掉动作/闪电 |
+| W8A16（`weight_only`，仅权重） | 25087 | 651s | ✅ 无损 |
+
+**差 1328 MiB 和 5% 时间，换回全部画质。**这也意味着凡是"治激活离群值"的手段
+（SmoothQuant、旋转量化 convrot）在这里才是对症的；而"治权重"的手段（GPTQ 校准等）
+解决不了本文观察到的退化。详见 §8。
+
 ### 耗时模型（两点拟合，中间点未验证）
 
 | 输入规模 | 每步耗时 | 固定开销 |
@@ -287,41 +360,80 @@ case7：2050s → 543s，快 **3.8 倍**。
 
 | 引擎 | 权重 | 卡 | 对外档位 | 输入上限 |
 |---|---|---|---|---|
-| 引擎 1 | 全量化 Turbo4 | 4 | **快**（固定 4 步） | 9图+3视频 12s |
-| 引擎 2 | 满血 BF16 非蒸馏 | 4 | **标准**（默认 20 步）+ **高质**（用户自调 30/50） | 参考文件 ≤5 且 ≤8s |
+| 引擎 1 | **剪枝 + DiT W8A16 + 编码器 Int8** + Turbo4 | 4 | **快**（固定 4 步） | 待按 W8A16 重测（见 §10） |
+| 引擎 2 | **剪枝 + DiT W8A16 + 编码器 Int8** 非蒸馏 | 4 | **标准**（默认 20 步）+ **高质**（用户自调 30/50） | 同上 |
 
 要点：
 
+- **两个引擎用同一套压缩配置**，只差有没有融 Turbo4 LoRA。初版建议高质档走满血 BF16
+  以规避量化风险，现在不必了：W8A16 在两个 case 上都无损，而满血的输入包络小得多
+  （带视频参考基本不可用，见 §5.4）。
 - **标准与高质权重相同、只差步数**，共用一个引擎（`supports_num_inference_steps_override: True`），
   8 张卡而不是 12 张。
 - **快档不开放调步数**——Turbo4 把 4 步蒸馏进了权重，调高步数是偏离其训练工作点。
-- **高质档不做任何压缩**，走满血 BF16，代价是输入包络小得多。这样收费档位上零量化风险。
+- **两个引擎都要带 `--diffusion-compile-granularity none`**（见 §5.7）。
 - 网关三个模型条目，`defaultSteps` 分别 4 / 20 / 20，前者路由引擎 1。
   （注意：步数要按模型配 `defaultSteps`，不能写死在引擎族上。）
+- **不要为省那 1.3 GiB 改回 W8A8**——它省的显存和时间都不足以补偿 §8 的画质退化。
 
 ### 必须设的护栏
 
 1. **offload 一律开启。**它换来的 6~7 GiB 就是大输入能否跑通的全部本钱，代价只有 3~4% 速度。
-2. **9 图 + 3 视频 15s 默认关闭。**真实余量 0.51 GiB，属于"每次恰好没爆"。
+2. **9 图 + 3 视频 15s 默认关闭。**在 W8A8 下真实余量就只有 0.51 GiB，属于"每次恰好没爆"；
+   换成 W8A16 后峰值再高约 1.3 GiB，**该档大概率直接 OOM**，重测前不得开放。
 3. **每引擎串行单请求。**极限档没有第二个请求的空间。
 4. **提交时按档位包络硬拒 + 给出预估耗时**，不要让用户等几十分钟才拿到 OOM。
    超出包络时建议**自动降级到快档并告知**，而非直接拒绝。
 
 ---
 
-## 8. 画质结论与其证据强度
+## 8. 画质：W8A8 会削掉瞬态事件，W8A16 不会
 
-**肉眼比较（case1、同种子、同提示词）未见明显差异**，覆盖两组独立 A/B：
+**这一节的结论与本报告初版相反。**初版写的是"肉眼未见明显差异"，那是只看了一个 case、
+且只比较了单帧清晰度的结果。逐个 case 看动态之后，发现了真实退化。
 
-- 满血 20 步下：编码器 BF16 vs INT8（`c1-base` vs `c1-baseEncINT8`）
-- 剪枝 4 步下：编码器 BF16 vs INT8（`c1-prunedT4v2int8` vs `c1-encINT8`）
+### 8.1 观察到的两处退化
 
-同种子下 INT8 与 BF16 的 PSNR 约 23 dB（Y 21.3 dB）。**这个数读作"采样轨迹发散"而非"画质下降"**：
-4 步蒸馏采样下，权重的微小扰动会把整条轨迹带走，逐像素指标必然低。
+| case | 症状 | 出现在 |
+|---|---|---|
+| case1（3 图 5.17s） | 中段一个动作**整个丢失** | 剪枝 + DiT W8A8 |
+| case2（3 图 5.17s） | 窗外的**闪电退化成一次亮光** | 只 DiT W8A8（不剪枝也复现） |
 
-**证据强度不足以给收费档背书**：目前只有 **1 个 case、5.17 秒、肉眼判断**。
-官方测试集共 8 个 case（case1~8，3~9 张参考图），建议全部跑 A/B 后再定案。
-另外**评测集缺"参考主体保持度"这一类指标**——这正是 §2 那个错误能藏住 8 小时的根因。
+两者都是**时序性**的：单帧截图看不出来，逐像素指标也测不出来。
+
+### 8.2 归因：唯一元凶是激活量化
+
+按成分逐个隔离，全部同素材、同官方提示词、同种子、NFE20：
+
+| 成分 | case1 动作 | case2 闪电 | 判定 |
+|---|---|---|---|
+| 剪枝 r8（DiT 不量化） | ✅ 正常 | ✅ 闪电在 | 干净 |
+| 编码器 Int8（权重-only） | ✅ 正常 | ✅ 闪电在 | 干净 |
+| **DiT W8A8**（权重+激活） | ❌ 动作丢失 | ❌ 闪电丢失 | **元凶** |
+| **DiT W8A16**（仅权重） | ✅ **动作在** | ✅ **闪电在** | 无损 |
+
+最后两行是**同一份 Int8 权重**——W8A16 的 checkpoint 用符号链接复用 W8A8 的张量文件，
+两者只有 `config.json` 里 `activation_scheme` 一个字段不同（`dynamic` vs `weight_only`）。
+所以这是单变量对照：**问题出在激活量化，不在权重量化**。
+
+推测机制：闪电是一次剧烈的激活幅值跃升，per-token 动态量化把整个 token 的 scale 交给
+这个离群值，同 token 内其余通道分到的 8 bit 分辨率随之塌陷。剪枝会加剧它——case1 中
+单独 W8A8 尚未露馅，叠加剪枝后露了，因为低秩调制误差本身也在制造离群值。
+
+### 8.3 PSNR 为什么没抓到
+
+同种子下 Int8 与 BF16 的 PSNR 约 23 dB（Y 21.3 dB）。这个数**既不能证明有问题、也不能
+证明没问题**：4 步蒸馏采样下权重的任何扰动都会把整条采样轨迹带走，逐像素指标必然低。
+初版把它解释成"轨迹发散、不代表画质下降"，方向对，但据此推出"没有可见差异"是过度解读。
+
+### 8.4 证据强度
+
+- 覆盖 **2 个官方 case**（case1 动作、case2 闪电），每个 case 都做了成分级隔离
+- 判断方式是**肉眼看动态**，非指标
+- 官方测试集共 8 个 case，其余 6 个（case4~8）**未跑 A/B**
+
+**评测集缺一类指标**：既没有"参考主体保持度"，也没有"瞬态事件保留度"。前者是 §2 那个
+权重取错分支能藏住 8 小时的根因，后者是本节这两处退化能通过全部现有检查的根因。
 
 ---
 
@@ -363,12 +475,22 @@ python3 vllm_omni/quantization/tools/quantize_qwen3vl_encoder_int8.py \
   --src $M/MiniMax-H3/Ref2VA/text_encoder \
   --dst $M/Qwen3-VL-32B-H3Encoder-INT8
 
-# 5. 组装 serve 根（Turbo 档需带 --num-inference-steps 与 --fusion-provenance）
+# 5. 由 W8A8 派生 W8A16：复用同一份张量，只改 activation_scheme
+#    （权重用符号链接，磁盘不翻倍）
+mkdir -p $M/...-INT8-W8A16-partition/transformer && cd $_
+ln -s $M/...-INT8-partition/transformer/*.safetensors .
+ln -s $M/...-INT8-partition/transformer/model.safetensors.index.json .
+python3 -c 'import json; c=json.load(open("SRC/config.json")); \
+  c["quantization_config"]["activation_scheme"]="weight_only"; \
+  json.dump(c, open("config.json","w"), indent=2)'
+
+# 6. 组装 serve 根（Turbo 档需带 --num-inference-steps 与 --fusion-provenance）
 python3 tools/minimax_h3_turbo/assemble_pruned_partition.py ...
 
-# 6. serve（不要传 --quantization，已序列化）
-vllm serve $M/MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-encINT8-vLLM --omni \
-  --num-gpus 4 -tp 4 --enable-cpu-offload --text-encoder-tp-size 4 ...
+# 7. serve（不要传 --quantization，已序列化；W8A16 需关闭编译，见 5.7）
+vllm serve $M/MiniMax-H3-Ref2VA-Pruned-r8-INT8-W8A16-encINT8-vLLM --omni \
+  --num-gpus 4 -tp 4 --enable-cpu-offload --text-encoder-tp-size 4 \
+  --diffusion-compile-granularity none ...
 ```
 
 ### 产物位置
@@ -384,13 +506,15 @@ vllm serve $M/MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-encINT8-vLLM --omni \
 
 | 项 | 状态 |
 |---|---|
-| 官方 case2~6、8 的 A/B | **未跑**，画质结论目前只有 case1 |
-| 耗时模型中间点（如 NFE30） | **未验**，线性模型是两点拟合 |
-| "参考主体保持度"客观指标 | **无**，这是 §2 错误能藏住的根因 |
-| TP2+SP2 等并行策略 | **未测**；对全量化档无收益（峰值在 encode），只对满血档有意义 |
-| 参考图分批编码 | **未做**；全量化后激活占 23759 中的约 17 G（73%），是下一个大头 |
-| 旋转量化（convrot） | **未评估**；上游剪枝仓库 README 有参考实现（`enable_convrot()` + torchao） |
-| 15s 档余量 0.51 GiB | **风险**：并发、更高分辨率参考图、长时间碎片都可能推爆 |
+| **W8A16 下的输入包络** | **必须重测**。§5.3 的包络是 W8A8 的；W8A16 峰值高约 1.3 GiB，9图+3视频 15s（原余量 0.51 GiB）大概率不再可跑 |
+| 官方 case4~8 的 A/B | **未跑**；画质结论目前建立在 case1（动作）与 case2（闪电）两个样本上 |
+| "瞬态事件保留度"客观指标 | **无**。§8 那两处退化通过了现有全部检查，只有肉眼看动态才发现 |
+| "参考主体保持度"客观指标 | **无**，这是 §2 权重取错分支能藏住 8 小时的根因 |
+| W8A16 + 编译的性能 | 已能跑，但**开编译反比 eager 慢 19 秒**（§5.7）。要提速需把 Triton 桥接包成 custom_op 而非整体 `disable` |
+| 耗时模型中间点 | ✅ **已验**：3 图 @30 步预测 901s、实测 937s，误差 3.8%（§6 耗时模型） |
+| 参考图分批编码 | **未做**；全量化后激活占约 73%，是显存的下一个大头 |
+| 旋转量化（convrot）/ SmoothQuant | **未评估**，但 §8 定位到激活量化之后，**这类手段才是对症的**；上游剪枝仓库 README 有 `enable_convrot()` 参考实现 |
+| TP2+SP2 等并行策略 | **未测**；峰值在 encode 时无收益，只有当 denoise 重新成为峰值才有靶子 |
 
 ---
 

@@ -59,6 +59,16 @@ PY
 offload_flag="--enable-cpu-offload"
 [ "$CPU_OFFLOAD" = "0" ] && offload_flag=""
 
+# Regional torch.compile is on for every ladder arm, so it stays on by default.
+# The Int8 weight-only (W8A16) path does not survive it — its Triton bridge
+# recurses until the stack blows inside AOT autograd — and a quality comparison
+# is still worth running without it, since compilation does not change results.
+# Pass ``none`` rather than dropping the flags: the field defaults to
+# ``regional``, so omitting it leaves compilation on and looks like the switch
+# had no effect.
+compile_flags="--diffusion-compile-granularity regional --diffusion-compile-dynamic"
+[ "${COMPILE:-1}" = "0" ] && compile_flags="--diffusion-compile-granularity none"
+
 docker rm -f "$NAME" >/dev/null 2>&1
 # A previous run that failed is deliberately left serving for retry (see the tail
 # of this script), and every run uses the same host port. Without this check the
@@ -72,16 +82,25 @@ if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; th
   exit 4
 fi
 
+# Hand-listed rather than mounting the whole package: the shared repo tree is a
+# different revision from the image's installed copy, so a blanket mount would
+# swap far more than the file under test and break comparability with the arms
+# already measured. The cost is that a new patch needs its file added here —
+# which was missed three times in one afternoon, so check this list first when a
+# change appears to have no effect.
 docker run -d --name "$NAME" --gpus all --ipc=host --network host --shm-size 64g \
   -v /nfs-models:/nfs-models -v /nfs-output:/nfs-output \
   -v "$REPO/vllm_omni/diffusion/models/minimax_h3:$PKG/diffusion/models/minimax_h3:ro" \
   -v "$REPO/vllm_omni/diffusion/sched/sigma_schedule.py:$PKG/diffusion/sched/sigma_schedule.py:ro" \
   -v "$REPO/vllm_omni/diffusion/model_metadata.py:$PKG/diffusion/model_metadata.py:ro" \
   -v "$REPO/vllm_omni/diffusion/data.py:$PKG/diffusion/data.py:ro" \
+  -v "$REPO/vllm_omni/diffusion/worker/diffusion_model_runner.py:$PKG/diffusion/worker/diffusion_model_runner.py:ro" \
+  -v "$REPO/vllm_omni/quantization/int8_config.py:$PKG/quantization/int8_config.py:ro" \
   -v "$REPO/vllm_omni/config/stage_config.py:$PKG/config/stage_config.py:ro" \
   -v "$REPO/vllm_omni/config/omni_config.py:$PKG/config/omni_config.py:ro" \
   -v "$REPO/vllm_omni/entrypoints/openai/serving_video.py:$PKG/entrypoints/openai/serving_video.py:ro" \
   -v "$REPO/vllm_omni/entrypoints/openai/api_server.py:$PKG/entrypoints/openai/api_server.py:ro" \
+  -v "$REPO/vllm_omni/entrypoints/cli/serve.py:$PKG/entrypoints/cli/serve.py:ro" \
   -v "$REPO/vllm_omni/entrypoints/openai/protocol/video_tasks.py:$PKG/entrypoints/openai/protocol/video_tasks.py:ro" \
   -v "$REPO/vllm_omni/entrypoints/openai/protocol/videos.py:$PKG/entrypoints/openai/protocol/videos.py:ro" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -96,7 +115,7 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network host --shm-size 64g
   --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
   --diffusion-attention-backend FLASH_ATTN --disable-multithread-weight-load \
   --enable-diffusion-pipeline-profiler --init-timeout 3600 --stage-init-timeout 3600 \
-  --diffusion-compile-granularity regional --diffusion-compile-dynamic \
+  $compile_flags \
   --allowed-local-media-path /nfs-output --host 0.0.0.0 --port "$PORT" --trust-remote-code
 
 ready=0

@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import torch._dynamo  # noqa: F401  # ``torch._dynamo.disable`` is used below and is not implied by ``import torch``
 from torch.nn import Module
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -436,12 +437,43 @@ class Int8WeightOnlyLinearMethod(BaseInt8LinearMethod):
         if layer.weight_scale.dtype != torch.float32:
             raise TypeError(f"W8A16 requires float32 weight scales, got {layer.weight_scale.dtype}.")
 
+    @staticmethod
+    def _plain_weights(layer: Module) -> tuple[torch.Tensor, torch.Tensor]:
+        """The Int8 weight (K-major) and its scale, as plain tensors.
+
+        Detached rather than read off the ``Parameter`` inside the GEMM call:
+        under regional torch.compile those accesses dispatch through
+        ``Parameter.__torch_function__`` and re-enter the compiled graph, which
+        recurses until the stack blows.
+
+        Cached against the parameter's current storage rather than computed once
+        after loading, because CPU offload moves the weight between host and
+        device: a view captured at load time still points at host memory, and
+        Triton rejects it as a CPU pointer on the first forward.
+        """
+        weight = layer.weight.data
+        cached = getattr(layer, "_w8a16_cache", None)
+        if cached is not None and cached[0] is weight:
+            return cached[1], cached[2]
+        weight_kn = weight.detach().t()
+        scale = layer.weight_scale.data.detach()
+        layer._w8a16_cache = (weight, weight_kn, scale)
+        return weight_kn, scale
+
+    @torch._dynamo.disable
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run the Triton W8A16 GEMM outside the compiled graph.
+
+        Dynamo cannot trace this bridge: it reaches into a Triton kernel through
+        a routing helper, and tracing it re-enters the block being compiled. The
+        detached tensors above remove the known re-entry, and this keeps the
+        whole call opaque so a new one cannot reintroduce it.
+        """
         if x.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError(f"W8A16 requires BF16/FP16 activations, got {x.dtype}.")
 
@@ -456,8 +488,11 @@ class Int8WeightOnlyLinearMethod(BaseInt8LinearMethod):
         # routing-free wrapper can replace this correctness-first bridge.
         text_indices = torch.arange(x_2d.shape[0], dtype=torch.int64, device=x.device)
         vae_indices = torch.empty(0, dtype=torch.int64, device=x.device)
-        weight_kn = layer.weight.data.t()
-        scale = layer.weight_scale.data
+        # See ``_plain_weights``: detached to keep Dynamo out, but resolved here
+        # rather than at load time so CPU offload cannot leave a host view behind.
+        weight_kn, scale = self._plain_weights(layer)
+        if bias is not None:
+            bias = bias.detach()
         invoke_mot_gemm(
             A=x_2d,
             B_text=weight_kn,
