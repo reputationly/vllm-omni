@@ -186,6 +186,12 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "SageAttention/sageattention3_blackwell. Falling back to TORCH_SDPA backend."
                     )
                     return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+            # SLA_ATTN deliberately has no fallback here: SLAAttentionBackend
+            # implements validate_available(), which validate_diffusion_attn_backend()
+            # above already raised on if the kernel package is missing. Falling back
+            # to dense would keep serving — a sparsity-distilled checkpoint on a dense
+            # path returns valid video, just slower and off-distribution — so the
+            # degradation would be invisible to callers and to monitoring.
             if backend_upper == "TRTLLM_ATTN":
                 trtllm_attn_supported = compute_capability is not None and compute_capability.major == 10
                 if not trtllm_attn_supported:
