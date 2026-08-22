@@ -55,9 +55,11 @@ docker run -d --name "$NAME" --gpus '"device=0"' --ipc=host --network host --shm
   --diffusion-compile-granularity regional --diffusion-compile-dynamic \
   --allowed-local-media-path /nfs-output --host 0.0.0.0 --port "$PORT" --trust-remote-code
 
+ready=0
 for attempt in $(seq 1 360); do
   if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
     echo "ready_after_seconds=$((attempt * 10))"
+    ready=1
     break
   fi
   if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
@@ -67,6 +69,13 @@ for attempt in $(seq 1 360); do
   fi
   sleep 10
 done
+if [ "$ready" -ne 1 ]; then
+  # Falling through here would post to an engine that never came up and report
+  # it as a request failure, hiding a startup problem behind a runner error.
+  echo "$NAME was not ready after 3600 seconds"
+  docker logs "$NAME" 2>&1 | tail -40
+  exit 3
+fi
 
 python3 "$ROOT/run_vllm_eval_case.py" \
   --endpoint "http://127.0.0.1:$PORT" \

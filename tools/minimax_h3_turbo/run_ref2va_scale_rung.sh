@@ -53,6 +53,10 @@ echo "case rc=$case_rc tag=$CASE_TAG"
 # An OOM leaves the peak in the engine log, not in the summary, and leaves
 # workers holding the cards; tear down so the box is reusable either way.
 docker logs "h3-turbo-eval-$SERVE_TAG" 2>&1 | grep -iE "out of memory|CUDA error" | tail -5
+# The allocator's own maxima, which nvidia-smi sampling cannot see, exist only
+# inside the container: harvest them before the teardown below deletes them.
+echo "--- exact peak (torch allocator maxima) ---"
+docker logs "h3-turbo-eval-$SERVE_TAG" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep "H3 denoise step" | tail -4
 docker rm -f "h3-turbo-eval-$SERVE_TAG" >/dev/null 2>&1
 sleep 10
 nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
