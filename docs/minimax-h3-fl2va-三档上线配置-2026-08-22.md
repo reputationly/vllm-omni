@@ -51,9 +51,20 @@ docker build -f docker/Dockerfile.cuda -t <registry>/reputationly/vllm-omni:arm6
 --omni
 --trust-remote-code
 --deploy-config=/deploy-configs/minimax_h3_a100_40g.yaml
+--allowed-local-media-path /nfs-output
 --init-timeout=2400
 --stage-init-timeout=2400
 ```
+
+`--allowed-local-media-path` 少了会让 **fl2va 请求直接 400**：
+
+```
+Refusing to read a local input image because --allowed-local-media-path is not set.
+Set it to the facade's media root (never '/') to enable path inputs.
+```
+
+首尾帧走服务端路径时必须有它，纯 t2va 不受影响——所以只冒烟文生视频发现不了这条（2026-08-22
+三档冒烟第一轮就是这么全挂的）。值填门面的媒体根目录，**不要填 `/`**。
 
 **环境变量（六个，一个都不能少）**：
 ```
@@ -98,9 +109,34 @@ VLLM_OMNI_H3_LOG_STEP_MEMORY=1
 
 **③ 三档的 shift 与步数来自各自的 partition 元数据**，不用也不能在启动参数里配。
 
-**④ 起完先打一发预热请求再放流量**：实例加载后的首发是稳态的 1.4~2 倍（10 秒档 199.4s vs 121.7s），含 Triton kernel 编译与 compile 预热。这一发的产物与稳态产物**不同**（同 seed 也不同），别拿它做基线。
+**④ 必须验实际步数**，这是唯一能证明步数契约生效的证据（引擎自己打的行）：
 
-**⑤ 对基准**（稳态、10 秒档、boars 类内容）：最快档约 **120s**，v1.1 稠密约 146s，满血约 535s。偏离一倍以上就查是不是退回稠密了。
+```bash
+docker logs <容器> 2>&1 | grep -o "H3 denoise step [0-9]*" | awk '{print $4}' | sort -n | uniq
+```
+
+最快档必须是 `0..3`、快一点档 `0..7`、满血 `0..19`。**最快档只出 `0..2` 说明跑的是旧代码**——
+旧路径把 `num_inference_steps` 当 sigma boundary 数，传 4 实际只跑 3 次，不报错，只是质量对不上。
+
+**⑤ 起完先打一发预热请求再放流量**：首发含 regional torch.compile 预热，是稳态的 1.4~2 倍
+（5 秒 768p 冒烟首发 154s，同档稳态约 72s）。这一发的产物与稳态产物**不同**（同 seed 也不同），
+别拿它做基线。
+
+**⑥ 对基准**（稳态、5 秒 768p、boars 类内容）：最快档约 **72s**、快一点档约 **118s**、
+满血约 **239s**。10 秒档分别约 146s / 未测 / 527s。偏离一倍以上先查步数（④）。
+
+### 5.1 2026-08-22 镜像冒烟结果
+
+镜像 `arm64-a100-latest`，构建 `2026-08-22T12:07:46Z`（Actions run 32571999781，源 `ec1be9cf`），
+**不挂任何代码**、deploy-config 用镜像自带那份，三档各起一个实例发一发 5 秒 768p fl2va：
+
+| 档位 | 就绪 | 首发墙钟 | 峰值显存 | 实际 NFE | backend |
+|---|---|---|---|---|---|
+| 最快 v1.1 / 4 步 | 370s | 154.4s | 32.6 GiB | `0..3` ✓ | FLASH_ATTN |
+| 快一点 turbo8 / 8 步 | 350s | 163.7s | 32.6 GiB | `0..7` ✓ | FLASH_ATTN |
+| 满血 base / 20 步 | 380s | — | — | `0..19` ✓ | FLASH_ATTN |
+
+产物规格三档一致：`1344x768 / 124 帧 / 5.21s / aac 32000Hz 2ch`。
 
 ---
 
