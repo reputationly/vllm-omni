@@ -112,7 +112,57 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         param.data.copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
+class _Int8WeightMixin:
+    """Optional serialized-Int8 storage for the encoder's TP linear layers.
+
+    Switched on after construction rather than through the constructors, so the
+    BF16 path — every signature, every default, ``F.linear`` on a BF16 tensor —
+    is unchanged for a checkpoint that carries no ``quantization_config``. Only
+    a checkpoint that ships ``weight_scale`` tensors takes the other branch.
+
+    Weight-only: the scale is folded back before the GEMM, so activations,
+    accumulation and every non-linear op keep their existing numerics. What this
+    buys is residency — 45.4 GiB of BF16 projections become 22.7 GiB — and the
+    dequantized copy is one layer's weight, materialized and freed inside the
+    call rather than held for the life of the engine.
+    """
+
+    def enable_int8(self) -> None:
+        weight = self.weight  # type: ignore[attr-defined]
+        if weight.dtype == torch.int8:
+            return
+        self._compute_dtype = weight.dtype
+        int8_weight = nn.Parameter(torch.empty(weight.shape, dtype=torch.int8), requires_grad=False)
+        int8_weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+        self.weight = int8_weight  # type: ignore[attr-defined]
+        scale = nn.Parameter(torch.empty(weight.shape[0], 1, dtype=torch.float32), requires_grad=False)
+        scale.weight_loader = self.scale_loader  # type: ignore[attr-defined]
+        self.weight_scale = scale  # type: ignore[attr-defined]
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return getattr(self, "_compute_dtype", self.weight.dtype)  # type: ignore[attr-defined]
+
+    def scale_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
+    ) -> None:
+        """Place a ``[out, 1]`` scale exactly where its rows went.
+
+        The output-sharded layers slice dim 0, which is what their own
+        ``weight_loader`` already does and what a per-row scale needs, so they
+        reuse it verbatim; a scale that drifted out of step with its rows would
+        rescale the wrong channels and still produce plausible output.
+        """
+        self.weight_loader(param, loaded_weight, loaded_shard_id)  # type: ignore[attr-defined]
+
+    def dense_weight(self) -> torch.Tensor:
+        weight = self.weight  # type: ignore[attr-defined]
+        if weight.dtype != torch.int8:
+            return weight
+        return (weight.to(torch.float32) * self.weight_scale).to(self.compute_dtype)  # type: ignore[attr-defined]
+
+
+class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_Int8WeightMixin, nn.Module):
     """Packed gate/up projection sharded along the output dimension."""
 
     def __init__(
@@ -137,7 +187,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
         self._tp_size = tp_size
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.weight)
+        return F.linear(input_, self.dense_weight())
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -150,7 +200,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
             param.data[0:shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLQKVParallelLinear(_Int8WeightMixin, nn.Module):
     """QKV projection with GQA head sharding along the output dimension."""
 
     def __init__(
@@ -185,7 +235,7 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         self._tp_size = tp_size
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.weight)
+        return F.linear(input_, self.dense_weight())
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -238,7 +288,7 @@ def _verify_fused_shards_complete(
     raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
 
 
-class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, nn.Module):
     def __init__(
         self,
         group: Any,
@@ -266,7 +316,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         else:
             split_input = input_.split(self.input_size_per_partition, dim=-1)
             input_parallel = split_input[self._tp_rank].contiguous()
-        output_parallel = F.linear(input_parallel, self.weight)
+        output_parallel = F.linear(input_parallel, self.dense_weight())
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
@@ -274,7 +324,10 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
             # and amplify error on this model's large-magnitude activations.
             output_parallel = output_parallel.float()
             self.group.all_reduce(output_parallel)
-            output_parallel = output_parallel.to(self.weight.dtype)
+            # ``compute_dtype`` rather than ``self.weight.dtype``: under Int8
+            # storage the weight is int8 and casting the reduced activations to
+            # it would quantize the layer's *output*.
+            output_parallel = output_parallel.to(self.compute_dtype)
         return output_parallel
 
     def weight_loader(
@@ -284,6 +337,14 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         shard_size = self.input_size_per_partition
         start_idx = self._tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(1, start_idx, shard_size))
+
+    def scale_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
+    ) -> None:
+        # This layer shards its *input*; every rank owns all output rows, so the
+        # per-row scale is replicated rather than sliced.
+        del loaded_shard_id
+        param.data.copy_(loaded_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -751,9 +812,15 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         q_local = self.qkv_proj.local_num_heads * self.head_dim
         kv_local = self.qkv_proj.local_num_kv_heads * self.head_dim
-        q_weight = self.qkv_proj.weight[0:q_local]
-        k_weight = self.qkv_proj.weight[q_local : q_local + kv_local]
-        v_weight = self.qkv_proj.weight[q_local + kv_local : q_local + 2 * kv_local]
+        # Dequantized once and then sliced, not sliced and then dequantized:
+        # this path reaches past ``qkv_proj.forward`` into its storage, so it is
+        # the caller's job to ask for a dense weight.  Under BF16 storage
+        # ``dense_weight()`` returns the parameter itself, so the slices below
+        # are the same views they always were.
+        qkv_weight = self.qkv_proj.dense_weight()
+        q_weight = qkv_weight[0:q_local]
+        k_weight = qkv_weight[q_local : q_local + kv_local]
+        v_weight = qkv_weight[q_local + kv_local : q_local + 2 * kv_local]
         # Three separate GEMMs keep the numerics identical to the reference
         # path (packed QKV changes cuBLAS tiling and shifts bf16 rounding).
         query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape)).transpose(1, 2)
@@ -802,8 +869,11 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ip_local = self.gate_up_proj.intermediate_size_per_partition
-        gate = F.linear(x, self.gate_up_proj.weight[0:ip_local])
-        up = F.linear(x, self.gate_up_proj.weight[ip_local : 2 * ip_local])
+        # Same contract as the attention path: this reaches past the module's
+        # own forward, so it asks for a dense weight before slicing.
+        gate_up_weight = self.gate_up_proj.dense_weight()
+        gate = F.linear(x, gate_up_weight[0:ip_local])
+        up = F.linear(x, gate_up_weight[ip_local : 2 * ip_local])
         x = F.silu(gate) * up
         return self.down_proj(x)
 
@@ -1023,12 +1093,52 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
         )
         self.text_model.to(dtype=dtype)
+        # After ``.to(dtype)``, so the Int8 weights and their float32 scales are
+        # created in their final dtypes rather than being cast by it: a scale
+        # rounded to BF16 would throw away most of what the scale is for.
+        quantized = self._enable_int8_if_serialized(model_path)
         self._load_weights(model_path)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, "
+            "vision replicated, projections=%s",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            "int8" if quantized else "bf16",
         )
+
+    def _enable_int8_if_serialized(self, model_path: str) -> bool:
+        """Switch the retained decoder layers to Int8 storage, if the checkpoint is.
+
+        Driven by the checkpoint rather than by a flag: an Int8 checkpoint has
+        no BF16 weights to fall back to, and a BF16 one has no scales, so the
+        two are not interchangeable and offering the choice would only create a
+        way to get it wrong.
+        """
+        import os
+
+        config_path = os.path.join(model_path, "config.json")
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                quant = json.load(handle).get("quantization_config")
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(quant, dict) or quant.get("quant_method") != "int8":
+            return False
+        if not quant.get("is_checkpoint_int8_serialized"):
+            raise ValueError(
+                "MiniMax H3 text encoder: quantization_config declares int8 but not "
+                "is_checkpoint_int8_serialized; online quantization is not supported here"
+            )
+        retained = quant.get("retained_layers")
+        if retained is not None and int(retained) < MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER:
+            raise ValueError(
+                f"MiniMax H3 text encoder needs {MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER} decoder layers, "
+                f"but this checkpoint retained only {retained}"
+            )
+        for module in self.text_model.modules():
+            if isinstance(module, _Int8WeightMixin):
+                module.enable_int8()
+        return True
 
     @property
     def is_loaded(self) -> bool:
@@ -1039,6 +1149,16 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return self._tp_size
 
     def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
+        # A serialized-Int8 checkpoint carries ``<proj>.weight_scale`` beside
+        # every quantized ``<proj>.weight``.  Route it through the same rules as
+        # its weight — including the q/k/v and gate/up fusions — so the scale
+        # rows can never be placed by a different rule than the rows they scale.
+        if name.endswith(".weight_scale"):
+            mapped = self._map_weight_name(name[: -len(".weight_scale")] + ".weight")
+            if mapped is None:
+                return None
+            param_name, shard_id = mapped
+            return (param_name[: -len(".weight")] + ".weight_scale", shard_id)
         if name == "lm_head.weight" or name == "model.language_model.norm.weight":
             return None
         if name.startswith("model.visual."):
@@ -1093,11 +1213,20 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         # Seeded from the modules that own a multi-shard loader, so a fused weight
         # that receives no source shard at all is caught too, not only a partially
         # filled one.
-        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
-            f"{module_name}.weight": sources
-            for module_name, module in self.named_modules()
-            if (sources := _fused_source_shards(module)) is not None
-        }
+        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {}
+        for module_name, module in self.named_modules():
+            sources = _fused_source_shards(module)
+            if sources is None:
+                continue
+            expected_fused_shards[f"{module_name}.weight"] = sources
+            if hasattr(module, "weight_scale"):
+                # An Int8 checkpoint fills the fused scale from the same q/k/v or
+                # gate/up shards as the weight, so it can be partially filled the
+                # same way — and the ``missing`` check below cannot see it, because
+                # a sibling shard already marked the parameter loaded. The rows the
+                # absent shard owned would stay uninitialized and be applied as
+                # per-row scales, silently scaling those output channels wrong.
+                expected_fused_shards[f"{module_name}.weight_scale"] = sources
         loaded_fused_shards: dict[str, set[str | int]] = {name: set() for name in expected_fused_shards}
         for shard in files:
             tensors = safetensors.torch.load_file(os.path.join(model_path, shard), device="cpu")

@@ -43,9 +43,19 @@ def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tens
         return
     free, total = torch.cuda.mem_get_info()
     gib = 1024**3
+    # ``max_*`` as well as the instantaneous pair: the allocator maintains those
+    # maxima itself, so they capture a transient spike between two steps that
+    # neither this line nor an external nvidia-smi poll can see. Deciding how
+    # much headroom is left on a 40 GiB card from sampled numbers alone reads a
+    # lower bound as if it were the peak.
+    #
+    # Read through ``torch.accelerator``: ``torch.cuda.max_memory_allocated`` is
+    # banned by TID251 in pyproject. Its ``max_memory_reserved`` sibling is not,
+    # but the two are one measurement and splitting them across two APIs would
+    # only invite the next reader to wonder which one is authoritative.
     logger.info(
         "H3 denoise step %d: rows video=%d audio=%d | driver free %.2f/%.2f GiB | "
-        "torch allocated %.2f GiB reserved %.2f GiB",
+        "torch allocated %.2f GiB reserved %.2f GiB | torch max allocated %.2f GiB reserved %.2f GiB",
         step,
         int(video_rows.shape[0]),
         int(audio_rows.shape[0]),
@@ -53,6 +63,8 @@ def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tens
         total / gib,
         torch.cuda.memory_allocated() / gib,
         torch.cuda.memory_reserved() / gib,
+        torch.accelerator.max_memory_allocated() / gib,
+        torch.accelerator.max_memory_reserved() / gib,
     )
 
 
