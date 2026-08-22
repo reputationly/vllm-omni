@@ -1,7 +1,9 @@
 # MiniMax-H3 FL2VA 三档上线配置（2026-08-22）
 
 > 面向执行者。从出镜像到 GPUStack 建实例到 new-api 配置，逐条可照抄。
-> 三档只服务 **768p（1344×768）**；最快档只服务 **10-15 秒**。
+> 三档只服务 **768p（1344×768）**。
+> **2026-08-22 更新：最快档由 SLA 改为 v1.1 稠密**——SLA 在手绘动画上会出现运动方向
+> 反转（写实内容不受影响），详见 `docs/实验报告/MiniMax-H3-SLA稀疏注意力-接入实测与暂缓结论-2026-08-22.md`。
 > 数据来源见 `docs/实验报告/vLLM-Omni-MiniMax-H3-768p-Turbo-v1.1-与-SLA-稀疏注意力实测与选型.md`。
 
 ---
@@ -10,14 +12,14 @@
 
 | | 官方满血 | 快一点 | 最快 |
 |---|---|---|---|
-| 权重目录 | `MiniMax-H3/FL2VA` | `MiniMax-H3-FL2VA-Turbo8-BF16-vLLM` | `MiniMax-H3-FL2VA-Turbo4-768p-SLA-v0.1-BF16-vLLM` |
+| 权重目录 | `MiniMax-H3/FL2VA` | `MiniMax-H3-FL2VA-Turbo8-BF16-vLLM` | `MiniMax-H3-FL2VA-Turbo4-768p-v1.1-BF16-vLLM` |
 | 步数（NFE） | 20 | 8 | 4 |
-| 注意力 | 稠密 FlashAttention | 稠密 FlashAttention | **SLA 块稀疏 0.85** |
+| 注意力 | 稠密 FlashAttention | 稠密 FlashAttention | 稠密 FlashAttention |
 | shift（video/audio） | 12 / 3 | 12 / 3 | 6 / 3 |
-| 15 秒实测 | 886.8s | 400.1s | **174.6s** |
-| 10 秒实测 | 待补（见 §6） | 未测（见 §6） | **110.8 ~ 121.7s** |
-| 15 秒峰值显存 | 35.8 GiB | 34.4 GiB | 35.8 GiB |
-| 服务时长 | 5-15s | 5-15s | **10-15s** |
+| 15 秒实测 | 886.8s | 400.1s | **226.6s** |
+| 10 秒实测 | 527.2s / 485.4s | 未测（见 §6） | **141.0 ~ 146.4s** |
+| 15 秒峰值显存 | 35.8 GiB | 34.4 GiB | 35.9 GiB |
+| 服务时长 | 5-15s | 5-15s | 5-15s |
 
 shift 与 base_schedule 跟着权重的 `model_index.json` 走，已经烘在 partition 里，**不用也不能在启动参数里配**。
 
@@ -28,34 +30,15 @@ shift 与 base_schedule 跟着权重的 `model_index.json` 走，已经烘在 pa
 
 ## 2. 出镜像
 
-镜像里唯一的新增依赖是 SLA kernel（`docker/Dockerfile.cuda` Step 2b-1，本次已加）：
-
-```dockerfile
-ARG SLA_COMMIT=main
-RUN uv pip install --no-cache-dir \
-      "sparse_linear_attention @ git+https://github.com/thu-ml/SLA.git@${SLA_COMMIT}" \
-      || echo "WARN: failed to install sparse_linear_attention (SLA_ATTN backend won't serve)"
-```
-
-纯 Triton，不编 CUDA。构建：
+三档都不需要新依赖，按现有流程出即可：
 
 ```bash
-docker build -f docker/Dockerfile.cuda \
-  --build-arg SLA_COMMIT=main \
-  -t <registry>/reputationly/vllm-omni:arm64-a100-<tag> .
+docker build -f docker/Dockerfile.cuda -t <registry>/reputationly/vllm-omni:arm64-a100-<tag> .
 ```
 
-**建议把 `SLA_COMMIT` 固定到具体 sha**，别用 `main`——上游改了 kernel 签名会让镜像行为漂移，而这类漂移只在出图质量上体现，不报错。
-
-**出完镜像必须验一行**（构建机上即可）：
-
-```bash
-docker run --rm <新镜像> python3 -c "import sparse_linear_attention, triton; print('SLA ok', triton.__version__)"
-```
-
-装失败时构建**不会**中断（沿用仓里可选包的 best-effort 惯例），所以这一步不做就可能出一个"看着正常、起最快档必失败"的镜像。失败也不会静默降级——`SLA_ATTN` 在解析期直接拒绝启动（见 §5 的日志）。
-
----
+> 曾为最快档在 Dockerfile 里加过 `sparse_linear_attention`（SLA kernel），随最快档改用 v1.1
+> 一并移除——不给生产镜像留用不上的依赖和构建期的 GitHub 网络依赖。`SLA_ATTN` backend 代码
+> 仍在仓库里，但默认永远不会被选中；将来重启该实验时装包 + 加一行 attention-config 即可。
 
 ## 3. GPUStack 建实例
 
@@ -86,33 +69,13 @@ VLLM_OMNI_H3_LOG_STEP_MEMORY=1
 
 每档一个实例，4 卡，一机一档。
 
-### 3.2 最快档额外参数
+### 3.2 最快档
 
-在共同参数之外再加一行（**这是已实测的写法**）：
+无额外参数——与另外两档完全相同，只是权重路径与 `defaultSteps` 不同。
 
-```
---diffusion-attention-config={"default": {"backend": "SLA_ATTN", "block_sparse": {"sparsity": 0.85, "start_step": 0}}}
-```
-
-GPUStack 的参数框若对 JSON 里的空格/引号处理不好，改用点号形式（文档支持，但我没在 GPUStack 上实测过，用了要按 §5 验日志）：
-
-```
---diffusion-attention-config.default.backend=SLA_ATTN
---diffusion-attention-config.default.block_sparse.sparsity=0.85
---diffusion-attention-config.default.block_sparse.start_step=0
-```
-
-**注意 `--diffusion-attention-backend` 与它互斥**，两个一起给会直接报错。
-
-最快档建议再加一个环境变量，把上界钉在 15 秒：
-
-```
-VLLM_OMNI_H3_MAX_OUTPUT_SECONDS=15
-```
-
-（引擎侧只能限上界，**下界 10 秒必须在门面层挡**，见 §4。）
-
----
+> 若将来重新启用 SLA：加
+> `--diffusion-attention-config={"default": {"backend": "SLA_ATTN", "block_sparse": {"sparsity": 0.85, "start_step": 0}}}`，
+> 并确认镜像里装了 `sparse_linear_attention`（缺包会拒绝启动，不会静默降级）。
 
 ## 4. new-api 配置
 
@@ -120,10 +83,8 @@ VLLM_OMNI_H3_MAX_OUTPUT_SECONDS=15
 
 这是实际生效的步数来源。不配的话请求不带步数，会跑 yaml 里的默认 20 步——加速档的加速全部丢失，而且不会有任何报错。
 
-**最快档还要在门面层加两条**：
-
-1. **时长白名单 10-15 秒**。引擎侧契约最小值是 5 秒，不会拒绝 5 秒请求；而 5 秒档 0.85 的稀疏率既不是最优速度也不是最优画质。
-2. **确保 `aspect_ratio` 随请求下发**。历史上 `duration=6` 的 t2va 因为网关漏传这个字段全挂过，做时长白名单时把 10/15 两个值都过一遍。
+**门面层仍要确保 `aspect_ratio` 随请求下发**：历史上 `duration=6` 的 t2va 因为网关漏传这个
+字段全挂过。三档都服务 5-15 秒，不再需要最快档的时长白名单。
 
 全档位：门面层统一加 **−1 dBTP 限幅**。15 秒档实测五个档位音频全部削波，**满血基座也削**（+0.9 dBFS），这不是加速档引入的问题。
 
@@ -133,25 +94,9 @@ VLLM_OMNI_H3_MAX_OUTPUT_SECONDS=15
 
 **① 实例就绪**：`/v1/models` 返回 200。冷启动到就绪约 6-7 分钟。
 
-**② 最快档必须看到这两行**（只认引擎自己打的日志，不认 tag/env）：
+**② 三档都应看到 FlashAttention 被选中**（`Resolved diffusion attention backend 'FLASH_ATTN'`）。
 
-```
-Resolved diffusion attention backend 'SLA_ATTN' for role='self' via attention_config.default
-SLA_ATTN active: sparsity=0.85 (keeps 514 of 1716 key blocks), start_step=0, exempt_layers=0, rows=109795
-```
-
-第二行只在**第一次请求**时打。看不到它就是没走稀疏——最常见原因是镜像里没装 SLA 包（那样会在启动期直接失败，见下）或参数没生效。
-
-看到下面这行是**正常**的，那是 token_refiner 的短序列自动退回稠密：
-```
-SLA_ATTN staying dense: 76 rows is 2 key blocks, under the 32-block threshold
-```
-
-**③ 缺包的表现是启动失败，不是降级**：
-```
-ValueError: SLA_ATTN requires the `sparse_linear_attention` package ... pip install git+https://github.com/thu-ml/SLA.git
-```
-这是有意设计——稀疏蒸馏的权重跑在稠密路径上仍会正常出片，只是慢一截且偏离训练分布，静默降级对调用方和监控都不可见。
+**③ 三档的 shift 与步数来自各自的 partition 元数据**，不用也不能在启动参数里配。
 
 **④ 起完先打一发预热请求再放流量**：实例加载后的首发是稳态的 1.4~2 倍（10 秒档 199.4s vs 121.7s），含 Triton kernel 编译与 compile 预热。这一发的产物与稳态产物**不同**（同 seed 也不同），别拿它做基线。
 

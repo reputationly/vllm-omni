@@ -31,18 +31,6 @@ RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
       uv pip install --python "$PY" --no-cache-dir "$pkg" || echo "WARN: failed to install $pkg (model needing it won't serve)"; \
     done
 
-# Step 2b-1: SLA (Sparse-Linear Attention) kernels for the SLA_ATTN diffusion
-# attention backend — 纯 Triton,不编 CUDA,所以任何 torch>=2.7 的镜像都能装。
-# 只有按同等稀疏率蒸馏过的权重才用它(如 MiniMax-H3 Turbo-SLA);其余模型不选这个
-# backend 就等于没装。固定到具体 commit,免得上游改了 kernel 签名后镜像行为漂移。
-# 与上面同样是 best-effort:装不上时 SLA_ATTN 会在解析期直接拒绝启动(不会静默降级),
-# 其他 backend 不受影响。
-ARG SLA_COMMIT=main
-RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
-    uv pip install --python "$PY" --no-cache-dir \
-      "sparse_linear_attention @ git+https://github.com/thu-ml/SLA.git@${SLA_COMMIT}" \
-      || echo "WARN: failed to install sparse_linear_attention (SLA_ATTN backend won't serve)"
-
 # Step 2b-2: NLTK data for g2p-en (SoulX 集成 preprocess 的英文 G2P 初始化会在运行时
 # 下这些;离线节点下不了 → 构建时预置)。新旧 NLTK 的 tagger 名不同,两个都装。
 ENV NLTK_DATA=/usr/local/share/nltk_data
