@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -75,7 +75,7 @@ class FusedMoE:
         # Current vLLM FusedMoE handles output reduction internally.
         kwargs.pop("reduce_results", None)
         # FusedMoE is now a factory function; call it to get a MoERunner.
-        from vllm.model_executor.layers.fused_moe import FusedMoEFactory as _FusedMoE
+        from vllm.model_executor.layers.fused_moe import FusedMoE as _FusedMoE
 
         moe_runner = _FusedMoE(prefix=prefix, **kwargs)
 

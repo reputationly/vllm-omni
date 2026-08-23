@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright 2023 Antgroup and The HuggingFace Inc. team. All rights reserved.
 # Adapted from Ming
@@ -33,7 +34,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -332,7 +333,7 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
