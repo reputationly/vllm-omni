@@ -8,12 +8,20 @@
 > 文档定位：这不是一份实验测试报告（我们**没有在自己的机器上跑过 Music3**），
 > 而是一份**决策依据归档**。所有性能与音质结论都来自第三方，来源与日期逐条标注。
 > 后面重启这个话题时，先看 §8「重启决策的触发条件」，再看 §7「未验证清单」。
+>
+> **2026-08-23 更正（决议已重启，见下方 §0 后的更正说明）**：本文档 §5.1 的
+> cu130 结论、§6.1 的 `/v1/tasks/music/` 接入路径设想，**均基于「我们自己实现」
+> 的假设，与 upstream vLLM-Omni 实际已完成的原生移植不符**，不要照抄这两节的
+> 具体路径，只参考横向对比数据（能力子集、成本、音质证据）。详细更正与最新
+> 执行方案见 `docs/vLLM-Omni-Upstream同步执行方案与开发约定-2026-08-23.md` §4/§8。
 
 ---
 
 ## 0. 决策记录
 
 **2026-08-16 决议：暂不适配 MiniMax-Music3，音乐生成继续用 ACE-Step 1.5。**
+**2026-08-23 决议重启：正式排期上线**（触发条件见 §8 第 1 条——产品侧确认要做精品档）。
+下方决策依据仍是当时的真实记录，保留不改；决策本身已被上面新决议覆盖。
 
 决策依据（按权重排序）：
 
@@ -49,7 +57,7 @@ tail -f /tmp/dl_minimax_music3.log
 ```
 
 | 环境变量 | 作用 |
-|---|---|
+| --- | --- |
 | `SET=full`（默认） | 两套权重 + 官方样例音频，57.35 GB |
 | `SET=core` | 只要 diffusers ModularPipeline 的 7 个组件，28.52 GB |
 | `SET=native` | 只要 `qwen_7B/` + 两个 `.pth`，28.80 GB |
@@ -82,7 +90,7 @@ curl -s 'https://modelscope.cn/api/v1/models/MiniMax/MiniMax-Music3/repo/files?R
 blocks 类 `MiniMaxMusic3Blocks`，diffusers 版本 `0.40.0.dev0`，7 个组件：
 
 | 子目录 | 体积 | 类 | 关键配置 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `transformer/` | 9.73 GB | `MiniMaxMusic3Transformer1DModel`（diffusers） | 36 层，32 头 × head_dim 64，in_channels 128，condition_dim 2048，ff_inner_dim 8192 — Flow Matching 2.4B，**fp32 存储** |
 | `language_model/` | 17.17 GB | `Qwen3ForCausalLM`（transformers） | 全局 LLM 8B，出第 1 层 RVQ |
 | `rvq_depth_decoder/` | 1.29 GB | `MiniMaxMusic3RVQDepthDecoder`（diffusers） | 4 层，hidden 4096，num_codebooks 8，audio_vocab_size 1024 — 局部 LLM 0.6B，出其余 7 层 |
@@ -96,7 +104,7 @@ blocks 类 `MiniMaxMusic3Blocks`，diffusers 版本 `0.40.0.dev0`，7 个组件�
 **B. 官方原生 / SGLang-Omni 那套（`SET=native`，28.80 GB，57 个文件）**
 
 | 路径 | 体积 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `qwen_7B/qwen_7B/` | 18.46 GB | `AbabForCausalLM`，`model_type: mixtral`，vocab **200000**，36 层，hidden 4096，num_local_experts 1，内含 `decoder_num_layers: 4` 的 depth decoder、`audio_num_codebooks: 8` |
 | `qwen_7B/qwen3-8B-tokenizer-music/` | 16 MB | 带音乐 token 的 tokenizer |
 | `flowmatching_vae.pth` | 9.83 GB | 单文件最大 |
@@ -112,7 +120,7 @@ README 也没说 A 路径是否间接用到它们——这个判断**没有跑�
 
 ### 1.3 落地状态
 
-```
+```text
 /nfs-models/wuhanjisuan894/models/MiniMax-Music3   54 GiB（du -sh）
 ├── assets/minimax_ttm.wav        36 MB   官方样例输出，做验收 A/B 的基线
 ├── condition_encoder/            96 MB
@@ -137,7 +145,7 @@ README 也没说 A 路径是否间接用到它们——这个判断**没有跑�
 ### 2.1 架构
 
 | 组件 | 参数量 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | Global LLM | 8B | 从 Qwen3-8B 初始化，负责长程结构，预测第 1 层 RVQ codebook |
 | Local LLM | 0.6B | 逐帧预测其余 7 层声学 codebook |
 | Flow Matching | 2.4B | 融合两个 LLM 的 hidden states 后合成连续表征 |
@@ -154,7 +162,7 @@ Planner 每音频秒吐 **25 帧**。一首 2:30 的歌 = **3750 次串行的 8B
 ### 2.2 输入输出与硬约束
 
 | 项 | 值 |
-|---|---|
+| --- | --- |
 | 输入 | `prompt`（风格描述）+ `lyrics`（带 `[verse]`/`[chorus]` 等段落标记）+ `audio_duration` |
 | 输出 | **44.1 kHz 立体声** |
 | 时长上限 | 9000 帧 / 25 fps = **360 s** |
@@ -201,7 +209,7 @@ sf.write("song.wav", audio.T.float().cpu().numpy(), pipe.sampling_rate)
 ### 2.4 显存
 
 | 来源 | 配置 | 显存 |
-|---|---|---|
+| --- | --- | --- |
 | 官方 README | 满精度 | < 24 GB |
 | 官方 README | `ComponentsManager.enable_auto_cpu_offload` | ~22 GB |
 | 官方 README | `apply_group_offloading(pipe.language_model, offload_type="leaf_level")` | 8 GB 可跑 |
@@ -235,7 +243,7 @@ sf.write("song.wav", audio.T.float().cpu().numpy(), pipe.sampling_rate)
 ### 3.1 能力面：Music3 是真子集
 
 | 能力 | ACE-Step 1.5 | Music3 |
-|---|---|---|
+| --- | --- | --- |
 | 文生音乐 t2m | ✅ | ✅ |
 | 参考音频条件输入 | ✅ | ❌ |
 | Cover 翻唱生成 | ✅ | ❌ |
@@ -260,7 +268,7 @@ task_type 已经为 ACE-Step 开好，new-api 也实现了 `materializeMusicInpu
 ### 3.2 性能与成本
 
 | 配置 | 2:30 的歌 | 峰值显存 | RTF |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **ACE-Step xl-turbo · 我们的 A100 实测** | 240 s 曲 45 s / 600 s 曲 100 s | 26.5 GB | **0.17–0.19** |
 | ACE-Step XL Turbo · RTX 5090（Sogni） | ~25 s（热态） | ~20 GB | 0.17 |
 | Music3 int8 planner · RTX 5090（Sogni） | **~4–5 min**（实测 201–376 s） | ~11 GB | **1.6–2.1** |
@@ -274,7 +282,7 @@ task_type 已经为 ACE-Step 开好，new-api 也实现了 `materializeMusicInpu
 我们自己的 ACE-Step A100 完整数据（`ACE-Step-1.5/docs/acestep-a100-实验测试报告.md`）：
 
 | 时长 | 生成（热） | 峰值显存 | RTF |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 60 s | 20 s | 23.8 G | 0.33 |
 | 120 s | 35 s | 24.8 G | 0.29 |
 | 240 s | 45 s | 24.9 G | 0.19 |
@@ -286,7 +294,7 @@ task_type 已经为 ACE-Step 开好，new-api 也实现了 `materializeMusicInpu
 **成本**（Sogni 按自家算力计价）：
 
 | 长度 | Music3 | ACE-Step XL Turbo |
-|---|---|---|
+| --- | --- | --- |
 | 60 s | ~$0.26 | ~$0.011 |
 | 2:30 | ~$0.64 | ~$0.03 |
 | 5:00 | ~$1.28 | — |
@@ -320,13 +328,14 @@ ACE-Step 一侧的自称：介于 Suno v4.5–v5；第三方报道其 SongEval 8
 Sogni 六个 brief 全部要求 2:30：
 
 | | brief 1 | 2 | 3 | 4 | 5 | 6 |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | ACE-Step | 2:30 | 2:30 | 2:30 | 2:30 | 2:30 | 2:30 |
 | Music3 | 2:31 | 2:52 | 2:06 | 2:11 | 3:00 | 2:14 |
 
 **Music3 把 duration 当上限，自己决定什么时候结束并写结尾。**
 
 两个衍生问题：
+
 - **计费**：Sogni 的做法是按**请求时长**计费（因为模型可能提前结束）。
   我们 new-api 按 duration 计费的逻辑正好对得上，但"我要 3 分钟给了我 2:06"
   是要提前对用户说清的产品行为。
@@ -343,6 +352,7 @@ Sogni 自己的落地方式就是把 Music3 作为 premium tier 与 ACE-Step 并
 并明确 ACE-Step Turbo 仍然 "exceptionally competitive"。
 
 选择判据（Sogni 版，我们认可）：
+
 - **选 ACE-Step**：要速度、要精确时长、要控制、要编辑、要批量出稿
 - **选 Music3**：歌本身就是交付物、成品保真度是第一优先级
 
@@ -361,6 +371,7 @@ Sogni 自己的落地方式就是把 Music3 作为 premium tier 与 ACE-Step 并
 - Music3 recipe：30 步 / CFG 1.7 / euler-simple，planner CFG 1.7，top-k 50，int8 planner
 
 **6 个 brief**：
+
 1. Anthemic pop-rock 女主唱，122 BPM E minor — 考爆发人声真实度、逐句歌词贴合、副歌抬升
 2. Lo-fi hip-hop 器乐，78 BPM D♭ major — 考 Rhodes 音色、黑胶噪、律动
 3. Cinematic orchestral trailer，100 BPM D minor — 考固定音型到全奏的动态、铜管弦乐真实度
@@ -403,7 +414,7 @@ Arrangement 三段式结构化描述，而不是标签堆砌。
 ### 4.4 中文能力：证据打架，这是唯一没有定论的一格
 
 | 来源 | 结论 |
-|---|---|
+| --- | --- |
 | Sogni（2026-08-14） | 社区共识把**中文音乐**列为 Music3 最强项之一；12 曲展示里 Mandopop 首次生成即过 |
 | MiniMax 官方博客 | 主推中文，demo 含沪语爵士、国语抒情、国语对唱，甚至能指定"台湾腔演唱" |
 | MindStudio 评测 | 英文人声扎实，但**多语言输出偏弱** |
@@ -429,7 +440,14 @@ Arrangement 三段式结构化描述，而不是标签堆砌。
 
 ## 5. 对我们集群特有的风险
 
-### 5.1 ⚠️ int8 加速核需要 cu130+，我们上不去
+### 5.1 ⚠️ int8 加速核需要 cu130+（**2026-08-23 更正：不适用于我们实际的接入路径，见下方加粗段**）
+
+> **2026-08-23 更正**：本节的 int8/cu130 结论针对的是 ComfyUI 社区 int8 量化权重
+> 和 Sogni 的测试路径。我们实际接入的是 **upstream vLLM-Omni 的原生移植版本**
+> （`vllm_omni/model_executor/models/minimax_music3/`），其部署配置全程
+> `dtype: bfloat16`（stage 0）/ `dtype: float32`（stage 1），**代码和部署配置里
+> 完全没有 int8/fp8**，本节的 4× 罚单**不适用**。cu128 完全够用。详见
+> `docs/vLLM-Omni-Upstream同步执行方案与开发约定-2026-08-23.md` §4。
 
 Sogni 明确记录了这个坑：他们早期的 int8 数据差 **4 倍**，根因是**量化 kernel 在
 CUDA-12 构建上退化回 eager PyTorch**，需要 **cu130+**；启动日志会打
@@ -449,7 +467,7 @@ CUDA-12 构建上退化回 eager PyTorch**，需要 **cu130+**；启动日志会
 ### 5.2 门面时延参数是按 ACE-Step 秒级标定的
 
 | 位置 | 常量 | 当前值 | Music3 的问题 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `gpustack/routes/videos.py:487` | `_DEFAULT_MUSIC_LATENCY` | 30 s | 差一到两个数量级 |
 | `gpustack/config/config.py:199` | `lightx2v_music_max_queue_wait_seconds` | 90 s | 排队直接判超时 |
 | `gpustack/server/video_progress.py:42` | music 阶段权重 | prepare 5 / encode 10 / **denoise 70** / decode 10 / save 5 | Music3 大头在 AR 解码不在 denoise，进度条会失真 |
@@ -474,12 +492,20 @@ Music3 要钉未合并 PR 的 commit `dafe373`，H3 有自己的 diffusers 版�
 
 ## 6. 若将来要接：技术路线（已调研完，可直接执行）
 
-### 6.1 GPUStack 侧：音乐通道整条已经铺通了
+### 6.1 GPUStack 侧：音乐通道整条已经铺通了（**2026-08-23 更正：接入形态假设有误，见下方加粗段**）
+
+> **2026-08-23 更正**：本节假设 Music3 会走 ACE-Step 那条 `t2m/cover/repaint`
+> 异步 music 任务路径。实际 upstream 把 Music3 做成了 `tts_adapters/minimax_music3.py`，
+> **走 `/v1/audio/speech` 的 TTS 风格接口**（`input`=歌词，`instructions`=风格描述），
+> 不是本节设想的 `/v1/tasks/music/` 端点。gpustack 侧要怎么接这种"task_type 语义是
+> music、但引擎侧是同步 speech 接口"的模型，需要重新查一遍 gpustack 的路由逻辑，
+> 本节下方的具体路径（新增 `/v1/tasks/music/` 端点等）**不要照抄**。详见
+> `docs/vLLM-Omni-Upstream同步执行方案与开发约定-2026-08-23.md` §4。
 
 好消息是 ACE-Step 已经把路修完，Music3 不用新建通道：
 
 | 层 | 现状 | 位置 |
-|---|---|---|
+| --- | --- | --- |
 | task_type 白名单 | `t2m / cover / repaint` 已在 | `gpustack/routes/videos.py:244` |
 | engine kind 路由 | → `music` → `POST /v1/tasks/music/` | `videos.py:493-503` |
 | 输出扩展名 | `.mp3` | `videos.py:511` |
@@ -499,7 +525,7 @@ Music3 要钉未合并 PR 的 commit `dafe373`，H3 有自己的 diffusers 版�
 三仓改动量：
 
 | 仓 | 改动 |
-|---|---|
+| --- | --- |
 | **vllm-omni** | ① pipeline 接入（主要工作量）② 抄 audiogen 那 40 行加 `/v1/tasks/music/` ③ 输出落 mp3 |
 | **gpustack** | `scheduler.py:724` 的 `_VLLM_OMNI_CATEGORY_HINTS` 加一行 `("minimax-music3", CategoryEnum.MUSIC)`；加 model-catalog 条目 + 图标。**门面零改** |
 | **new-api** | `adaptor.go:811` 的 t2m 推断现在只认 `acestep` 系名字，加规则；`MusicModelConfig` 加模型（只开 t2m tab） |
@@ -523,7 +549,7 @@ registry（Wan 系已用于加载期注入 `boundary_ratio` / `flow_shift`）。
 
 **它明确放弃的东西**（源码注释写死）：
 
-```
+```text
 It does NOT support:
 - CFG parallel
 - Sequence parallel (requires model-specific attention surgery)
@@ -557,6 +583,7 @@ diffusers 的 modular 体系是新模型的主流出货方式，扩一次所有 
 在"写出来跟官方不是一个东西"。adapter 天然零契约漂移——那是同一份代码在跑。
 
 **正确姿势是两段式，不是二选一**：
+
 1. 新模型先用 adapter 上线，拿正确性和 time-to-first-run；
 2. 只有当时延/显存/QPS 不达标，**且 profiler 证明瓶颈在 DiT 上**，才做原生移植换并行和 cache，
    并拿 adapter 那条路当 oracle 做逐阶段 parity。
@@ -590,7 +617,7 @@ diffusers 工程化能把"接一个新模型"从两周压到几天，但压不�
 **权重已在 NFS 上，这些都是半天内能拿到的数。**
 
 | # | 要验证什么 | 为什么重要 | 判据 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | **中文咬字/唱腔盲测**，与 ACE-Step xl-turbo 同歌词同风格，每边 10 条双盲 | §4.4 第三方证据打架，是唯一没定论的一格 | Music3 需**明显优于** ACE-Step，否则连高端档的立足点都没有 |
 | 2 | **cu128 上的实际耗时**（60 s / 240 s 曲） | §5.1，决定成本是 20× 还是 80× | 落在哪一档决定定价可行性 |
 | 3 | **单卡能否跑完**（A100 40G） | 官方 SGLang 是 2 卡切分；若单卡不行，节点密度腰斩 | 单卡跑不完则成本再翻倍 |
@@ -600,6 +627,7 @@ diffusers 工程化能把"接一个新模型"从两周压到几天，但压不�
 | 7 | 产物与 `assets/minimax_ttm.wav` 对拍 | 确认我们跑的路径与官方一致 | 后续判断移植有没有跑偏的唯一基线 |
 
 **判死线（先定后测，避免测完再找理由）**：
+
 - 第 1 项不显著胜出 → **直接判死**，能力面子集 + 授权负担 + 成本三条全占
 - 第 2 项吃到 4× 罚单且第 1 项只是小胜 → 判死
 - 第 3 项需要 2 卡 → 门槛再抬一档
@@ -653,7 +681,7 @@ IMAGE="$REG/reputationly/acestep:arm64-a100-latest" \
 ## 10. 一页速查
 
 | 维度 | ACE-Step 1.5 | MiniMax-Music3 |
-|---|---|---|
+| --- | --- | --- |
 | 授权 | **MIT** | 社区许可（UI 挂标 + $20M 门槛 + 托管方保障义务） |
 | 能力面 | t2m + cover + repaint + stem + 多轨 + Vocal2BGM + 音频理解 + LRC + LoRA | **仅 t2m**（encoder 未释出） |
 | 时长 | 10 s – 600 s，**精确命中** | ≤ 360 s，**上限而非目标** |
@@ -673,10 +701,10 @@ IMAGE="$REG/reputationly/acestep:arm64-a100-latest" \
 
 ## 附录 A：参考索引
 
-**本仓 / 关联仓文档**
+### 本仓 / 关联仓文档
 
 | 内容 | 位置 |
-|---|---|
+| --- | --- |
 | 下载脚本 | `scripts/download_minimax_music3.sh` |
 | ACE-Step A100 实验测试报告（我们自己的实测） | `ACE-Step-1.5/docs/acestep-a100-实验测试报告.md` |
 | ACE-Step GPUStack 异步门面 | `ACE-Step-1.5/acestep/api/http/tasks_facade_{routes,service}.py` |
@@ -684,10 +712,10 @@ IMAGE="$REG/reputationly/acestep:arm64-a100-latest" \
 | H3 官方 Diffusers 流程对齐任务书（parity 方法论） | `docs/MiniMax-H3-官方Diffusers流程对齐开发与验收指南.md` |
 | Ideogram-4 接入调研（同类文档范式） | `docs/Ideogram-4-接入调研与路线选型报告.md` |
 
-**关键代码位置**
+### 关键代码位置
 
 | 内容 | 位置 |
-|---|---|
+| --- | --- |
 | diffusers 黑盒适配层 | `vllm_omni/diffusion/models/diffusers_adapter/pipeline_diffusers_adapter.py` |
 | adapter 选路 | `vllm_omni/diffusion/model_loader/diffusers_loader.py:684` |
 | adapter per-pipeline 钩子 | `vllm_omni/diffusion/models/diffusers_adapter/pipeline_utils.py` |
@@ -702,7 +730,7 @@ IMAGE="$REG/reputationly/acestep:arm64-a100-latest" \
 **外部来源**（括号内为查阅日期 2026-08-16 时的状态）
 
 | 来源 | 用于本文哪一节 |
-|---|---|
+| --- | --- |
 | [Sogni Labs — MiniMax Music 3 vs. ACE-Step 1.5 XL](https://blog.sogni.ai/blogs/minimax-music3-vs-ace-step-15-xl/)（2026-08-14，**唯一同题对拍**） | §3.2 §3.3 §3.4 §4.1 §5.1 |
 | [HuggingFace 讨论区 #4](https://huggingface.co/MiniMaxAI/MiniMax-Music3/discussions/4) | §4.2 §4.3 |
 | [MiniMax 官方博客](https://www.minimax.io/blog/minimax-music-3-0-next-generation-open-weights-production-ready-versatile-music-model)（零 benchmark） | §2.1 §4.4 |

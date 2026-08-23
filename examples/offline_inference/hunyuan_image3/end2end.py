@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 HunyuanImage-3.0-Instruct unified end-to-end inference script.
 """
@@ -73,7 +76,6 @@ def parse_args():
     )
     parser.add_argument("--sys-type", type=str, default=None, help="Override system prompt type.")
     parser.add_argument("--deploy-config", type=str, default=None, help="Custom deploy YAML path.")
-    parser.add_argument("--stage-configs-path", type=str, default=None, help="Custom legacy stage config YAML path.")
     parser.add_argument(
         "--stream",
         action="store_true",
@@ -146,13 +148,7 @@ def main():
     else:
         bot_task = args.bot_task
 
-    if args.deploy_config is not None and args.stage_configs_path is not None:
-        raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive.")
-
-    deploy_config = args.deploy_config
-    stage_configs_path = args.stage_configs_path
-    if deploy_config is None and stage_configs_path is None:
-        deploy_config = _MODALITY_DEFAULT_DEPLOY_CONFIG[args.modality]
+    deploy_config = args.deploy_config or _MODALITY_DEFAULT_DEPLOY_CONFIG[args.modality]
 
     omni_kwargs = {
         "model": args.model,
@@ -172,10 +168,7 @@ def main():
 
     if additional_config is not None:
         omni_kwargs["additional_config"] = additional_config
-    if deploy_config is not None:
-        omni_kwargs["deploy_config"] = deploy_config
-    else:
-        omni_kwargs["stage_configs_path"] = stage_configs_path
+    omni_kwargs["deploy_config"] = deploy_config
 
     omni = Omni(**omni_kwargs)
 
@@ -276,10 +269,7 @@ def main():
     print(f"  Modality: {args.modality}")
     print(f"  Prompt task: {task}")
     print(f"  Bot task: {bot_task}")
-    if deploy_config is not None:
-        print(f"  Deploy config: {deploy_config}")
-    else:
-        print(f"  Stage config: {stage_configs_path}")
+    print(f"  Deploy config: {deploy_config}")
     print(f"  Num stages: {omni.num_stages}")
     if args.modality in ("text2img", "img2img"):
         print(f"  Inference steps: {args.steps}")
@@ -307,7 +297,7 @@ def main():
     )
     img_idx = 0
     for req_output in omni_outputs:
-        ro = getattr(req_output, "request_output", None)
+        ro = req_output
         stage_id = getattr(req_output, "stage_id", None)
 
         # AR stage text — each CompletionOutput.text is already a delta when

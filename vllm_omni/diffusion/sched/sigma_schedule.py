@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -13,12 +13,18 @@ BASE_SCHEDULE_KEY = "base_schedule"
 
 @dataclass(frozen=True)
 class DMD2SigmaSchedule:
-    """Recommended rectified-flow positions carried by a distilled checkpoint.
+    """Continuous rectified-flow positions pinned by a distilled checkpoint.
 
-    Entries are sigma boundaries. A schedule with N+1 boundaries performs N
-    transformer evaluations.  The checkpoint's schedule supplies its default
-    and records the grid it was distilled on; callers may still request a
-    different NFE, as the official MiniMax-H3-Turbo inference entry point does.
+    A DMD2 student only ever sees the few noise levels it was trained on, so a
+    distilled release ships the exact positions instead of letting the server
+    derive a uniform schedule from ``num_inference_steps``.
+
+    This is deliberately distinct from
+    ``vllm_omni.diffusion.models.dmd2.DMD2Config.denoising_timesteps``, which
+    carries integer scheduler timesteps for scheduler-backed pipelines. Here the
+    entries are continuous positions in ``[0, 1]`` that still need a per-modality
+    time shift applied, which is what lets one schedule drive several coupled
+    modalities at different shift scales.
     """
 
     base_schedule: tuple[float, ...]
@@ -27,6 +33,8 @@ class DMD2SigmaSchedule:
         values = self.base_schedule
         if len(values) < 2:
             raise ValueError("DMD2 base_schedule needs at least 2 entries")
+        # Ordering comparisons are all false against NaN, so non-finite entries
+        # have to be rejected before the monotonicity check rather than after it.
         if any(not math.isfinite(value) for value in values):
             raise ValueError("DMD2 base_schedule entries must be finite")
         if values[0] != 1.0 or values[-1] != 0.0:
@@ -45,6 +53,12 @@ class DMD2SigmaSchedule:
         *,
         key: str = BASE_SCHEDULE_KEY,
     ) -> DMD2SigmaSchedule | None:
+        """Read a schedule from checkpoint metadata.
+
+        An absent key means the release is not distilled and keeps the legacy
+        uniform schedule. An explicitly empty value is a malformed contract and
+        is rejected rather than silently falling back.
+        """
         raw = metadata.get(key)
         if raw is None:
             return None
@@ -52,13 +66,15 @@ class DMD2SigmaSchedule:
 
     @property
     def num_inference_steps(self) -> int:
+        """Denoising steps, i.e. one per interval between sigma boundaries."""
         return len(self.base_schedule) - 1
 
     def shifted_sigmas(self, shift_scale: float) -> list[float]:
+        """Apply the rectified-flow time shift for one modality."""
         if shift_scale <= 0:
             raise ValueError("DMD2 shift_scale must be > 0")
         shift = float(shift_scale)
-        return [shift * value / (1 + (shift - 1) * value) for value in self.base_schedule]
+        return [shift * u / (1 + (shift - 1) * u) for u in self.base_schedule]
 
     def positions_for_num_inference_steps(self, num_inference_steps: int) -> tuple[float, ...]:
         """Return this grid at its native NFE, or a uniform N+1 grid otherwise."""
@@ -70,4 +86,7 @@ class DMD2SigmaSchedule:
         return tuple(float(steps - index) / steps for index in range(steps + 1))
 
 
-__all__ = ["BASE_SCHEDULE_KEY", "DMD2SigmaSchedule"]
+__all__ = [
+    "BASE_SCHEDULE_KEY",
+    "DMD2SigmaSchedule",
+]

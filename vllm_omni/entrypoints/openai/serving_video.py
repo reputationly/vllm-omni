@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ import copy
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from http import HTTPStatus
-from typing import Any, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import HTTPException
 from PIL import Image
@@ -33,8 +35,12 @@ from vllm_omni.entrypoints.openai.stage_params import (
     get_default_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
+from vllm_omni.entrypoints.openai.video_api_utils import (
+    _encode_video_bytes,
+    encode_video_base64,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.model_extras import should_preserve_reference_image_size
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
@@ -42,6 +48,9 @@ from vllm_omni.outputs.output_metadata import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 
 @dataclass
@@ -93,6 +102,12 @@ class OmniOpenAIServingVideo:
         self._model_name = model_name
         self._stage_configs = stage_configs
 
+    def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
+        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
+        if callable(get_od_config):
+            return get_od_config()
+        return getattr(self._engine_client, "od_config", None)
+
     @property
     def model_name(self) -> str | None:
         return self._model_name
@@ -118,6 +133,27 @@ class OmniOpenAIServingVideo:
         if callable(get_od_config):
             return get_od_config()
         return getattr(self._engine_client, "od_config", None)
+
+    @cached_property
+    def preserves_reference_image_size(self) -> bool:
+        """Return whether the active pipeline owns reference-image resizing.
+
+        Backed by the ``model_extras`` registry (currently LTX2 only), which is
+        independent of the MiniMax-H3 contract resolved by
+        ``_reference_images_bind_output_canvas_for_request``. Both checks gate
+        the same resize decision at the one call site that needs them; for any
+        model without a registered resolver this returns False and is a no-op.
+        """
+        od_config = self._resolve_diffusion_od_config()
+        model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
+        model = getattr(od_config, "model", None) if od_config is not None else None
+        model = model or self.model_name
+        revision = getattr(od_config, "revision", None) if od_config is not None else None
+        return should_preserve_reference_image_size(
+            model_class_name,
+            model=None if model is None else str(model),
+            revision=revision,
+        )
 
     @property
     def supports_mixed_reference_inputs(self) -> bool:
@@ -262,6 +298,9 @@ class OmniOpenAIServingVideo:
                 reference_audio=reference_audio,
                 requested_task=(request.extra_params or {}).get("task"),
             )
+            # LTX2's independent model_extras opt-out (see preserves_reference_image_size);
+            # a no-op for every model without a registered resolver, including MiniMax-H3.
+            and not self.preserves_reference_image_size
         ):
             # Stretches, not cover-crops: a reference whose aspect ratio differs
             # from the canvas is distorted here, and the model's own aspect-ratio
@@ -434,7 +473,11 @@ class OmniOpenAIServingVideo:
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(video, fps=artifacts.output_fps, video_codec_options=video_codec_options)
+                    encode_video_base64(
+                        video,
+                        fps=artifacts.output_fps,
+                        video_codec_options=video_codec_options,
+                    )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
                         video,
@@ -629,16 +672,6 @@ class OmniOpenAIServingVideo:
         videos = None
         if hasattr(result, "images") and result.images:
             videos = result.images
-        elif hasattr(result, "request_output"):
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("images"):
-                videos = request_output["images"]
-            elif hasattr(request_output, "images") and request_output.images:
-                videos = request_output.images
-            else:
-                request_multimodal_output = getattr(request_output, "multimodal_output", None)
-                if isinstance(request_multimodal_output, Mapping):
-                    videos = request_multimodal_output.get("video")
         if videos is None:
             multimodal_output = getattr(result, "multimodal_output", None)
             if isinstance(multimodal_output, Mapping):
@@ -658,16 +691,6 @@ class OmniOpenAIServingVideo:
         multimodal_output = getattr(result, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             audio = multimodal_output.get("audio")
-        elif hasattr(result, "request_output"):
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("multimodal_output"):
-                mm_output = request_output.get("multimodal_output") or {}
-                if isinstance(mm_output, Mapping):
-                    audio = mm_output.get("audio")
-            else:
-                request_multimodal_output = getattr(request_output, "multimodal_output", None)
-                if isinstance(request_multimodal_output, Mapping):
-                    audio = request_multimodal_output.get("audio")
 
         if audio is None:
             return [None] * expected_count
@@ -723,7 +746,7 @@ class OmniOpenAIServingVideo:
         if isinstance(multimodal_output, Mapping):
             return dict(multimodal_output)
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output")
             if multimodal_output is None:
@@ -840,7 +863,7 @@ class OmniOpenAIServingVideo:
                 except (TypeError, ValueError):
                     pass
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             mm = request_output.get("multimodal_output") or {}
             if isinstance(mm, Mapping):
@@ -879,7 +902,7 @@ class OmniOpenAIServingVideo:
             if sample_rate is not None:
                 return sample_rate
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output") or {}
             if isinstance(multimodal_output, Mapping):

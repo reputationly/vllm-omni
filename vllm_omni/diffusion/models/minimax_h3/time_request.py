@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -39,6 +40,13 @@ def _time_shift_sigmas(
     shift_scale: float = 6.0,
     base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
+    """Build a shifted sigma schedule.
+
+    ``base_schedule`` supplies the rectified-flow positions explicitly and takes
+    precedence over ``num_steps``. Distilled checkpoints need it because their
+    few-step schedule is not the uniform one ``num_steps`` produces; validation
+    and the shift itself live in the shared :class:`DMD2SigmaSchedule`.
+    """
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
 
@@ -55,6 +63,9 @@ def _time_shift_sigmas(
         raise ValueError("MiniMax H3 num_steps must be > 0")
 
     import torch
+
+    if num_steps <= 0:
+        raise ValueError("MiniMax H3 num_steps must be > 0")
 
     # The rectified-flow sigma range is fixed at [1.0, 0.0].
     # Diffusers counts denoising intervals (transformer evaluations), while a

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 Qwen3-VL layer-50 text/vision encoder.
 
 The encoder is reimplemented on top of vLLM-style tensor-parallel building
@@ -38,6 +39,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearBase
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -115,33 +117,52 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
 class _Int8WeightMixin:
     """Optional serialized-Int8 storage for the encoder's TP linear layers.
 
-    Switched on after construction rather than through the constructors, so the
-    BF16 path — every signature, every default, ``F.linear`` on a BF16 tensor —
-    is unchanged for a checkpoint that carries no ``quantization_config``. Only
-    a checkpoint that ships ``weight_scale`` tensors takes the other branch.
+    Layers using this mixin also inherit ``LinearBase`` (see the concrete
+    classes below), which is what gives ``self.quant_method``,
+    ``self.prefix`` and ``self.output_dtype`` their meaning here.
 
-    Weight-only: the scale is folded back before the GEMM, so activations,
-    accumulation and every non-linear op keep their existing numerics. What this
-    buys is residency — 45.4 GiB of BF16 projections become 22.7 GiB — and the
-    dequantized copy is one layer's weight, materialized and freed inside the
-    call rather than held for the life of the engine.
+    Switched on after construction rather than through the constructors, so the
+    BF16 path — every signature, every default, ``self.quant_method`` staying
+    the ``UnquantizedLinearMethod`` ``LinearBase.__init__`` resolved for
+    ``quant_config=None`` — is unchanged for a checkpoint that carries no
+    ``quantization_config``. Only a checkpoint that ships ``weight_scale``
+    tensors takes the other branch, and it must happen after the caller's
+    ``.to(dtype)`` on the owning module: the float32 scale created here would
+    otherwise be swept into the model's dtype cast and lose the precision it
+    exists for.
+
+    Deliberately does not build storage through
+    ``self.quant_method.create_weights`` (the standard vLLM path for a
+    quantized ``LinearBase``): that helper attaches one ``weight_loader`` to
+    both the weight and the scale, and this encoder's row-parallel layer needs
+    two different ones (weight shards along its input, scale is replicated
+    per output row). Building storage by hand keeps the existing, already
+    correct per-layer ``weight_loader``/``scale_loader`` pair instead of
+    fighting the generic helper's single-loader assumption.
+
+    Weight-only: the scale is folded back before the GEMM by
+    ``Int8WeightOnlyLinearMethod``, so activations, accumulation and every
+    non-linear op keep their existing numerics. What this buys is residency —
+    45.4 GiB of BF16 projections become 22.7 GiB.
     """
 
     def enable_int8(self) -> None:
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
         weight = self.weight  # type: ignore[attr-defined]
         if weight.dtype == torch.int8:
             return
-        self._compute_dtype = weight.dtype
         int8_weight = nn.Parameter(torch.empty(weight.shape, dtype=torch.int8), requires_grad=False)
         int8_weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self.weight = int8_weight  # type: ignore[attr-defined]
         scale = nn.Parameter(torch.empty(weight.shape[0], 1, dtype=torch.float32), requires_grad=False)
         scale.weight_loader = self.scale_loader  # type: ignore[attr-defined]
         self.weight_scale = scale  # type: ignore[attr-defined]
-
-    @property
-    def compute_dtype(self) -> torch.dtype:
-        return getattr(self, "_compute_dtype", self.weight.dtype)  # type: ignore[attr-defined]
+        # Re-resolve through the standard QuantizationConfig entry point (CUDA
+        # vs NPU, weight-only vs full W8A8) instead of hardcoding a method
+        # class, so this keeps working if the platform dispatch changes.
+        int8_config = DiffusionInt8Config(is_checkpoint_int8_serialized=True, activation_scheme="weight_only")
+        self.quant_method = int8_config.get_quant_method(self, self.prefix)  # type: ignore[attr-defined]
 
     def scale_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -156,13 +177,22 @@ class _Int8WeightMixin:
         self.weight_loader(param, loaded_weight, loaded_shard_id)  # type: ignore[attr-defined]
 
     def dense_weight(self) -> torch.Tensor:
+        """Full dense weight, dequantizing Int8 storage back to BF16 first.
+
+        Used only where a caller reaches past ``forward()``/``quant_method.apply``
+        into this layer's storage directly (the fused QKV/gate-up split below),
+        to keep that path's three-separate-GEMM numerics identical regardless
+        of storage dtype. ``forward()`` itself never calls this — it dispatches
+        through ``self.quant_method.apply``, which does its own (kernel-fused,
+        never-materialized-dense) dequantization for Int8 storage.
+        """
         weight = self.weight  # type: ignore[attr-defined]
         if weight.dtype != torch.int8:
             return weight
-        return (weight.to(torch.float32) * self.weight_scale).to(self.compute_dtype)  # type: ignore[attr-defined]
+        return (weight.to(torch.float32) * self.weight_scale).to(self.output_dtype)  # type: ignore[attr-defined]
 
 
-class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_Int8WeightMixin, nn.Module):
+class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_Int8WeightMixin, LinearBase):
     """Packed gate/up projection sharded along the output dimension."""
 
     def __init__(
@@ -172,7 +202,6 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_Int8WeightMixin, nn.Module):
         intermediate_size: int,
         dtype: torch.dtype,
     ) -> None:
-        super().__init__()
         self.group = group
         self.input_size = input_size
         self.intermediate_size = intermediate_size
@@ -181,13 +210,30 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_Int8WeightMixin, nn.Module):
             f"intermediate_size {intermediate_size} must be divisible by text_encoder_tp_size {tp_size}"
         )
         self.intermediate_size_per_partition = intermediate_size // tp_size
+        self.output_dtype = dtype
+        # quant_config is always None here: Int8 activation is a post-construction
+        # toggle (see _Int8WeightMixin.enable_int8), driven by the checkpoint
+        # rather than by a config object threaded through this constructor.
+        super().__init__(
+            input_size=input_size,
+            output_size=2 * intermediate_size,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=None,
+            prefix="",
+            disable_tp=True,
+        )
         self.weight = nn.Parameter(torch.empty(2 * self.intermediate_size_per_partition, input_size, dtype=dtype))
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+        # Read by Int8WeightOnlyLinearMethod.apply (sizes/reshapes its GEMM
+        # output); bypassing quant_method.create_weights means nothing else
+        # sets it.
+        self.output_size_per_partition = 2 * self.intermediate_size_per_partition
         self._tp_rank = tp_rank
         self._tp_size = tp_size
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.dense_weight())
+        return self.quant_method.apply(self, input_)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -200,7 +246,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_Int8WeightMixin, nn.Module):
             param.data[0:shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLQKVParallelLinear(_Int8WeightMixin, nn.Module):
+class MiniMaxH3Qwen3VLQKVParallelLinear(_Int8WeightMixin, LinearBase):
     """QKV projection with GQA head sharding along the output dimension."""
 
     def __init__(
@@ -212,7 +258,6 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(_Int8WeightMixin, nn.Module):
         head_dim: int,
         dtype: torch.dtype,
     ) -> None:
-        super().__init__()
         self.group = group
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -229,13 +274,27 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(_Int8WeightMixin, nn.Module):
         self.local_num_kv_heads = num_kv_heads // tp_size
         q_local = self.local_num_heads * head_dim
         kv_local = self.local_num_kv_heads * head_dim
+        self.output_dtype = dtype
+        # See MergedColumnParallelLinear: quant_config is always None, Int8 is
+        # a post-construction toggle.
+        super().__init__(
+            input_size=hidden_size,
+            output_size=(num_heads + 2 * num_kv_heads) * head_dim,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=None,
+            prefix="",
+            disable_tp=True,
+        )
         self.weight = nn.Parameter(torch.empty(q_local + 2 * kv_local, hidden_size, dtype=dtype))
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+        # See MergedColumnParallelLinear for why this is set by hand.
+        self.output_size_per_partition = q_local + 2 * kv_local
         self._tp_rank = tp_rank
         self._tp_size = tp_size
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.dense_weight())
+        return self.quant_method.apply(self, input_)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -288,7 +347,7 @@ def _verify_fused_shards_complete(
     raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
 
 
-class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, nn.Module):
+class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, LinearBase):
     def __init__(
         self,
         group: Any,
@@ -297,16 +356,29 @@ class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, nn.Module):
         dtype: torch.dtype,
         input_is_parallel: bool = True,
     ) -> None:
-        super().__init__()
         self.group = group
-        self.input_size = input_size
-        self.output_size = output_size
         self.input_is_parallel = input_is_parallel
+        self.output_dtype = dtype
         tp_rank, tp_size = _tp_range(group)
         assert input_size % tp_size == 0, f"input_size {input_size} must be divisible by text_encoder_tp_size {tp_size}"
         self.input_size_per_partition = input_size // tp_size
+        # See MergedColumnParallelLinear: quant_config is always None, Int8 is
+        # a post-construction toggle.
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=None,
+            prefix="",
+            disable_tp=True,
+        )
         self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition, dtype=dtype))
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+        # This layer shards its input, not its output, so unlike the two
+        # classes above, the full output_size is what Int8WeightOnlyLinearMethod
+        # .apply needs (see MergedColumnParallelLinear for why this is set by hand).
+        self.output_size_per_partition = output_size
         self._tp_rank = tp_rank
         self._tp_size = tp_size
 
@@ -316,7 +388,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, nn.Module):
         else:
             split_input = input_.split(self.input_size_per_partition, dim=-1)
             input_parallel = split_input[self._tp_rank].contiguous()
-        output_parallel = F.linear(input_parallel, self.dense_weight())
+        output_parallel = self.quant_method.apply(self, input_parallel)
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
@@ -324,10 +396,10 @@ class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, nn.Module):
             # and amplify error on this model's large-magnitude activations.
             output_parallel = output_parallel.float()
             self.group.all_reduce(output_parallel)
-            # ``compute_dtype`` rather than ``self.weight.dtype``: under Int8
+            # ``output_dtype`` rather than ``self.weight.dtype``: under Int8
             # storage the weight is int8 and casting the reduced activations to
             # it would quantize the layer's *output*.
-            output_parallel = output_parallel.to(self.compute_dtype)
+            output_parallel = output_parallel.to(self.output_dtype)
         return output_parallel
 
     def weight_loader(

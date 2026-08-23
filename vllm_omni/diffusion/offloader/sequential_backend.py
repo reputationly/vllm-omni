@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -11,7 +13,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig
+from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
 from .module_collector import ModuleDiscovery, PipelineModules
 
 logger = init_logger(__name__)
@@ -284,6 +286,7 @@ def apply_sequential_offload(
     device: torch.device,
     pin_memory: bool = True,
     use_hsdp: bool = False,
+    offload_initial_dits: bool = False,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -297,6 +300,7 @@ def apply_sequential_offload(
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
         use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
+        offload_initial_dits: Whether to begin with all DiT modules on CPU.
 
     Example:
         >>> apply_sequential_offload(
@@ -331,6 +335,14 @@ def apply_sequential_offload(
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", enc.__class__.__name__)
 
+    if offload_initial_dits:
+        try:
+            for dit_mod in dit_modules:
+                _get_sequential_offload_hook(dit_mod)._to_cpu(dit_mod)
+        except Exception:
+            remove_sequential_offload([*dit_modules, *encoder_modules])
+            raise
+
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
     """Remove sequential offloading hooks from modules.
@@ -349,6 +361,31 @@ def remove_sequential_offload(modules: list[nn.Module]) -> None:
             logger.debug("Removed offload hook from %s", module.__class__.__name__)
 
 
+def _get_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook:
+    registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+    hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
+    if not isinstance(hook, SequentialOffloadHook):
+        raise RuntimeError(f"{module.__class__.__name__} has no sequential offload hook")
+    return hook
+
+
+@contextmanager
+def sequential_offload_component(module: nn.Module) -> Iterator[None]:
+    """Activate and release a hooked component called outside ``forward``."""
+    hook = _get_sequential_offload_hook(module)
+    try:
+        hook.pre_forward(module)
+        yield
+    except BaseException:
+        try:
+            hook._to_cpu(module)
+        except Exception:
+            logger.exception("Failed to release %s after component failure", module.__class__.__name__)
+        raise
+    else:
+        hook._to_cpu(module)
+
+
 class ModelLevelOffloadBackend(OffloadBackend):
     """Model-level (sequential) offloading backend.
 
@@ -358,7 +395,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
         self._offload_modules: list[nn.Module] = []  # Track modules with hooks
-        self._custom_pipeline: nn.Module | None = None
+        self._custom_pipeline: SupportsModelCpuOffload | None = None
 
     # Headroom, in GiB, that must remain free on the device after the DiT joins
     # the encoder there for the swap to be skipped. Unset disables the check and
@@ -440,16 +477,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
 
-        # Pipelines with a nested transformer (e.g. Cosmos3's reasoner/generator
-        # pathways) own their own mutual-exclusion swaps and cannot be offloaded
-        # with the generic encoder<->DiT hooks. Delegate to the custom hook.
-        # TODO: Cosmos3 is the only implementer today, so we duck-type the
-        # enable/disable_omni_model_cpu_offload pair via getattr. Once a second
-        # pipeline needs it, formalize this as a Protocol (like
-        # SupportsComponentDiscovery) instead of getattr detection.
-        custom_enable = getattr(pipeline, "enable_omni_model_cpu_offload", None)
-        if callable(custom_enable):
-            custom_enable(
+        # Pipelines with non-forward component entry points own their complete
+        # mutual-exclusion lifecycle. Delegate through the explicit protocol.
+        if isinstance(pipeline, SupportsModelCpuOffload):
+            pipeline.enable_omni_model_cpu_offload(
                 device=self.device,
                 pin_memory=self.config.pin_cpu_memory,
                 use_hsdp=self.config.use_hsdp,
@@ -539,9 +570,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         if self._custom_pipeline is not None:
-            custom_disable = getattr(self._custom_pipeline, "disable_omni_model_cpu_offload", None)
-            if callable(custom_disable):
-                custom_disable()
+            self._custom_pipeline.disable_omni_model_cpu_offload()
             self._custom_pipeline = None
             self.enabled = False
             logger.info("Model-level offloading disabled")
