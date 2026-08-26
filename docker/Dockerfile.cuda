@@ -38,6 +38,19 @@ RUN python3 -m nltk.downloader -d /usr/local/share/nltk_data \
       averaged_perceptron_tagger averaged_perceptron_tagger_eng cmudict \
       || echo "WARN: nltk data download failed (English SVS 集成 preprocess may need it)"
 
+# Step 2d: SpargeAttn (thu-ml) — compiled CUDA kernel for the SLA_SAGE2_ATTN
+# diffusion attention backend (MiniMax-H3 sage2 block-sparse path). Only
+# CTA_Q=128/CTA_K=64 is compiled upstream for sm80/86/87 — fleet is A100
+# (sm80). --no-build-isolation is required: setup.py imports torch at module
+# level, which breaks pip's default isolated build env. Best-effort: a
+# compile failure here shouldn't fail the whole image, SLA_SAGE2_ATTN just
+# surfaces a clear "backend unavailable" error at serve time.
+RUN (git clone --depth 1 https://github.com/thu-ml/SpargeAttn.git /tmp/SpargeAttn \
+      && cd /tmp/SpargeAttn \
+      && TORCH_CUDA_ARCH_LIST=8.0 pip install . --no-build-isolation \
+      && rm -rf /tmp/SpargeAttn) \
+      || echo "WARN: SpargeAttn build failed (SLA_SAGE2_ATTN backend won't be available)"
+
 # Step 2c: Bake the A100 40G x2 deploy-configs for the 8B MOSS models (TTSD /
 # SoundEffect / VoiceGenerator) + SoulX-Singer SVS/SVC to a stable in-image path
 # so GPUStack can reference them via `--deploy-config /deploy-configs/<x>.yaml`.
