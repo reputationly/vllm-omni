@@ -36,6 +36,7 @@ For the internal selector, registry, and platform contract, see
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | `SLA_ATTN` | Block sparse | SLA (Sparse-Linear Attention) top-k block-sparse attention, CUDA/Triton | [SLA_ATTN backend](#sla_attn-backend-and-sparsity-distilled-checkpoints) |
+| `SLA_SAGE2_ATTN` | Block sparse, quantized | SLA top-k block selection computed with SpargeAttn's INT8 SageAttention2 kernel | [SageAttention](attention_backends/sage.md#sla_sage2_attn) |
 
 ## Configuration
 

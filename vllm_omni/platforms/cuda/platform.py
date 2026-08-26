@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 
@@ -186,8 +186,8 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "SageAttention/sageattention3_blackwell. Falling back to TORCH_SDPA backend."
                     )
                     return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
-            # SLA_ATTN deliberately has no fallback here: SLAAttentionBackend
-            # implements validate_available(), which validate_diffusion_attn_backend()
+            # SLA_ATTN and SLA_SAGE2_ATTN deliberately have no fallback here: both
+            # implement validate_available(), which validate_diffusion_attn_backend()
             # above already raised on if the kernel package is missing. Falling back
             # to dense would keep serving — a sparsity-distilled checkpoint on a dense
             # path returns valid video, just slower and off-distribution — so the

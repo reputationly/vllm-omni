@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Diffusion attention backend registry.
 
 This module provides an enum-based registry for diffusion attention backends,
@@ -67,6 +67,7 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     TRTLLM_ATTN = "vllm_omni.diffusion.attention.backends.trtllm_attn.TrtllmAttentionBackend"
     RAINFUSION_ATTN = "vllm_omni.diffusion.attention.backends.rainfusion_attn.RainFusionAttentionBackend"
     SLA_ATTN = "vllm_omni.diffusion.attention.backends.sla_attn.SLAAttentionBackend"
+    SLA_SAGE2_ATTN = "vllm_omni.diffusion.attention.backends.sla_sage2_attn.SLASage2AttentionBackend"
 
     def get_path(self, include_classname: bool = True) -> str:
         """Get the class path for this backend (respects overrides).

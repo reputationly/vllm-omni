@@ -1668,7 +1668,7 @@ class AttnQuantSpec:
 
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
-BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN", "SLA_ATTN"})
+BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN", "SLA_ATTN", "SLA_SAGE2_ATTN"})
 
 
 @dataclass
