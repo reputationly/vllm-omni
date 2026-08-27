@@ -11,6 +11,12 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# `python` (not just `python3`) must exist before any third-party setup.py that
+# shells out to a bare `python` (SpargeAttn's csrc/qattn instantiation autogen
+# does exactly this via os.system(), silently, with no return-code check) —
+# moved here from the end of this file so every later RUN step can see it.
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
 # ==========================================================================
 # 固化依赖层(与源码无关)——放在 `COPY . ` 之前,源码改动不会失效这些层,
 # 每次出包只重跑最后的 app 安装层。改这段顺序前请留意:下面每一层都不引用
@@ -90,7 +96,5 @@ COPY vllm_omni/deploy/soulxsinger_svs.yaml vllm_omni/deploy/soulxsinger_svc.yaml
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
-
-RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
