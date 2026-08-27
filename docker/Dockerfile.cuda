@@ -46,15 +46,19 @@ RUN python3 -m nltk.downloader -d /usr/local/share/nltk_data \
 # has no GPU/driver, so the real libcuda.so (driver API, distinct from the
 # CUDA toolkit's own libcudart) doesn't exist — the final link step needs the
 # toolkit's driver-stub library instead, via LIBRARY_PATH. The base image's
-# CUDA toolkit also ships nvcc/libcudart but NOT the libcusparse-dev headers
-# (csrc/fused/fused.cu pulls in <cusparse.h> transitively via torch's
-# ATen/cuda/CUDAContext.h) — install the matching apt dev package first.
+# CUDA toolkit also ships nvcc/libcudart but NOT the dev sub-packages for the
+# math libs torch's ATen/cuda/CUDAContext.h transitively pulls in (cusparse.h,
+# cublas_v2.h, ... — discovered one apt package at a time via build-log
+# fatal errors) — install the matching dev packages up front instead.
 # Best-effort throughout: a failure here shouldn't fail the whole image,
 # SLA_SAGE2_ATTN just surfaces a clear "backend unavailable" error at serve time.
 RUN CUDA_VER_DASH="$(nvcc --version | sed -n 's/^Cuda compilation tools, release \([0-9]*\.[0-9]*\).*/\1/p' | tr '.' '-')"; \
-    (apt-get update && apt-get install -y --no-install-recommends "libcusparse-dev-${CUDA_VER_DASH}" \
+    (apt-get update && apt-get install -y --no-install-recommends \
+        "libcusparse-dev-${CUDA_VER_DASH}" "libcublas-dev-${CUDA_VER_DASH}" \
+        "libcusolver-dev-${CUDA_VER_DASH}" "libcurand-dev-${CUDA_VER_DASH}" \
+        "libcufft-dev-${CUDA_VER_DASH}" \
       && apt-get clean && rm -rf /var/lib/apt/lists/*) \
-      || echo "WARN: failed to install libcusparse-dev-${CUDA_VER_DASH} (cusparse.h missing, SpargeAttn build may fail)"
+      || echo "WARN: failed to install CUDA math-lib dev headers for ${CUDA_VER_DASH} (SpargeAttn build may fail)"
 RUN (git clone --depth 1 https://github.com/thu-ml/SpargeAttn.git /tmp/SpargeAttn \
       && cd /tmp/SpargeAttn \
       && TORCH_CUDA_ARCH_LIST=8.0 LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
