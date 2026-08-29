@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Text preparation shared by IndexTTS 2.5 prompt sizing and model prefill."""
 
 from __future__ import annotations
@@ -8,12 +8,16 @@ import re
 from collections.abc import Callable
 from functools import lru_cache
 
+from vllm.logger import init_logger
+
 from .tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
     encode_indextts25_text,
     lang_to_token,
     normalize_language_code,
 )
+
+logger = init_logger(__name__)
 
 PRONUNCIATION_ANNOTATION_PATTERN = re.compile(r"<([^|>\n]+)\|([^>\n]+)>")
 _SPECIAL_TOKEN_PATTERN = re.compile(r"<\|([^|]+)\|>")
@@ -98,28 +102,44 @@ def clean_indextts25_text(text: str) -> str:
 
 @lru_cache(maxsize=2)
 def _load_wetext_normalizer(lang: str):
+    import importlib.util
     import platform
 
-    if platform.system() == "Linux":
-        try:
-            if lang == "zh":
-                from tn.chinese.normalizer import Normalizer
-            else:
-                from tn.english.normalizer import Normalizer
-        except ModuleNotFoundError as exc:
-            if exc.name != "tn":
-                raise
-            raise RuntimeError(
-                f"IndexTTS 2.5 text normalization backend for {lang!r} is unavailable. "
-                "Install it with pip install 'vllm-omni[indextts2]'"
-            ) from exc
+    # WeTextProcessing (``tn``) is the preferred backend on Linux, but it is not
+    # always installable there: it needs ``pynini``, which publishes no aarch64
+    # wheel and therefore has to compile OpenFst from source. On such an image
+    # the extra silently resolves to ``wetext`` alone (its marker is
+    # ``sys_platform != 'linux'``), and hard-requiring ``tn`` here took IndexTTS
+    # 2.5 down completely — every request failed with "backend unavailable",
+    # for zh and en alike.
+    #
+    # ``wetext`` is the WeTextProcessing *runtime*: it loads the same
+    # pre-compiled FSTs through kaldifst instead of building them with pynini,
+    # and its ``remove_interjections`` / ``remove_erhua`` defaults already match
+    # what the ``tn`` branch passes explicitly. Falling back to it keeps the
+    # model serving instead of failing closed. It is a fallback rather than the
+    # default because the bundled FSTs may lag the ``tn`` grammar version, and
+    # that cannot be checked from an image where ``tn`` will not install.
+    if platform.system() == "Linux" and importlib.util.find_spec("tn") is not None:
         if lang == "zh":
+            from tn.chinese.normalizer import Normalizer
+
             return Normalizer(
                 remove_interjections=False,
                 remove_erhua=False,
                 overwrite_cache=False,
             )
+        from tn.english.normalizer import Normalizer
+
         return Normalizer(overwrite_cache=False)
+
+    if platform.system() == "Linux":
+        logger.warning(
+            "IndexTTS 2.5: WeTextProcessing ('tn') is unavailable, falling back to the "
+            "'wetext' runtime for %r text normalization. Install 'vllm-omni[indextts2]' "
+            "to use the preferred backend.",
+            lang,
+        )
 
     try:
         from wetext import Normalizer
