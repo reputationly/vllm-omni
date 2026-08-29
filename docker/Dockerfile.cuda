@@ -26,14 +26,21 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # Step 2b: Third-party runtime deps for community speech/singing models.
 #   voxcpm (VoxCPM2), s3tokenizer (CosyVoice3), funasr (SoulX ASR / MOSS),
 #   BS-RoFormer (SoulX vocal-sep + F0 — SVC & 集成 preprocess 都要),
-#   g2pM/g2p-en/ToJyutping (SoulX 集成 preprocess 的中/英/粤 G2P).
+#   g2pM/g2p-en/ToJyutping (SoulX 集成 preprocess 的中/英/粤 G2P),
+#   fugashi+unidic-lite (IndexTTS-2.5 日语分词 —— pyproject 的 [indextts2] extra 里,
+#     但那个 extra 从未被安装过,导致 lang=ja 直接 400
+#     "Japanese preprocessing requires fugashi and unidic";两者在 aarch64 上都有现成
+#     产物(fugashi 有 manylinux2014_aarch64 wheel、unidic-lite 是纯词典数据),
+#     实测 17s 装完,与同 extra 里那个要编 OpenFst 的 WeTextProcessing 完全不同 ——
+#     后者已由 text_processing_v2_5 的 wetext 回落绕开,不在此安装).
 # Best-effort per-package so a missing arm64 wheel can't fail the whole build —
 # the model needing a skipped dep surfaces a clear ImportError at serve time.
 # NOTE: install the individual g2p packages, NOT `pip install -e ".[soulx-svs]"`
 # (that reinstalls vllm-omni editable in-place — a footgun; Phase 2 POC 踩过).
 RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
     for pkg in "voxcpm>=2.0.2" "s3tokenizer>=0.3.0" "torchdiffeq>=0.2.5" "cn2an>=0.5.22" "funasr>=1.0.0" \
-               "BS-RoFormer" "g2pM>=0.1.2.5" "g2p-en>=2.1.0" "ToJyutping>=3.2.0"; do \
+               "BS-RoFormer" "g2pM>=0.1.2.5" "g2p-en>=2.1.0" "ToJyutping>=3.2.0" \
+               "fugashi>=1.2.0" "unidic-lite>=1.0.8"; do \
       uv pip install --python "$PY" --no-cache-dir "$pkg" || echo "WARN: failed to install $pkg (model needing it won't serve)"; \
     done
 
