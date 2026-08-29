@@ -1121,6 +1121,7 @@ class AsyncOmniEngine:
             "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+            "diffusion_warmup_shapes": kwargs.get("diffusion_warmup_shapes", None),
             "cache_backend": cache_backend,
             "cache_config": cache_config,
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),

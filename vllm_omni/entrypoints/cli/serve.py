@@ -480,6 +480,20 @@ class OmniServeCommand(CLISubcommand):
             help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
         )
         omni_config_group.add_argument(
+            "--diffusion-warmup-shapes",
+            nargs="+",
+            default=None,
+            metavar="WxHxF",
+            help=(
+                "Startup warmup shapes, e.g. --diffusion-warmup-shapes 960x544x121 960x544x249. "
+                "Only matters with --no-diffusion-compile-dynamic, where inductor compiles per "
+                "shape and the first request of every unseen shape pays that cost (measured on "
+                "LTX-2.5/A100: ~24s one-stage, ~57s two-stage). List every shape the deployment "
+                "serves. Unset keeps the single hardcoded 512x512 dummy run, which no production "
+                "menu uses."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusion-compile-granularity",
             choices=["regional", "full", "none"],
             default=None,

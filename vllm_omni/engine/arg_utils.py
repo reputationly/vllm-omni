@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import json
 import os
@@ -541,6 +544,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    diffusion_warmup_shapes: list[str] | None = None
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False

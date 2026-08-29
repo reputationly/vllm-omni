@@ -768,6 +768,18 @@ class OmniDiffusionConfig:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
 
+    # Startup warmup shapes, "<width>x<height>x<frames>" each (e.g. "960x544x121").
+    #
+    # Only matters under static-shape compilation
+    # (``diffusion_compile_dynamic=False``), where inductor compiles per shape:
+    # the first request of every unseen shape pays the compile cost (measured on
+    # LTX-2.5 / A100: ~24 s one-stage, ~57 s two-stage). The stock dummy run
+    # covers one hardcoded 512x512 shape, which no production menu uses, so
+    # without this every menu entry burns that cost on a real user's request.
+    #
+    # Unset keeps the historical single 512x512 dummy run.
+    diffusion_warmup_shapes: list[str] | None = None
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
