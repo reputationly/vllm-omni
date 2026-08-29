@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Audit an offline MiniMax-H3 Turbo LoRA fusion.
 
 The product serves a transformer with the adapter baked into BF16 weights, so
@@ -219,7 +222,6 @@ def verify_lora_fusion(
     metadata: LoRACheckpointMetadata | None = None,
 ) -> dict[str, Any]:
     """Prove sampled rows from every target use the checkpoint's alpha/rank."""
-    import sys
 
     import torch
     from safetensors import safe_open
@@ -227,8 +229,40 @@ def verify_lora_fusion(
     try:
         from tools.minimax_h3.bake_turbo_lora import build_plan
     except ModuleNotFoundError:  # direct execution from tools/minimax_h3_turbo
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from tools.minimax_h3.bake_turbo_lora import build_plan
+        # Load the sibling tool by path instead of retrying the package import.
+        #
+        # The obvious fallback -- prepend the repo root to sys.path and import
+        # `tools.minimax_h3...` again -- does not work, for two compounding
+        # reasons, and was silently dead code:
+        #   1. the failed attempt can already bind `tools` to a different package
+        #      and cache it, so the retry never re-runs the finder;
+        #   2. even after clearing that cache, our `tools/` has no __init__.py, so
+        #      it is only a *namespace* portion -- and a regular package found
+        #      anywhere on sys.path beats it regardless of order.
+        # Our own serving image hits both: it ships an unrelated
+        # /usr/local/lib/python3.12/dist-packages/tools/ package, which made
+        # assemble_distilled_partition.py unrunnable inside the image we serve
+        # with. Resolving by file path sidesteps the whole name contest.
+        import importlib.util
+        import sys
+
+        _path = Path(__file__).resolve().parents[1] / "minimax_h3" / "bake_turbo_lora.py"
+        _spec = importlib.util.spec_from_file_location("_h3_bake_turbo_lora", _path)
+        if _spec is None or _spec.loader is None:
+            raise ModuleNotFoundError(f"cannot load build_plan from {_path}")
+        _module = importlib.util.module_from_spec(_spec)
+        # Register before exec: bake_turbo_lora defines @dataclass types, and
+        # dataclasses._is_type resolves each class through
+        # ``sys.modules.get(cls.__module__).__dict__``. An unregistered module
+        # makes that ``None`` and the import dies with a baffling
+        # "'NoneType' object has no attribute '__dict__'".
+        sys.modules[_spec.name] = _module
+        try:
+            _spec.loader.exec_module(_module)
+        except BaseException:
+            del sys.modules[_spec.name]
+            raise
+        build_plan = _module.build_plan
 
     base_transformer = base_transformer.expanduser().resolve()
     fused_transformer = fused_transformer.expanduser().resolve()
