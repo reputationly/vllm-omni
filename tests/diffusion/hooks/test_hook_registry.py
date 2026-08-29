@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for hook registry.
 
@@ -165,3 +168,40 @@ def test_dispatch_with_fwd_hooks():
     res = registry.dispatch(inp="")
     assert isinstance(res, str)
     assert res == f"123{OVERRIDE_OUT}321"
+
+
+def test_wrapped_forward_rebinds_like_a_bound_method():
+    """`module.forward.__get__(module)` must round-trip and stay callable.
+
+    Third-party code stashes `module.forward` and restores it later by
+    re-binding: cache-dit's `_release_transformer_hooks` does
+    `transformer.forward = transformer._original_forward.__get__(transformer)`.
+    When `enable_cpu_offload` has already installed the wrapper, the stashed
+    object IS the wrapper, so it has to honour the descriptor protocol. Without
+    this, cache-dit raised AttributeError mid-teardown and left the module
+    wedged for every later request.
+    """
+    mod = EchoModule()
+    HookRegistry.get_or_create(mod)
+    wrapper = mod.forward
+
+    # Simulate the enable/release round trip a cache library performs.
+    stashed = mod.forward
+    mod.forward = lambda **kwargs: "cached"  # type: ignore[method-assign]
+    mod.forward = stashed.__get__(mod)  # type: ignore[method-assign]
+
+    assert mod.forward is wrapper
+    assert mod.forward(inp="x") == f"x{DEFAULT_OUT}"
+
+
+def test_wrapped_forward_refuses_foreign_rebind():
+    """Re-binding to another module would route its forward through alien hooks."""
+    mod = EchoModule()
+    other = EchoModule()
+    HookRegistry.get_or_create(mod)
+
+    # Class access (obj is None) is allowed and yields the wrapper itself.
+    assert mod.forward.__get__(None, EchoModule) is mod.forward
+
+    with pytest.raises(TypeError, match="cannot be re-bound"):
+        mod.forward.__get__(other)

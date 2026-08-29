@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base hook classes for model forward interception.
 
 This module provides the foundational hook mechanism that allows intercepting
@@ -140,6 +140,36 @@ class _WrappedForward:
             return self.module._omni_original_forward(*args, **kwargs)
         return registry.dispatch(*args, **kwargs)
 
+    def __get__(self, obj: Any, objtype: type | None = None) -> _WrappedForward:
+        """Behave like a bound method under the descriptor protocol.
+
+        ``module.forward`` is normally a bound method, so third-party code that
+        stashes it and restores it later re-binds with ``.__get__(module)``.
+        cache-dit does exactly that in ``_release_transformer_hooks``::
+
+            transformer.forward = transformer._original_forward.__get__(transformer)
+
+        Without ``__get__`` that raises ``AttributeError`` *after* cache-dit has
+        already torn down part of its state and *before* it clears
+        ``_original_forward`` / ``_context_manager``, which leaves the module
+        permanently wedged: every later request fails, first with this
+        AttributeError and then with cache-dit's "Context not exist!". On
+        MiniMax-H3 that made a single ``quality=high`` request brick the whole
+        deployment until restart, because ``enable_cpu_offload`` installs this
+        wrapper before cache-dit ever sees the module.
+
+        This instance is already bound to ``self.module``, so re-binding to that
+        same module is a no-op. Re-binding to a *different* module would
+        silently dispatch that module's forward through another module's hooks,
+        so it is rejected instead.
+        """
+        if obj is None or obj is self.module:
+            return self
+        raise TypeError(
+            f"{type(self).__name__} is bound to {type(self.module).__name__} and cannot be "
+            f"re-bound to {type(obj).__name__}; install a fresh wrapper via HookRegistry.get_or_create"
+        )
+
 
 def sort_hooks_after_call(func):
     """Calls the method on the hook registry, then sorts the hooks.
@@ -243,7 +273,7 @@ class HookRegistry:
                 def __init__(self, orig_forward):
                     self.original_forward = orig_forward
 
-            hook.fn_ref = _FnRef(original_forward)
+            hook.fn_ref = _FnRef(original_forward)  # type: ignore[attr-defined]
 
         self._hooks[name] = hook
         # We can only have one hook that overrides new_forward,
