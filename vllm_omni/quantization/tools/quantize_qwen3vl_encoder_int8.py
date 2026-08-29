@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Quantize the MiniMax-H3 Qwen3-VL text encoder to Int8 weights.
 
 Why the encoder and not just the DiT
@@ -45,17 +48,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import sys
 import time
 
+# ``regex`` rather than stdlib ``re``: repo policy, enforced by the
+# check-forbidden-imports hook. Kept inside the try so a bare venv gets the same
+# readable dependency message as a missing torch, not a raw traceback.
 try:
+    import regex as re
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
 except ImportError as exc:  # pragma: no cover - environment problem, not logic
-    sys.exit(f"missing dependency: {exc}. Run inside the vllm-omni image or a venv with torch+safetensors.")
+    sys.exit(f"missing dependency: {exc}. Run inside the vllm-omni image or a venv with torch+safetensors+regex.")
 
 # Kept in step with ``MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER``: the encoder returns
 # unnormalized layer-50 states, so layers past it never exist as parameters.

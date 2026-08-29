@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 cfg-distilled full denoise loop.
 
 Per step, the positive presentation is forwarded exactly once. Video and audio
@@ -19,6 +20,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.progress import PHASE_DENOISE, report_phase
+from vllm_omni.platforms import current_omni_platform
 
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
@@ -39,9 +41,9 @@ _LOG_STEP_MEMORY = os.getenv("VLLM_OMNI_H3_LOG_STEP_MEMORY", "0") == "1"
 
 
 def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tensor) -> None:
-    if not _LOG_STEP_MEMORY or not torch.cuda.is_available():
+    if not _LOG_STEP_MEMORY or not torch.accelerator.is_available():
         return
-    free, total = torch.cuda.mem_get_info()
+    free, total = current_omni_platform.get_device_memory()
     gib = 1024**3
     # ``max_*`` as well as the instantaneous pair: the allocator maintains those
     # maxima itself, so they capture a transient spike between two steps that
@@ -49,10 +51,12 @@ def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tens
     # much headroom is left on a 40 GiB card from sampled numbers alone reads a
     # lower bound as if it were the peak.
     #
-    # Read through ``torch.accelerator``: ``torch.cuda.max_memory_allocated`` is
-    # banned by TID251 in pyproject. Its ``max_memory_reserved`` sibling is not,
-    # but the two are one measurement and splitting them across two APIs would
-    # only invite the next reader to wonder which one is authoritative.
+    # Driver-level free/total reads through ``current_omni_platform``; all four
+    # allocator numbers through ``torch.accelerator``. Both are required —
+    # torch.cuda.{mem_get_info,memory_allocated,memory_reserved} are banned by
+    # the check-torch-cuda-call hook, max_memory_allocated additionally by
+    # TID251 — and keeping the four allocator reads on one API avoids inviting
+    # the next reader to wonder which one is authoritative.
     logger.info(
         "H3 denoise step %d: rows video=%d audio=%d | driver free %.2f/%.2f GiB | "
         "torch allocated %.2f GiB reserved %.2f GiB | torch max allocated %.2f GiB reserved %.2f GiB",
@@ -61,8 +65,8 @@ def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tens
         int(audio_rows.shape[0]),
         free / gib,
         total / gib,
-        torch.cuda.memory_allocated() / gib,
-        torch.cuda.memory_reserved() / gib,
+        torch.accelerator.memory_allocated() / gib,
+        torch.accelerator.memory_reserved() / gib,
         torch.accelerator.max_memory_allocated() / gib,
         torch.accelerator.max_memory_reserved() / gib,
     )
