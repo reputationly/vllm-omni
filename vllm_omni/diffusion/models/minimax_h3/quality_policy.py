@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Model-owned request quality policy for MiniMax H3."""
 
@@ -10,12 +10,42 @@ from dataclasses import dataclass, replace
 from numbers import Integral
 from typing import Any
 
+from vllm.logger import init_logger
+
 from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.errors import OmniClientError
 
+logger = init_logger(__name__)
+
 MINIMAX_H3_GENERIC_CACHE_KEY = "minimax_h3.generic"
 MINIMAX_H3_HIGH_CACHE_KEY = "minimax_h3.high"
+
+# ``quality="high"`` is accepted but treated as "no cache" on MiniMax H3.
+#
+# Measured 2026-08-29 on 4x A100-40G, 832x480 / 124 frames, same seed, against
+# the uncached result:
+#   Turbo8 (8 steps)   36.07s -> 36.58s, outputs byte-identical. The profile's
+#                      ``max_warmup_steps=4`` eats half of an 8-step schedule and
+#                      ``max_continuous_cached_steps=1`` blocks the rest, so not a
+#                      single step was skipped -- the 1.4% is pure hook overhead.
+#   Base (20 steps)    65.65s -> 67.79s. Steps *were* skipped and the sample moved,
+#                      but with no discernible quality gain (per-file sharpness went
+#                      two down / one up -- divergence, not degradation) and it is
+#                      3.3% slower. Note PSNR/SSIM between two diffusion samples
+#                      measures divergence, not quality loss; do not read those as
+#                      degradation.
+# So the shipped profile costs time and buys nothing at either step count.
+#
+# Gating it here rather than at the gateway is deliberate: instance ports are
+# reachable directly, so a gateway-side strip leaves the path open. Gating it here
+# rather than by removing the protocol field is also deliberate: ``quality`` is a
+# public OpenAI-compatible field and H3 is the only model that consumes it today.
+#
+# Flip this to True to re-enable once the profile has been re-tuned (Fn/Bn/
+# residual_diff_threshold/max_warmup_steps are all adjustable); the paths below
+# are otherwise unchanged.
+MINIMAX_H3_CACHE_DIT_ENABLED = False
 MINIMAX_H3_FORCE_REFRESH_STEP_HINT_ARG = "force_refresh_step_hint"
 MINIMAX_H3_FORCE_REFRESH_STEP_POLICY_ARG = "force_refresh_step_policy"
 MINIMAX_H3_FORCE_REFRESH_POLICIES = ("once", "repeat")
@@ -146,13 +176,26 @@ class MiniMaxH3QualityPolicy:
         num_inference_steps: int,
         extra_args: Mapping[str, Any] | None = None,
     ) -> MiniMaxH3QualityPlan:
-        if quality == "high":
+        if quality == "high" and MINIMAX_H3_CACHE_DIT_ENABLED:
             base_key = MINIMAX_H3_HIGH_CACHE_KEY
             base_config = _high_quality_cache_config()
         elif self._configured_backend == "cache_dit" and quality is None:
             base_key = MINIMAX_H3_GENERIC_CACHE_KEY
             base_config = self._od_config.cache_config
         else:
+            # Only the request-selected ``high`` profile is gated. A server that
+            # deliberately starts with ``cache_backend: cache_dit`` still gets its
+            # configured profile above -- that is a deployment choice, not something
+            # a caller can flip, and gating it here would silently ignore a config.
+            if quality == "high":
+                # Log rather than drop silently: an operator needs to see why a
+                # requested knob did nothing. Not a 400 either, because ``quality``
+                # is documented as advisory ("exact behavior is model-specific").
+                logger.warning(
+                    "MiniMax H3 ignores quality='high': its Cache-DiT profile measured slower at both "
+                    "8 and 20 steps with no quality gain, so it is disabled (see "
+                    "MINIMAX_H3_CACHE_DIT_ENABLED). Serving this request without cache."
+                )
             if _has_force_refresh_args(extra_args):
                 raise OmniClientError("MiniMax H3 force-refresh arguments require an active Cache-DiT request target")
             return MiniMaxH3QualityPlan(cache_dit=None)

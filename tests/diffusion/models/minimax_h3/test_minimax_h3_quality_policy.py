@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -48,7 +48,52 @@ def _resolve_quality(policy, **overrides):
     return policy.resolve(**values)
 
 
-def test_high_quality_policy_emits_cache_profile_without_deployment_gates():
+@pytest.fixture
+def cache_dit_enabled(monkeypatch):
+    """Re-enable the request-selected ``high`` Cache-DiT profile.
+
+    H3 ships with ``MINIMAX_H3_CACHE_DIT_ENABLED = False`` because the profile
+    measured slower at both 8 and 20 steps with no quality gain. The machinery
+    it gates is untouched, so the tests below that use ``quality="high"`` merely
+    as a vehicle for the force-refresh / installation-key logic opt back in here
+    rather than being rewritten around the gate.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import quality_policy
+
+    monkeypatch.setattr(quality_policy, "MINIMAX_H3_CACHE_DIT_ENABLED", True)
+
+
+def test_high_quality_is_gated_off_by_default():
+    """``quality="high"`` is accepted but installs nothing.
+
+    The field stays valid (it is a public OpenAI-compatible field, and other
+    models may use it later); only H3's own policy declines to act on it. Gating
+    lives here rather than at the gateway because instance ports are reachable
+    directly, so a gateway-side strip would leave that path open.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+
+    for cache_backend in ("none", "cache_dit"):
+        policy = MiniMaxH3QualityPolicy(_quality_od_config(cache_backend=cache_backend))
+        assert _resolve_quality(policy, quality="high").cache_dit is None, cache_backend
+
+
+def test_server_configured_cache_dit_is_not_gated():
+    """A deployment that starts with ``cache_backend: cache_dit`` still gets it.
+
+    Only the caller-selectable ``high`` profile is gated. Silently ignoring an
+    explicit server config would be a different, worse failure.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+
+    policy = MiniMaxH3QualityPolicy(_quality_od_config(cache_backend="cache_dit"))
+    plan = _resolve_quality(policy, quality=None)
+
+    assert plan.cache_dit is not None
+    assert plan.cache_dit.installation_key == "minimax_h3.generic"
+
+
+def test_high_quality_policy_emits_cache_profile_without_deployment_gates(cache_dit_enabled):
     from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
         MiniMaxH3QualityPolicy,
     )
@@ -77,7 +122,7 @@ def test_high_quality_policy_emits_cache_profile_without_deployment_gates():
     assert spec.cache_config.scm_steps_mask_policy is None
 
 
-def test_h3_force_refresh_is_model_owned_and_request_scoped():
+def test_h3_force_refresh_is_model_owned_and_request_scoped(cache_dit_enabled):
     from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
 
     policy = MiniMaxH3QualityPolicy(_quality_od_config())
@@ -129,7 +174,7 @@ def test_h3_force_refresh_policy_supports_repeat_and_does_not_mutate_generic_con
         ({"force_refresh_step_policy": "repeat"}, "requires force_refresh_step_hint"),
     ],
 )
-def test_h3_force_refresh_rejects_invalid_values(extra_args, message):
+def test_h3_force_refresh_rejects_invalid_values(extra_args, message, cache_dit_enabled):
     from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
 
     with pytest.raises(OmniClientError, match=message):
@@ -164,10 +209,12 @@ def test_h3_force_refresh_requires_active_cache_target(cache_backend, quality):
     [
         ("cache_dit", None, "minimax_h3.generic"),
         ("cache_dit", "lossless", None),
-        ("cache_dit", "high", "minimax_h3.high"),
+        # ``high`` resolves to no cache while MINIMAX_H3_CACHE_DIT_ENABLED is off;
+        # the enabled behaviour is covered by the companion test below.
+        ("cache_dit", "high", None),
         ("none", None, None),
         ("none", "lossless", None),
-        ("none", "high", "minimax_h3.high"),
+        ("none", "high", None),
     ],
 )
 def test_model_policy_owns_request_cache_target(cache_backend, quality, expected_key):
@@ -190,6 +237,22 @@ def test_model_policy_owns_request_cache_target(cache_backend, quality, expected
         assert plan.cache_dit.installation_key == expected_key
         if quality is None:
             assert plan.cache_dit.cache_config is config.cache_config
+
+
+@pytest.mark.parametrize("cache_backend", ["cache_dit", "none"])
+def test_model_policy_owns_request_cache_target_when_enabled(cache_backend, cache_dit_enabled):
+    """With the gate lifted, ``high`` picks H3's profile regardless of the server backend.
+
+    Kept as a separate test so that re-enabling the profile later is a one-line
+    flag flip plus deleting the gated expectations, not an archaeology exercise.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+
+    policy = MiniMaxH3QualityPolicy(_quality_od_config(cache_backend=cache_backend))
+    plan = _resolve_quality(policy, quality="high")
+
+    assert plan.cache_dit is not None
+    assert plan.cache_dit.installation_key == "minimax_h3.high"
 
 
 def test_h3_adopts_runner_installed_cache_dit_backend():
