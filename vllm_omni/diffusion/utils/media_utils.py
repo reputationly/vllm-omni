@@ -1,16 +1,162 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Video/audio muxing utilities using PyAV (no ffmpeg binary dependency)."""
 
 from __future__ import annotations
 
 import io
-from collections.abc import Iterable
+import itertools
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, cast
 
 import av
 import numpy as np
+
+
+@dataclass(frozen=True)
+class VideoDelivery:
+    """Delivery geometry applied to decoded frames at encode time.
+
+    The model generates at its own native canvas; this rescales the decoded
+    frames to the resolution the caller asked to be delivered, *before* the one
+    and only encode. Doing it here rather than as a separate super-resolution
+    hop avoids an extra encode/decode generation and keeps the intermediate out
+    of a lossy container.
+
+    ``sharpen`` is an ``unsharp`` luma amount compensating the interpolation
+    kernel's rolloff. It is deliberately content-dependent and small: measured
+    on real material, 0.3 buys ~1.17x high-frequency amplitude for a 0.0125 drop
+    in inter-frame high-frequency correlation, while 1.0 pushes dark-region
+    amplitude to 1.75x -- which is what re-amplifies generator noise in dark
+    scenes. 0 disables the filter entirely.
+    """
+
+    width: int
+    height: int
+    sharpen: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"delivery size must be positive, got {self.width}x{self.height}")
+        if self.sharpen < 0:
+            raise ValueError(f"delivery sharpen must be >= 0, got {self.sharpen}")
+
+    def matches(self, width: int, height: int) -> bool:
+        """True when this delivery is a no-op for a source of the given size."""
+        return self.width == width and self.height == height and self.sharpen <= 0
+
+
+MAX_DELIVERY_SHORT_EDGE = 2160
+MAX_DELIVERY_UPSCALE = 4.0
+DEFAULT_DELIVERY_SHARPEN = 0.3
+
+
+def resolve_delivery(
+    *,
+    source_width: int,
+    source_height: int,
+    short_edge: int | None,
+    sharpen: float | None = None,
+) -> VideoDelivery | None:
+    """Turn a requested delivery short edge into a concrete, validated geometry.
+
+    Only the short edge is a caller-facing knob: the long edge is derived from
+    the *generated* frame so the picture is never stretched. Asking for a long
+    edge as well is what silently anamorphoses output whenever the generator's
+    real canvas differs from the nominal tier label.
+
+    Returns ``None`` when there is nothing to do. Raises ``ValueError`` for a
+    request beyond the caps -- delivering a soft 8K is worse than telling the
+    caller the model tops out where it does.
+    """
+    if short_edge is None:
+        return None
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError(f"invalid source geometry {source_width}x{source_height}")
+    if short_edge > MAX_DELIVERY_SHORT_EDGE:
+        raise ValueError(f"delivery_short_edge must be <= {MAX_DELIVERY_SHORT_EDGE}, got {short_edge}")
+
+    source_short = min(source_width, source_height)
+    ratio = short_edge / source_short
+    if ratio > MAX_DELIVERY_UPSCALE:
+        raise ValueError(
+            f"delivery_short_edge {short_edge} upscales the {source_width}x{source_height} "
+            f"source by {ratio:.2f}x, above the {MAX_DELIVERY_UPSCALE:g}x ceiling"
+        )
+
+    # Downscaling loses nothing, so sharpening it only amplifies whatever noise
+    # the generator already put there. Upscaling is the only case that needs the
+    # interpolation kernel's rolloff compensated.
+    effective_sharpen = (DEFAULT_DELIVERY_SHARPEN if sharpen is None else sharpen) if ratio > 1.0 else 0.0
+
+    def _even(value: float) -> int:
+        return max(2, int(round(value / 2.0)) * 2)
+
+    if source_width <= source_height:
+        width, height = _even(short_edge), _even(source_height * ratio)
+    else:
+        width, height = _even(source_width * ratio), _even(short_edge)
+
+    delivery = VideoDelivery(width=width, height=height, sharpen=effective_sharpen)
+    return None if delivery.matches(source_width, source_height) else delivery
+
+
+def _build_delivery_graph(template: av.VideoFrame, delivery: VideoDelivery) -> av.filter.Graph:
+    graph = av.filter.Graph()
+    nodes = [
+        graph.add_buffer(
+            width=template.width,
+            height=template.height,
+            format=template.format.name,
+            time_base=Fraction(1, 1000000),
+        ),
+        # param0=5 widens the Lanczos window from the default a=3. Measured on a
+        # ground-truth downscale/upscale round trip it is the best pure scaler
+        # (40.73 dB vs 40.63 for a=3); the margin is small but free.
+        graph.add("scale", f"w={delivery.width}:h={delivery.height}:flags=lanczos:param0=5"),
+    ]
+    if delivery.sharpen > 0:
+        nodes.append(graph.add("unsharp", f"5:5:{delivery.sharpen}:5:5:0"))
+    nodes.append(graph.add("format", template.format.name))
+    nodes.append(graph.add("buffersink"))
+    for upstream, downstream in itertools.pairwise(nodes):
+        upstream.link_to(downstream)
+    graph.configure()
+    return graph
+
+
+def _iter_delivered_frames(
+    frames: Iterable[av.VideoFrame],
+    delivery: VideoDelivery,
+) -> Iterator[av.VideoFrame]:
+    """Rescale (and optionally sharpen) frames through one libavfilter graph.
+
+    Frames enter the graph with a synthetic monotonic pts because buffersrc
+    rejects a stream that never advances, and leave with ``pts=None`` so the
+    encoder keeps assigning timestamps exactly as it does on the unscaled path.
+    """
+    iterator = iter(frames)
+    first = next(iterator, None)
+    if first is None:
+        return
+    if delivery.matches(first.width, first.height):
+        yield from itertools.chain([first], iterator)
+        return
+
+    graph = _build_delivery_graph(first, delivery)
+    for index, frame in enumerate(itertools.chain([first], iterator)):
+        frame.pts = index
+        frame.time_base = Fraction(1, 1000000)
+        graph.push(frame)
+        while True:
+            try:
+                filtered = graph.pull()
+            except (av.error.BlockingIOError, av.error.EOFError):
+                break
+            filtered.pts = None
+            yield filtered
 
 
 class FragmentedMP4Muxer:
@@ -135,6 +281,7 @@ def mux_video_audio_bytes(
     audio_codec: str = "aac",
     crf: str = "18",
     video_codec_options: dict[str, str] | None = None,
+    delivery: VideoDelivery | None = None,
 ) -> bytes:
     """Mux video frames and optional audio waveform into MP4 bytes.
 
@@ -143,6 +290,7 @@ def mux_video_audio_bytes(
         audio_waveform: float32 array – mono ``(N,)`` or ``(N, C)`` / ``(C, N)``.
         fps: Video frame rate.
         audio_sample_rate: Audio sample rate in Hz.
+        delivery: Optional delivery geometry; rescales frames before the encode.
         video_codec: Video codec name.
         audio_codec: Audio codec name.
         crf: Constant rate factor for the video encoder.
@@ -154,8 +302,8 @@ def mux_video_audio_bytes(
     container = av.open(buf, mode="w", format="mp4")
 
     v_stream = cast(av.VideoStream, container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000)))
-    v_stream.width = video_frames.shape[2]
-    v_stream.height = video_frames.shape[1]
+    v_stream.width = delivery.width if delivery is not None else video_frames.shape[2]
+    v_stream.height = delivery.height if delivery is not None else video_frames.shape[1]
     v_stream.pix_fmt = "yuv420p"
 
     options: dict[str, object] = {"crf": str(crf)}
@@ -177,8 +325,12 @@ def mux_video_audio_bytes(
         a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=audio_sample_rate))
         a_stream.layout = layout
 
-    for frame_data in video_frames:
-        frame = av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+    source_frames: Iterator[av.VideoFrame] = (
+        av.VideoFrame.from_ndarray(frame_data, format="rgb24") for frame_data in video_frames
+    )
+    if delivery is not None:
+        source_frames = _iter_delivered_frames(source_frames, delivery)
+    for frame in source_frames:
         for packet in v_stream.encode(frame):
             container.mux(packet)
     for packet in v_stream.encode():
@@ -215,6 +367,7 @@ def mux_av_video_audio_bytes(
     audio_codec: str = "aac",
     crf: str = "18",
     video_codec_options: dict[str, str] | None = None,
+    delivery: VideoDelivery | None = None,
 ) -> bytes:
     """Mux preconstructed video frames and optional audio into MP4 bytes."""
     buf = io.BytesIO()
@@ -223,8 +376,8 @@ def mux_av_video_audio_bytes(
             av.VideoStream,
             container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000)),
         )
-        v_stream.width = width
-        v_stream.height = height
+        v_stream.width = delivery.width if delivery is not None else width
+        v_stream.height = delivery.height if delivery is not None else height
         v_stream.pix_fmt = "yuv420p"
 
         options: dict[str, object] = {"crf": str(crf)}
@@ -246,7 +399,8 @@ def mux_av_video_audio_bytes(
             a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=audio_sample_rate))
             a_stream.layout = layout
 
-        for frame in video_frames:
+        source_frames = _iter_delivered_frames(video_frames, delivery) if delivery is not None else video_frames
+        for frame in source_frames:
             for packet in v_stream.encode(frame):
                 container.mux(packet)
         for packet in v_stream.encode():

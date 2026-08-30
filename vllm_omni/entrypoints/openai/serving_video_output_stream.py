@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WebSocket handler for streaming generated video chunks.
 
 Protocol:
@@ -234,6 +234,20 @@ class OmniStreamingVideoOutputHandler:
             await self._send_error(
                 websocket,
                 f"Model mismatch: request specifies '{request.model}' but server is running '{configured_model}'.",
+            )
+            return None
+
+        # Delivery rescaling lives in the one-shot encode funnel; this path muxes
+        # chunk by chunk through FragmentedMP4Muxer and never reaches it. Accepting
+        # the field here would hand back a stream at the generation resolution with
+        # nothing to tell the caller their request was dropped, so refuse instead.
+        # Wiring it up is not hard -- scale/unsharp carry no temporal state -- but
+        # it belongs with a latency measurement on this path, not a silent no-op.
+        if request.delivery_short_edge is not None or request.delivery_sharpen is not None:
+            await self._send_error(
+                websocket,
+                "delivery_short_edge/delivery_sharpen are not supported on the streaming path; "
+                "the stream is emitted at the generation resolution.",
             )
             return None
 

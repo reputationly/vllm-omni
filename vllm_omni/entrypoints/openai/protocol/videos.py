@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OpenAI-compatible protocol definitions for video generation.
 
@@ -186,6 +186,28 @@ class VideoGenerationRequest(BaseModel):
         ),
     )
     short_edge: int | None = Field(default=None, ge=1, description="MiniMax H3 output short edge in pixels")
+    delivery_short_edge: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Short edge of the delivered video, in pixels. Independent of the generation "
+            "canvas: the model still renders at its own native tier and the decoded frames "
+            "are rescaled once, before the single encode. Only the short edge is accepted - "
+            "the long edge is derived from the generated frames so the picture is never "
+            "stretched. Do not confuse with 'short_edge', which sizes the generation canvas."
+        ),
+    )
+    delivery_sharpen: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=3.0,
+        description=(
+            "Unsharp luma amount applied after delivery upscaling, compensating the "
+            "interpolation kernel's rolloff. Defaults to a conservative 0.3; raise it for "
+            "texture-rich bright material and drop it to 0 for dark, noisy material where "
+            "sharpening re-amplifies generator noise. Ignored when not upscaling."
+        ),
+    )
     num_outputs_per_prompt: int = Field(
         default=1,
         ge=1,

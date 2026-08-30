@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
@@ -121,7 +121,14 @@ async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
-    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec_options=None):
+    def _fake_mux_video_audio_bytes(
+        frames,
+        audio,
+        fps,
+        audio_sample_rate,
+        video_codec_options=None,
+        delivery=None,
+    ):
         mux_calls.append(
             {
                 "frames": frames,
@@ -129,6 +136,7 @@ def _install_fake_video_mux(monkeypatch, mux_calls):
                 "fps": fps,
                 "audio_sample_rate": audio_sample_rate,
                 "video_codec_options": video_codec_options,
+                "delivery": delivery,
             }
         )
         return b"fake-video"
@@ -821,3 +829,93 @@ def test_frame_interpolator_uses_platform_device_when_tensor_is_cpu(monkeypatch)
     assert chosen_devices == [torch.device("cuda")]
     assert multiplier == 2
     assert output_video.shape == (1, 3, 3, 32, 32)
+
+
+@pytest.mark.parametrize(
+    ("source_width", "source_height", "short_edge"),
+    [
+        (1344, 768, None),  # nothing requested
+        (1344, 768, 768),  # already the delivery size
+    ],
+)
+def test_resolve_delivery_is_a_noop_when_nothing_to_do(source_width, source_height, short_edge):
+    assert (
+        media_utils.resolve_delivery(
+            source_width=source_width,
+            source_height=source_height,
+            short_edge=short_edge,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_width", "source_height", "short_edge", "expected"),
+    [
+        # H3's nominal 16:9 768p tier really renders 1344x768 (=1.75), so the
+        # long edge must follow the frames rather than the tier label.
+        (1344, 768, 1080, (1890, 1080)),
+        (1344, 768, 1440, (2520, 1440)),
+        (768, 1344, 1080, (1080, 1890)),  # portrait
+        (1248, 704, 1080, (1914, 1080)),  # LTX-2.5 bucket
+    ],
+)
+def test_resolve_delivery_preserves_source_aspect(source_width, source_height, short_edge, expected):
+    delivery = media_utils.resolve_delivery(
+        source_width=source_width,
+        source_height=source_height,
+        short_edge=short_edge,
+    )
+    assert (delivery.width, delivery.height) == expected
+    assert delivery.width % 2 == 0 and delivery.height % 2 == 0
+    assert abs(delivery.width / delivery.height - source_width / source_height) < 0.01
+
+
+def test_resolve_delivery_skips_sharpening_when_downscaling():
+    delivery = media_utils.resolve_delivery(source_width=1344, source_height=768, short_edge=480)
+    assert (delivery.width, delivery.height) == (840, 480)
+    assert delivery.sharpen == 0.0
+
+
+def test_resolve_delivery_honours_explicit_sharpen():
+    delivery = media_utils.resolve_delivery(
+        source_width=1344,
+        source_height=768,
+        short_edge=1080,
+        sharpen=0.0,
+    )
+    assert delivery.sharpen == 0.0
+
+
+@pytest.mark.parametrize(
+    ("source_width", "source_height", "short_edge"),
+    [
+        (1344, 768, media_utils.MAX_DELIVERY_SHORT_EDGE + 1),
+        (400, 224, 1080),  # 4.82x, past the upscale ceiling
+    ],
+)
+def test_resolve_delivery_rejects_requests_past_the_caps(source_width, source_height, short_edge):
+    with pytest.raises(ValueError):
+        media_utils.resolve_delivery(
+            source_width=source_width,
+            source_height=source_height,
+            short_edge=short_edge,
+        )
+
+
+def test_encode_video_bytes_rescales_to_the_delivery_short_edge():
+    frames = [np.zeros((768, 1344, 3), dtype=np.uint8) for _ in range(4)]
+    video_bytes = video_api_utils._encode_video_bytes(frames, fps=24, delivery_short_edge=1080)
+
+    with av.open(BytesIO(video_bytes)) as container:
+        stream = container.streams.video[0]
+        assert (stream.codec_context.width, stream.codec_context.height) == (1890, 1080)
+
+
+def test_encode_video_bytes_keeps_native_size_without_a_delivery_request():
+    frames = [np.zeros((768, 1344, 3), dtype=np.uint8) for _ in range(4)]
+    video_bytes = video_api_utils._encode_video_bytes(frames, fps=24)
+
+    with av.open(BytesIO(video_bytes)) as container:
+        stream = container.streams.video[0]
+        assert (stream.codec_context.width, stream.codec_context.height) == (1344, 768)

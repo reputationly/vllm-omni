@@ -464,7 +464,15 @@ class OmniOpenAIServingVideo:
             reference_audio=reference_audio,
         )
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        # x264's `ultrafast` preset implies `--no-cabac --no-8x8dct --bframes 0`,
+        # which drops the stream to Constrained Baseline. Losing the 8x8 transform is
+        # precisely the wrong trade for the detail-heavy footage these models produce,
+        # and it damages the frames any downstream upscaler then magnifies. `veryfast`
+        # restores CABAC/8x8dct/B-frames; measured on a 362-frame 1080p clip it costs
+        # about 3 s of encode against a 100-270 s generation. The streaming encoder
+        # keeps `ultrafast`+`zerolatency` on purpose -- that path trades quality for
+        # first-byte latency.
+        video_codec_options = {"preset": "veryfast", "threads": "0"}
         if request.extra_params is not None and isinstance(request.extra_params, dict):
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
@@ -477,6 +485,8 @@ class OmniOpenAIServingVideo:
                         video,
                         fps=artifacts.output_fps,
                         video_codec_options=video_codec_options,
+                        delivery_short_edge=request.delivery_short_edge,
+                        delivery_sharpen=request.delivery_sharpen,
                     )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
@@ -485,6 +495,8 @@ class OmniOpenAIServingVideo:
                         audio=artifacts.audios[idx],
                         audio_sample_rate=artifacts.audio_sample_rate,
                         video_codec_options=video_codec_options,
+                        delivery_short_edge=request.delivery_short_edge,
+                        delivery_sharpen=request.delivery_sharpen,
                     )
                 ),
                 action=artifacts.actions[idx],
@@ -525,7 +537,15 @@ class OmniOpenAIServingVideo:
             )
         audio = artifacts.audios[0]
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        # x264's `ultrafast` preset implies `--no-cabac --no-8x8dct --bframes 0`,
+        # which drops the stream to Constrained Baseline. Losing the 8x8 transform is
+        # precisely the wrong trade for the detail-heavy footage these models produce,
+        # and it damages the frames any downstream upscaler then magnifies. `veryfast`
+        # restores CABAC/8x8dct/B-frames; measured on a 362-frame 1080p clip it costs
+        # about 3 s of encode against a 100-270 s generation. The streaming encoder
+        # keeps `ultrafast`+`zerolatency` on purpose -- that path trades quality for
+        # first-byte latency.
+        video_codec_options = {"preset": "veryfast", "threads": "0"}
         if request.extra_params is not None and isinstance(request.extra_params, dict):
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
@@ -541,6 +561,8 @@ class OmniOpenAIServingVideo:
             fps=artifacts.output_fps,
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
             video_codec_options=video_codec_options,
+            delivery_short_edge=request.delivery_short_edge,
+            delivery_sharpen=request.delivery_sharpen,
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)

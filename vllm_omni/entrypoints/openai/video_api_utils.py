@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared helper utilities for OpenAI-compatible video generation API.
 """
@@ -39,6 +39,8 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 
 if TYPE_CHECKING:
     import av
+
+    from vllm_omni.diffusion.utils.media_utils import VideoDelivery
 
 
 logger = init_logger(__name__)
@@ -653,6 +655,7 @@ def _encode_prepared_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    delivery: VideoDelivery | None = None,
 ) -> bytes:
     """Encode validated frames through the compatibility path used before planar encoding."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
@@ -664,6 +667,7 @@ def _encode_prepared_video_bytes_legacy(
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
         video_codec_options=video_codec_options,
+        delivery=delivery,
     )
 
 
@@ -673,6 +677,7 @@ def _encode_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    delivery: VideoDelivery | None = None,
 ) -> bytes:
     """Encode through the compatibility path used before planar encoding."""
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
@@ -684,6 +689,7 @@ def _encode_video_bytes_legacy(
         audio=audio,
         audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
+        delivery=delivery,
     )
 
 
@@ -693,13 +699,26 @@ def _encode_video_bytes(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    delivery_short_edge: int | None = None,
+    delivery_sharpen: float | None = None,
 ) -> bytes:
     """Encode a video payload through the automatic capability dispatcher."""
-    from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
+    from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes, resolve_delivery
 
     # Prepare once so validation is shared by both paths and malformed common
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
+    # Resolve here rather than at the caller: the delivery long edge has to come
+    # from the frames the model actually produced, not from the nominal tier the
+    # request asked for. Those two differ whenever the pipeline clamps its canvas
+    # (H3's 16:9 768p tier is really 1344x768), and deriving from the label is
+    # exactly what anamorphoses the picture.
+    delivery = resolve_delivery(
+        source_width=frame_shape[1],
+        source_height=frame_shape[0],
+        short_edge=delivery_short_edge,
+        sharpen=delivery_sharpen,
+    )
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
     fallback_reason = _direct_planar_fallback_reason(frames, frame_shape, common_dtype)
     if fallback_reason is not None:
@@ -721,6 +740,7 @@ def _encode_video_bytes(
             audio=audio,
             audio_sample_rate=effective_audio_sample_rate,
             video_codec_options=video_codec_options,
+            delivery=delivery,
         )
 
     _log_video_encoding_path(
@@ -741,6 +761,7 @@ def _encode_video_bytes(
         fps=float(fps),
         audio_sample_rate=effective_audio_sample_rate,
         video_codec_options=video_codec_options,
+        delivery=delivery,
     )
 
 
@@ -799,6 +820,8 @@ def encode_video_base64(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    delivery_short_edge: int | None = None,
+    delivery_sharpen: float | None = None,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(
@@ -807,5 +830,7 @@ def encode_video_base64(
         audio=audio,
         audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
+        delivery_short_edge=delivery_short_edge,
+        delivery_sharpen=delivery_sharpen,
     )
     return base64.b64encode(video_bytes).decode("utf-8")
