@@ -79,6 +79,25 @@ RUN (git clone --depth 1 https://github.com/thu-ml/SpargeAttn.git /tmp/SpargeAtt
       && rm -rf /tmp/SpargeAttn) \
       || echo "WARN: SpargeAttn build failed (SLA_SAGE2_ATTN backend won't be available)"
 
+# Step 2e: SLA (thu-ml, arXiv 2509.24006) — the `sparse_linear_attention`
+# package behind the SLA_ATTN diffusion attention backend, and the source of the
+# `get_block_map` block selection SLA_SAGE2_ATTN imports as well (so sage2 needs
+# BOTH this and SpargeAttn above). Pure Triton, no CUDA build — seconds to
+# install and arch-agnostic, unlike Step 2d.
+# Placed AFTER Step 2d on purpose: a new layer inserted before the SpargeAttn
+# build would invalidate its cache entry and re-run that CUDA compile on every
+# image.
+# Best-effort is safe here despite both backends hard-requiring the package:
+# selecting either one without it aborts startup by design (a sparsity-distilled
+# checkpoint served on the dense path returns valid but off-distribution video,
+# so a silent fallback would be invisible to callers and monitoring). A failed
+# install therefore surfaces loudly at serve time, not as bad output.
+# The isolated install is tried first; SLA's setup.py may import torch at module
+# level the way SpargeAttn's does, which only builds with --no-build-isolation.
+RUN pip install --no-cache-dir "git+https://github.com/thu-ml/SLA.git" \
+      || pip install --no-cache-dir --no-build-isolation "git+https://github.com/thu-ml/SLA.git" \
+      || echo "WARN: SLA install failed (SLA_ATTN / SLA_SAGE2_ATTN backends won't be available)"
+
 # Step 2c: Bake the A100 40G x2 deploy-configs for the 8B MOSS models (TTSD /
 # SoundEffect / VoiceGenerator) + SoulX-Singer SVS/SVC to a stable in-image path
 # so GPUStack can reference them via `--deploy-config /deploy-configs/<x>.yaml`.
