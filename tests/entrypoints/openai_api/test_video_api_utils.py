@@ -912,6 +912,33 @@ def test_encode_video_bytes_rescales_to_the_delivery_short_edge():
         assert (stream.codec_context.width, stream.codec_context.height) == (1890, 1080)
 
 
+@pytest.mark.parametrize("delivery_short_edge", [None, 1080])
+def test_delivery_keeps_the_frames_spread_over_real_time(delivery_short_edge):
+    """A rescaled clip must span the same wall time as an untouched one.
+
+    Frames pulled from the filter graph carry the graph's own time base, and
+    clearing ``pts`` does not hand timestamp assignment back to the encoder. Left
+    unstamped they collapse into a few graph ticks: the file still holds every
+    frame, but players show frame one for the length of the audio.
+    """
+    frame_count, fps = 12, 24
+    frames = [np.zeros((768, 1344, 3), dtype=np.uint8) for _ in range(frame_count)]
+
+    video_bytes = video_api_utils._encode_video_bytes(
+        frames,
+        fps=fps,
+        delivery_short_edge=delivery_short_edge,
+    )
+
+    with av.open(BytesIO(video_bytes)) as container:
+        stream = container.streams.video[0]
+        packet_timestamps = [packet.pts for packet in container.demux(stream) if packet.pts is not None]
+
+    assert len(packet_timestamps) == frame_count
+    span_seconds = (max(packet_timestamps) - min(packet_timestamps)) * stream.time_base
+    assert span_seconds == pytest.approx((frame_count - 1) / fps, rel=0.02)
+
+
 def test_encode_video_bytes_keeps_native_size_without_a_delivery_request():
     frames = [np.zeros((768, 1344, 3), dtype=np.uint8) for _ in range(4)]
     video_bytes = video_api_utils._encode_video_bytes(frames, fps=24)

@@ -48,6 +48,10 @@ class VideoDelivery:
         return self.width == width and self.height == height and self.sharpen <= 0
 
 
+# buffersrc needs a grid fine enough that no two frames collide on it; the
+# output is restamped onto the real frame rate before it reaches the encoder.
+_DELIVERY_GRAPH_TIME_BASE = Fraction(1, 1000000)
+
 MAX_DELIVERY_SHORT_EDGE = 2160
 MAX_DELIVERY_UPSCALE = 4.0
 DEFAULT_DELIVERY_SHARPEN = 0.3
@@ -110,7 +114,7 @@ def _build_delivery_graph(template: av.VideoFrame, delivery: VideoDelivery) -> a
             width=template.width,
             height=template.height,
             format=template.format.name,
-            time_base=Fraction(1, 1000000),
+            time_base=_DELIVERY_GRAPH_TIME_BASE,
         ),
         # param0=5 widens the Lanczos window from the default a=3. Measured on a
         # ground-truth downscale/upscale round trip it is the best pure scaler
@@ -130,12 +134,18 @@ def _build_delivery_graph(template: av.VideoFrame, delivery: VideoDelivery) -> a
 def _iter_delivered_frames(
     frames: Iterable[av.VideoFrame],
     delivery: VideoDelivery,
+    *,
+    fps: float,
 ) -> Iterator[av.VideoFrame]:
     """Rescale (and optionally sharpen) frames through one libavfilter graph.
 
-    Frames enter the graph with a synthetic monotonic pts because buffersrc
-    rejects a stream that never advances, and leave with ``pts=None`` so the
-    encoder keeps assigning timestamps exactly as it does on the unscaled path.
+    Every frame leaving the graph is restamped onto the ``1/fps`` grid. That is
+    not cosmetic: buffersrc carries its own time base, so a frame pulled from the
+    graph arrives already timestamped on the graph's grid, and clearing ``pts``
+    does not put it back to the "encoder, assign this for me" state a freshly
+    built frame is in. Encoding those frames as-is packs the whole clip into a
+    few graph ticks -- the muxed video then reports a single frame's duration and
+    players show frame one for the length of the audio.
     """
     iterator = iter(frames)
     first = next(iterator, None)
@@ -145,17 +155,25 @@ def _iter_delivered_frames(
         yield from itertools.chain([first], iterator)
         return
 
+    rate = Fraction(fps).limit_denominator(10000)
+    output_time_base = Fraction(rate.denominator, rate.numerator)
     graph = _build_delivery_graph(first, delivery)
+    output_index = 0
     for index, frame in enumerate(itertools.chain([first], iterator)):
         frame.pts = index
-        frame.time_base = Fraction(1, 1000000)
+        frame.time_base = _DELIVERY_GRAPH_TIME_BASE
         graph.push(frame)
         while True:
             try:
                 filtered = graph.pull()
             except (av.error.BlockingIOError, av.error.EOFError):
                 break
-            filtered.pts = None
+            # Counted on the output side rather than reusing ``index``: the
+            # filters here are 1-in-1-out, but nothing in the contract says a
+            # future one has to be.
+            filtered.pts = output_index
+            filtered.time_base = output_time_base
+            output_index += 1
             yield filtered
 
 
@@ -329,7 +347,7 @@ def mux_video_audio_bytes(
         av.VideoFrame.from_ndarray(frame_data, format="rgb24") for frame_data in video_frames
     )
     if delivery is not None:
-        source_frames = _iter_delivered_frames(source_frames, delivery)
+        source_frames = _iter_delivered_frames(source_frames, delivery, fps=fps)
     for frame in source_frames:
         for packet in v_stream.encode(frame):
             container.mux(packet)
@@ -399,7 +417,9 @@ def mux_av_video_audio_bytes(
             a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=audio_sample_rate))
             a_stream.layout = layout
 
-        source_frames = _iter_delivered_frames(video_frames, delivery) if delivery is not None else video_frames
+        source_frames = (
+            _iter_delivered_frames(video_frames, delivery, fps=fps) if delivery is not None else video_frames
+        )
         for frame in source_frames:
             for packet in v_stream.encode(frame):
                 container.mux(packet)
