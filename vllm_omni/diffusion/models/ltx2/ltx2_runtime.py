@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared recipe-driven runtime for LTX pipeline variants."""
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import replace
@@ -13,6 +15,7 @@ from typing import Any, ClassVar
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -111,6 +114,13 @@ def _prepare_decode_timestep_conditioning(
         torch.tensor(decode_timestep_values, device=device, dtype=dtype),
         torch.tensor(decode_noise_scale_values, device=device, dtype=dtype)[:, None, None, None, None],
     )
+
+
+logger = init_logger(__name__)
+
+# 解码前把 DiT 搬回主机内存的开关。与 MiniMax-H3 的
+# VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE 同语义、同默认值(关)。
+LTX2_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE"
 
 
 class LTXRuntime(
@@ -502,6 +512,52 @@ class LTXRuntime(
             )
         return DiffusionOutput(output=output)
 
+    def _offload_dit_before_vae(self) -> None:
+        """把 model-level offload 托管的 DiT 在全分辨率 VAE 解码前搬回主机内存。
+
+        与 MiniMax-H3 的同名方法同构(``pipeline_minimax_h3.py``),动机也一样:LTX 的
+        model-level offload 组是 ``transformer ↔ text_encoder/connectors`` 互斥,去噪刚
+        结束时 DiT 正驻卡;而解码阶段根本不用它 —— int8 下 19 GB 就这么占着,偏偏那是
+        整条链路显存最紧的一段(tile all-gather 的缓冲每张卡一份、rank 0 还要合并整段
+        视频再转 fp32,两者都随帧数线性涨,20 秒档实测峰值 37.0 GB / 40 GB)。
+
+        默认关。开了以后下一次去噪要把 DiT 搬回卡上(PCIe 上 19 GB,数秒),所以这是一个
+        "长时长档用显存换一点吞吐"的取舍,交给部署侧按档位决定,与 H3 的处理一致。
+        """
+        if not bool(getattr(self.od_config, "enable_cpu_offload", False)):
+            return
+        if os.getenv(LTX2_OFFLOAD_DIT_BEFORE_VAE_ENV, "0") != "1":
+            return
+
+        dit_modules = [getattr(self, name) for name in self._dit_modules if hasattr(self, name)]
+        # 已经不在卡上就别白跑一趟同步与 empty_cache。
+        if not any(
+            parameter.device.type == current_omni_platform.device_type
+            for module in dit_modules
+            for parameter in module.parameters()
+        ):
+            return
+
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+        current_omni_platform.synchronize()
+        started = time.perf_counter()
+        free_before = current_omni_platform.get_free_memory()
+        for module in dit_modules:
+            SequentialOffloadHook._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=False,
+                pin_memory=bool(getattr(self.od_config, "pin_cpu_memory", True)),
+            )
+        current_omni_platform.empty_cache()
+        free_after = current_omni_platform.get_free_memory()
+        logger.info(
+            "LTX-2 pre-VAE DiT offload: %.3f s, freed %.2f GiB",
+            time.perf_counter() - started,
+            (free_after - free_before) / 1024**3,
+        )
+
     def _decode_output(
         self,
         *,
@@ -532,6 +588,8 @@ class LTXRuntime(
                 dtype=latents.dtype,
             )
             latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
+
+        self._offload_dit_before_vae()
 
         dist_initialized = torch.distributed.is_initialized()
         is_output_rank = not dist_initialized or torch.distributed.get_rank() == 0
