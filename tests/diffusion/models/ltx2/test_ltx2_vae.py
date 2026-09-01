@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for LTX-2.3 VAE tiling and distributed decode behavior."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -46,6 +47,10 @@ class TestLTXOutputRank:
         pipe = object.__new__(LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.vae = FakeVae()
+        # _decode_output 会先走一遍 _offload_dit_before_vae(),它读 od_config。
+        # 真实 pipeline 在 __init__ 里必然有这个字段,这里是 object.__new__ 出来的
+        # 半成品,得补上;enable_cpu_offload=False 让卸载分支立即返回,不干扰本用例。
+        pipe.od_config = SimpleNamespace(enable_cpu_offload=False)
 
         decode_kwargs = {
             "latents": torch.ones(1, 1),
@@ -113,7 +118,9 @@ class TestLTX23VaeDistributedDecode:
             },
             output_dtype=torch.float32,
         )
-        seen = {}
+        # 这个 dict 同时存 tuple 和 dict 两种值,不标注的话 mypy 会按首次赋值把它
+        # 收窄成 dict[Any, tuple[...]],后面存 merged_shapes 就报类型不兼容。
+        seen: dict[str, Any] = {}
 
         def exec_tile(task):
             return torch.full(tile_output_shapes[task.tile_id], float(task.tile_id + 1))
@@ -320,3 +327,114 @@ class TestLTX23VaeTiling:
         assert seen["broadcast_result"] is False
         assert seen["operator"].split.__name__ == "tile_split"
         assert seen["operator"].merge.__name__ == "tile_merge"
+
+
+class TestLTXPreVaeDitOffload:
+    """``VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE`` 的契约。
+
+    这个开关的失败方式**全是静默的**:env 名在某次统一命名里被改掉、调用点被挪到
+    ``output_type == "latent"`` 的早退分支之后、``_dit_modules`` 换了取值方式 ——
+    三种改动都不报错、也不会让任何别的测试变红,唯一的症状是"显存没降下来",
+    而那要起一个 4 卡实例跑一发 20 秒 1080p 盯 nvidia-smi 才看得见
+    (实测:开了之后峰值 37.0 → 27.3~30.2 GB,引擎日志 ``freed 19.05 GiB``)。
+
+    所以这里锁的是**接线还在不在**,不是"省了多少显存"——后者只能靠实测。
+    与 H3 的 ``test_pre_vae_offload_releases_all_resident_dits`` 同源。
+    """
+
+    @staticmethod
+    def _pipeline(monkeypatch, *, enable_cpu_offload=True):
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2DistilledOneStagePipeline
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+        pipe = object.__new__(LTX2DistilledOneStagePipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.od_config = SimpleNamespace(enable_cpu_offload=enable_cpu_offload, pin_cpu_memory=False)
+        pipe._dit_modules = ["transformer"]
+        pipe.transformer = torch.nn.Linear(2, 2, bias=False)
+
+        moved: list[torch.nn.Module] = []
+        # device_type 设成 cpu,参数就算"在设备上",能走到真正的搬运分支;
+        # 其余三个平台调用在 CPU 上没有意义,换成空实现。
+        monkeypatch.setattr(ltx_runtime.current_omni_platform, "device_type", "cpu")
+        monkeypatch.setattr(ltx_runtime.current_omni_platform, "synchronize", lambda: None)
+        monkeypatch.setattr(ltx_runtime.current_omni_platform, "empty_cache", lambda: None)
+        monkeypatch.setattr(ltx_runtime.current_omni_platform, "get_free_memory", lambda: 1024**3)
+        monkeypatch.setattr(
+            SequentialOffloadHook,
+            "_move_params",
+            lambda module, *_args, **_kwargs: moved.append(module),
+        )
+        return pipe, moved
+
+    def test_offloads_dit_when_switch_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE", "1")
+        pipe, moved = self._pipeline(monkeypatch)
+
+        pipe._offload_dit_before_vae()
+
+        assert moved == [pipe.transformer]
+
+    def test_inert_when_env_unset(self, monkeypatch):
+        """默认关。这条锁的是"补丁装上了也不改变现有部署的行为"这句承诺本身。"""
+        monkeypatch.delenv("VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE", raising=False)
+        pipe, moved = self._pipeline(monkeypatch)
+
+        pipe._offload_dit_before_vae()
+
+        assert moved == []
+
+    def test_inert_without_cpu_offload(self, monkeypatch):
+        """没开 model-level offload 的部署不该被打扰:DiT 本来就该常驻,搬走它只是白费。"""
+        monkeypatch.setenv("VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE", "1")
+        pipe, moved = self._pipeline(monkeypatch, enable_cpu_offload=False)
+
+        pipe._offload_dit_before_vae()
+
+        assert moved == []
+
+    def test_runs_before_vae_decode(self, monkeypatch):
+        """锁**调用点**:必须在 VAE 解码之前跑。
+
+        解码那一段才是峰值所在(tile all-gather 的缓冲每张卡一份、rank 0 还要合并整段
+        视频再转 fp32),挪到解码之后就等于这个开关白开 —— 而且不会有任何报错。
+        """
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2DistilledOneStagePipeline
+
+        order: list[str] = []
+
+        class FakeVae:
+            dtype = torch.float32
+            config = SimpleNamespace(timestep_conditioning=False)
+
+            def is_distributed_enabled(self):
+                return True
+
+            def decode(self, *_args, **_kwargs):
+                order.append("decode")
+                return (torch.ones(1, 1),)
+
+        # 非输出 rank:解码后即早退,不必再搭 audio_vae
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "get_rank", lambda: 1)
+
+        pipe = object.__new__(LTX2DistilledOneStagePipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae = FakeVae()
+        object.__setattr__(pipe, "_offload_dit_before_vae", lambda: order.append("offload"))
+
+        pipe._decode_output(
+            latents=torch.ones(1, 1),
+            audio_latents=torch.ones(1, 1),
+            output_type="np",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=None,
+            device=torch.device("cpu"),
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            prompt_batch_size=1,
+        )
+
+        assert order == ["offload", "decode"]
