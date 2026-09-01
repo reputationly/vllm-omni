@@ -6,6 +6,7 @@
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -438,3 +439,65 @@ class TestLTXPreVaeDitOffload:
         )
 
         assert order == ["offload", "decode"]
+
+
+class TestLTXPostprocessChunking:
+    """分块 postprocess 与整段 postprocess 必须**逐位相等**。
+
+    分块是为了砍掉解码阶段最大的那一块:diffusers 的 ``postprocess_video`` 对整段视频
+    一次性 ``.float()``,4K×121 帧那份 fp32 就是 12.1 GB,与 all-gather 缓冲、merge
+    结果同时存在(2026-08-31 实测峰值 31.6 GB / 40 GB)。
+
+    为什么必须用单测而不是比对成片:LTX 的端到端输出**跨实例不可复现** —— 同一份代码在
+    两个容器里跑出的像素 md5 不同(inductor 的 autotune 按实测耗时挑 kernel),
+    但同一实例内连发两次完全一致。所以"改前改后产物一样"这种验证方法在这里无效,
+    只能把等价性钉在这一层:postprocess 是逐帧的反归一化 + clamp + 维度变换,
+    帧间无耦合,沿帧轴切开必然等价。
+    """
+
+    @staticmethod
+    def _pipeline():
+        from diffusers.video_processor import VideoProcessor
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2DistilledOneStagePipeline
+
+        pipe = object.__new__(LTX2DistilledOneStagePipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.video_processor = VideoProcessor(vae_scale_factor=32)
+        return pipe
+
+    @pytest.mark.parametrize(
+        ("num_frames", "chunk", "output_type"),
+        [
+            (121, 32, "np"),  # 生产菜单的 5 秒档
+            (121, 32, "pt"),
+            (64, 16, "np"),  # 整除
+            (65, 16, "pt"),  # 有余数块
+            (7, 32, "np"),  # 不足一块,走原路径
+        ],
+    )
+    def test_chunked_matches_whole(self, monkeypatch, num_frames, chunk, output_type):
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+        monkeypatch.setenv(ltx_runtime.LTX2_POSTPROCESS_FRAME_CHUNK_ENV, str(chunk))
+        pipe = self._pipeline()
+        torch.manual_seed(0)
+        video = torch.randn(1, 3, num_frames, 16, 24)
+
+        whole = pipe.video_processor.postprocess_video(video.clone(), output_type=output_type)
+        chunked = pipe._postprocess_video_chunked(video.clone(), output_type)
+
+        if output_type == "pt":
+            assert torch.equal(whole, chunked)
+        else:
+            assert whole.shape == chunked.shape
+            assert np.array_equal(whole, chunked)
+
+    def test_chunk_env_rejects_garbage(self, monkeypatch):
+        """粒度配错要当场报错,不能静默回落 —— 静默回落等于这条优化悄悄失效。"""
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+        for bad in ("0", "-4", "abc"):
+            monkeypatch.setenv(ltx_runtime.LTX2_POSTPROCESS_FRAME_CHUNK_ENV, bad)
+            with pytest.raises(ValueError):
+                ltx_runtime._postprocess_frame_chunk()

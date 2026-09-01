@@ -12,6 +12,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -121,6 +122,24 @@ logger = init_logger(__name__)
 # 解码前把 DiT 搬回主机内存的开关。与 MiniMax-H3 的
 # VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE 同语义、同默认值(关)。
 LTX2_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE"
+
+# postprocess 的分帧粒度。与 H3 的 VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK 同性质:
+# 只调"一次转多少帧",不是开关 —— 分块本身无条件生效(逐帧运算,数值等价)。
+LTX2_POSTPROCESS_FRAME_CHUNK = 32
+LTX2_POSTPROCESS_FRAME_CHUNK_ENV = "VLLM_OMNI_LTX2_POSTPROCESS_FRAME_CHUNK"
+
+
+def _postprocess_frame_chunk() -> int:
+    raw = os.getenv(LTX2_POSTPROCESS_FRAME_CHUNK_ENV)
+    if raw is None:
+        return LTX2_POSTPROCESS_FRAME_CHUNK
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{LTX2_POSTPROCESS_FRAME_CHUNK_ENV} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{LTX2_POSTPROCESS_FRAME_CHUNK_ENV} must be >= 1, got {value}")
+    return value
 
 
 class LTXRuntime(
@@ -512,6 +531,39 @@ class LTXRuntime(
             )
         return DiffusionOutput(output=output)
 
+    def _postprocess_video_chunked(self, video: torch.Tensor, output_type: str):
+        """按帧分块做 postprocess，把整段 fp32 副本换成一块的大小。
+
+        diffusers 的 ``postprocess_video`` 对整段视频一次性 ``.float()`` 再搬到主机,
+        那一份是解码阶段最大的一块:4K×121 帧 = 121×8.36M×3×4B = **12.1 GB**,
+        而它与 all-gather 缓冲、merge 结果同时存在(实测峰值 31.6 GB / 40 GB)。
+        逐块转换 + 逐块落主机之后,设备上任一时刻只有 chunk 那么大。
+
+        与 MiniMax-H3 的 ``vae.py::_revert_frames`` 同一手法(它的注释写得最准:
+        "Bound post-decode denormalization memory independently of clip length"),
+        差别只是 LTX 这一步在 diffusers 里,得从外面按帧切。
+
+        **数值上与不分块完全一致**:postprocess 是逐帧的反归一化 + clamp + 维度变换,
+        帧与帧之间没有耦合。所以这里不设开关、默认就分块 —— 与 H3 的做法一致。
+
+        只对 np / pt 两种输出分块。pil 输出是 list-of-list,拼接语义另说,而且它本身
+        就要在主机上再拷一遍,不是显存瓶颈,交给原路径。
+        """
+        num_frames = video.shape[2] if video.ndim == 5 else 0
+        chunk = _postprocess_frame_chunk()
+        if output_type not in ("np", "pt") or num_frames <= chunk:
+            return self.video_processor.postprocess_video(video, output_type=output_type)
+
+        parts = [
+            self.video_processor.postprocess_video(video[:, :, start : start + chunk], output_type=output_type)
+            for start in range(0, num_frames, chunk)
+        ]
+        # 设备上那份 bf16 全片到这里就没人要了,早一步释放,给音频解码腾地方。
+        del video
+        if output_type == "pt":
+            return torch.cat(parts, dim=1)
+        return np.concatenate(parts, axis=1)
+
     def _offload_dit_before_vae(self) -> None:
         """把 model-level offload 托管的 DiT 在全分辨率 VAE 解码前搬回主机内存。
 
@@ -614,7 +666,7 @@ class LTXRuntime(
             )
 
         if video.numel() > 0:
-            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            video = self._postprocess_video_chunked(video, output_type)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
         audio = self.vocoder(generated_mel)
         return self._make_output((video, audio))

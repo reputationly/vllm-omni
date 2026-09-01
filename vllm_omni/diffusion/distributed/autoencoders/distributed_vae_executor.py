@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -57,9 +57,25 @@ class DistributedVaeExecutor:
         self.parallel_mode = mode
 
     def gather_tensors(self, tensor: torch.Tensor):
-        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        return gather_list if self.rank == 0 else None
+        """把各 rank 的分块收到 rank 0。
+
+        用 ``gather`` 而不是 ``all_gather``:两条调用路径(本文件的 ``execute`` 与
+        ``autoencoder_kl_ltx2.py`` 的 tile 版)**都只在 rank 0 用这个结果** ——
+        下面紧接着就是 ``if self.rank != 0: result = torch.empty(0)``。
+        all_gather 会让每张卡都分配 world_size 份缓冲、把整段解码后视频全收一遍,
+        非 rank 0 那几张收完即扔。
+
+        这不是省边角:2026-08-31 实测 LTX-2.5 的 4K 档就是**非 rank 0 的卡**先 OOM 的
+        (3840×2176×249 报 `GPU 2 has a total capacity of 39.49 GiB of which
+        10.19 GiB is free`),因为整段视频在每张卡上都有一份。改掉之后非 rank 0 的
+        这一份就不存在了。
+
+        NCCL 支持 gather(PyTorch 用 point-to-point 实现),已在 A100×2 上实跑验证。
+        """
+        dst = dist.get_global_rank(self.group, 0) if self.group is not None else 0
+        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
+        dist.gather(tensor, gather_list, dst=dst, group=self.group)
+        return gather_list
 
     def broadcast_tensor(self, tensor: torch.Tensor):
         dist.broadcast(tensor, src=0, group=self.group)
