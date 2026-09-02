@@ -275,6 +275,13 @@ vllm_omni/_version.py
 *.wav
 # Vendored test reference audio (small, intentionally checked in)
 !tests/assets/**/*.wav
+# Bundled runtime assets (small, intentionally checked in). The IndexTTS2 startup
+# warmup needs a reference voice to clone — the model has no zero-shot mode — so
+# the asset must ship inside the package. Without this exception the blanket
+# *.wav above silently drops it: the file exists in a dev tree, so everything
+# looks fine locally, while a clean checkout builds an image where warmup logs
+# one warning and no-ops, leaving the 96s first-request penalty in place.
+!vllm_omni/**/assets/*.wav
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/

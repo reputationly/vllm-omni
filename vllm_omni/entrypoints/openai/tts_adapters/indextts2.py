@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 serving adapter."""
 
 from __future__ import annotations
 
 import hashlib
 import math
+import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
+import pybase64 as base64
 import torch
 from vllm.inputs import tokens_input
+from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
@@ -128,6 +133,37 @@ def indextts2_conditioning_cache_salt(
         h.update(b"\x00indextts2-use-random-request\x00")
         h.update((request_id or random_uuid()).encode("utf-8"))
     return h.hexdigest()[:32]
+
+
+logger = init_logger(__name__)
+
+# Reference voice for the startup warmup. IndexTTS2 has no zero-shot mode — the
+# model clones a voice, so a warmup request cannot be synthesised out of thin
+# air the way VoxCPM2's can. This is one of IndexTTS-2's own demo samples
+# (HuggingFace ``spaces/IndexTeam/IndexTTS-2-Demo`` examples/), already
+# 24 kHz mono 16-bit — the format the model works in — so warmup exercises the
+# same resample/encode path a real request takes.
+_WARMUP_REF_AUDIO = Path(__file__).parent / "assets" / "indextts2_warmup_ref.wav"
+
+# Long enough to run the talker for a realistic number of steps; short enough
+# that warmup does not dominate startup. The JIT cost being paid here is not
+# proportional to text length — it is the one-time Triton kernel compilation.
+_WARMUP_TEXT = "系统预热中，这段语音不会返回给任何调用方。"
+
+
+def _warmup_ref_audio_uri() -> str:
+    """Return the warmup reference voice as a base64 ``data:`` URI.
+
+    A ``file://`` URI would be the obvious choice and is the wrong one: the
+    production launch pins ``--allowed-local-media-path /nfs-output``, and this
+    asset lives inside the installed package, so the path allowlist would reject
+    it and warmup would silently no-op on exactly the deployment it was written
+    for. A data URI carries the bytes inline and is subject to no path policy.
+
+    Raises ``OSError`` if the asset is missing (e.g. a build that failed to ship
+    package data); the caller downgrades that to a warning.
+    """
+    return "data:audio/wav;base64," + base64.b64encode(_WARMUP_REF_AUDIO.read_bytes()).decode("ascii")
 
 
 @register_tts_adapter
@@ -276,6 +312,56 @@ class IndexTTS2Adapter(ARTTSAdapter):
             else:
                 params[key] = [extras[key]]
         return params
+
+    async def warmup(self) -> None:
+        """Pay the one-time Triton compilation cost before traffic arrives.
+
+        IndexTTS compiles two Triton kernels on the *first* inference of every
+        process — ``kernel_unified_attention`` and ``SnakeBeta._init_triton``.
+        Measured on a production instance, those two compilations sat 93 seconds
+        apart and made the first request take 96s against a 15s steady state:
+        a 6x penalty paid by whichever user happened to arrive first after a
+        restart, on every replica, after every upgrade.
+
+        This runs from ``init_app_state`` *before* the ``/ready`` gate flips, so
+        GPUStack neither routes traffic nor marks the instance Ready until the
+        kernels are built — the cost moves from a user's request to the startup
+        window, where it belongs. Expect startup to grow by roughly the
+        compilation time.
+
+        Failure is deliberately non-fatal. A model that cannot warm up still
+        serves correctly, just slowly on the first request; refusing to start
+        would turn a latency problem into an availability one.
+        """
+        from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+        server = self.ctx.server
+        try:
+            ref_audio = _warmup_ref_audio_uri()
+        except OSError as exc:
+            logger.warning("Speech warmup skipped, reference audio unreadable: %s", exc)
+            return
+
+        logger.info("Running warmup speech request for model_type=%s", self.name)
+        started = time.time()
+        # ``voice`` is required by the OpenAI schema but ignored here: the clone
+        # source is ref_audio, and this name intentionally matches no uploaded
+        # speaker so the lookup in _build_params falls straight through.
+        warmup_req = OpenAICreateSpeechRequest(
+            input=_WARMUP_TEXT,
+            voice="__warmup__",
+            ref_audio=ref_audio,
+            response_format="wav",
+            speed=1.0,
+            stream=False,
+            model=server.model_name,
+        )
+        try:
+            await server._generate_audio_bytes(warmup_req, request_id="speech-warmup")
+        except Exception as exc:
+            logger.warning("Speech warmup failed (non-fatal): %s", exc)
+            return
+        logger.info("Speech warmup complete in %.1fs", time.time() - started)
 
 
 @register_tts_adapter
