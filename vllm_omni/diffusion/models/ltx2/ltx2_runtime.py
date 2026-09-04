@@ -662,7 +662,10 @@ class LTXRuntime(
         默认关。开了以后下一次去噪要把 DiT 搬回卡上(PCIe 上 19 GB,数秒),所以这是一个
         "长时长档用显存换一点吞吐"的取舍,交给部署侧按档位决定,与 H3 的处理一致。
         """
-        if not bool(getattr(self.od_config, "enable_cpu_offload", False)):
+        # nn.Module.__getattr__ raises instead of returning None, so read od_config
+        # defensively: a pipeline constructed without one (as upstream's decoder
+        # tests do) demonstrably has no model-level offload to undo.
+        if not bool(getattr(getattr(self, "od_config", None), "enable_cpu_offload", False)):
             return
         if os.getenv(LTX2_OFFLOAD_DIT_BEFORE_VAE_ENV, "0") != "1":
             return
