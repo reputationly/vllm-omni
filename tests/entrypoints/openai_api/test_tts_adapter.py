@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the TTS serving adapter registry (RFC #4327).
 
 Pure-Python registry/resolution logic; no model or GPU resources are loaded.
@@ -236,3 +237,93 @@ def test_diffusion_adapter_extra_body_params_fallback():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _indextts_length_guard_adapter(
+    adapter_cls,
+    *,
+    token_count: int,
+    max_text_tokens: int | None = 600,
+    monkeypatch=None,
+):
+    """Adapter whose text tokenizer is stubbed to report ``token_count``."""
+    gpt_cfg = {} if max_text_tokens is None else {"max_text_tokens": max_text_tokens}
+    server = SimpleNamespace(
+        uploaded_speakers={},
+        _validate_ref_audio_format=lambda ref_audio: None,
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="/weights/IndexTTS-2.5",
+                hf_config=SimpleNamespace(gpt=gpt_cfg, tokenizer_file="t.tiktoken"),
+            )
+        ),
+    )
+    adapter = adapter_cls(SimpleNamespace(server=server))
+    request = SimpleNamespace(
+        input="任意文本",
+        voice="alloy",
+        ref_audio=object(),
+        max_new_tokens=None,
+        extra_params=None,
+        speed=1.0,
+    )
+    monkeypatch.setattr(
+        prompt_utils,
+        "count_indextts2_text_tokens",
+        lambda *args, **kwargs: token_count,
+    )
+    return adapter, request
+
+
+@pytest.mark.parametrize("adapter_cls", [IndexTTS2Adapter, IndexTTS25Adapter])
+def test_indextts_accepts_text_at_the_position_embedding_limit(adapter_cls, monkeypatch):
+    # text_pos_embedding is nn.Embedding(max_text_tokens + 2), so 602 is the
+    # last index-safe length for the shipped max_text_tokens=600.
+    adapter, request = _indextts_length_guard_adapter(adapter_cls, token_count=602, monkeypatch=monkeypatch)
+
+    assert adapter.validate(request) is None
+
+
+@pytest.mark.parametrize("adapter_cls", [IndexTTS2Adapter, IndexTTS25Adapter])
+def test_indextts_rejects_text_past_the_position_embedding_limit(adapter_cls, monkeypatch):
+    # One token past the table would be an out-of-bounds embedding lookup,
+    # i.e. a device-side assert that kills the stage-0 replica for every later
+    # request. It must fail this request instead.
+    adapter, request = _indextts_length_guard_adapter(adapter_cls, token_count=603, monkeypatch=monkeypatch)
+
+    error = adapter.validate(request)
+    assert error is not None
+    assert "603" in error and "602" in error
+
+
+def test_indextts_length_guard_honours_checkpoint_max_text_tokens(monkeypatch):
+    adapter, request = _indextts_length_guard_adapter(
+        IndexTTS25Adapter,
+        token_count=900,
+        max_text_tokens=1024,
+        monkeypatch=monkeypatch,
+    )
+
+    assert adapter.validate(request) is None
+
+
+def test_indextts_length_guard_falls_back_when_config_lacks_limit(monkeypatch):
+    adapter, request = _indextts_length_guard_adapter(
+        IndexTTS25Adapter,
+        token_count=603,
+        max_text_tokens=None,
+        monkeypatch=monkeypatch,
+    )
+
+    assert "602" in (adapter.validate(request) or "")
+
+
+def test_indextts_length_guard_does_not_block_when_counting_fails(monkeypatch):
+    adapter, request = _indextts_length_guard_adapter(IndexTTS25Adapter, token_count=1, monkeypatch=monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("tokenizer unavailable")
+
+    monkeypatch.setattr(prompt_utils, "count_indextts2_text_tokens", _boom)
+
+    assert adapter.validate(request) is None

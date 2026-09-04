@@ -199,6 +199,49 @@ class IndexTTS2Adapter(ARTTSAdapter):
             extra_err = self._validate_extra_params(request.extra_params)
             if extra_err:
                 return extra_err
+        return self._validate_text_token_length(request)
+
+    def _text_tokenizer_kwargs(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Tokenizer settings that affect the text-token count for this model."""
+        del request
+        return {}
+
+    def _validate_text_token_length(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Reject text the talker cannot position-embed.
+
+        Without this the request reaches ``text_pos_embedding``, indexes past
+        its ``max_text_tokens + 2`` table and raises a CUDA device-side assert,
+        which kills the stage-0 replica for every subsequent request instead of
+        failing just this one.
+        """
+        server = self.ctx.server
+        from vllm_omni.model_executor.models.indextts2.prompt_utils import (
+            count_indextts2_text_tokens,
+            resolve_indextts2_text_token_limit,
+        )
+
+        model_config = getattr(getattr(server, "engine_client", None), "model_config", None)
+        if model_config is None:
+            return None
+        limit = resolve_indextts2_text_token_limit(getattr(model_config, "hf_config", None))
+        try:
+            token_count = count_indextts2_text_tokens(
+                model_config.model,
+                request.input,
+                model_type=self.name,
+                **self._text_tokenizer_kwargs(request),
+            )
+        except Exception:
+            # Counting needs the tokenizer and (for 2.5) text normalization.
+            # If either is unavailable, fall through: prepare() runs the same
+            # code path and surfaces a clean error there.
+            logger.warning("IndexTTS text-length guard could not count tokens; skipping", exc_info=True)
+            return None
+        if token_count > limit:
+            return (
+                f"Input text is too long: it tokenizes to {token_count} text tokens but this "
+                f"model supports at most {limit}. Split the input into shorter requests."
+            )
         return None
 
     def _validate_extra_params(self, extras: Mapping[str, Any]) -> str | None:
@@ -378,6 +421,22 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
         if speed < INDEXTTS25_MIN_DURATION_FACTOR or speed > INDEXTTS25_MAX_DURATION_FACTOR:
             return "IndexTTS 2.5 speed must be between 0.5 and 2.0"
         return None
+
+    def _text_tokenizer_kwargs(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+            INDEXTTS25_TOKENIZER_FILE,
+            normalize_language_code,
+        )
+
+        extras = request.extra_params if isinstance(request.extra_params, dict) else {}
+        server = self.ctx.server
+        hf_config = getattr(getattr(server, "engine_client", None), "model_config", None)
+        hf_config = getattr(hf_config, "hf_config", None)
+        return {
+            "lang": normalize_language_code(str(extras.get("lang", "zh"))),
+            "text_normalization": bool(extras.get("text_normalization", True)),
+            "tokenizer_file": getattr(hf_config, "tokenizer_file", INDEXTTS25_TOKENIZER_FILE),
+        }
 
     def _validate_extra_params(self, extras: Mapping[str, Any]) -> str | None:
         error = super()._validate_extra_params(extras)

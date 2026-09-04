@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib.util
 from pathlib import Path
@@ -13,6 +13,21 @@ from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _clear_text_token_count_cache():
+    """Keep the token-count cache from leaking across tests.
+
+    ``count_indextts2_text_tokens`` is ``lru_cache``d so a request counts once
+    instead of twice. Tests here stub ``prepare_indextts25_text`` with
+    different fakes while reusing the same ``("/model", "hello", ...)``
+    arguments, so without this the second test would read the first test's
+    cached answer and pass (or fail) for the wrong reason.
+    """
+    prompt_utils.count_indextts2_text_tokens.cache_clear()
+    yield
+    prompt_utils.count_indextts2_text_tokens.cache_clear()
 
 
 def _load_indextts2_offline_example():
@@ -200,3 +215,47 @@ def test_indextts25_prompt_ids_preserve_placeholder_value(monkeypatch):
 
     assert prompt_ids == [17] * 10
     assert captured["tokenizer_file"] == "custom-tokenizer.tiktoken"
+
+
+def test_text_token_count_is_cached_across_the_validate_build_hop(monkeypatch):
+    """One request must not pay text normalization twice.
+
+    The serving adapter counts tokens in ``validate()`` to bound the sequence,
+    then ``build()`` recomputes the same value through
+    ``estimate_indextts2_prefill_prompt_len``. Both run synchronously on the
+    event loop, so the second call has to be a cache hit.
+    """
+    calls = []
+
+    def fake_prepare(*args, **kwargs):
+        calls.append(kwargs)
+        return [11, 12, 13, 14], 0
+
+    monkeypatch.setattr(prompt_utils, "prepare_indextts25_text", fake_prepare)
+
+    kwargs = {"model_type": "indextts2_5", "lang": "en", "text_normalization": True}
+    first = prompt_utils.count_indextts2_text_tokens("/model", "hello", **kwargs)
+    prompt_len = prompt_utils.estimate_indextts2_prefill_prompt_len("/model", "hello", **kwargs)
+
+    assert len(calls) == 1
+    assert first == 4 + 2
+    assert prompt_len == 3 + first + 1
+
+
+def test_text_token_count_cache_keys_on_normalization_and_language(monkeypatch):
+    """Cache keys must not collapse requests that tokenize differently."""
+    calls = []
+
+    def fake_prepare(*args, **kwargs):
+        calls.append(kwargs)
+        return [11, 12, 13, 14], 0
+
+    monkeypatch.setattr(prompt_utils, "prepare_indextts25_text", fake_prepare)
+
+    base = {"model_type": "indextts2_5", "lang": "en", "text_normalization": True}
+    prompt_utils.count_indextts2_text_tokens("/model", "hello", **base)
+    prompt_utils.count_indextts2_text_tokens("/model", "hello", **{**base, "text_normalization": False})
+    prompt_utils.count_indextts2_text_tokens("/model", "hello", **{**base, "lang": "zh"})
+    prompt_utils.count_indextts2_text_tokens("/model", "goodbye", **base)
+
+    assert len(calls) == 4
