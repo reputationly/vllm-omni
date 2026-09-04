@@ -238,23 +238,35 @@ def _normalize_zh_or_en(text: str) -> str:
     return clean_indextts25_text(result)
 
 
+@lru_cache(maxsize=1)
+def _load_spanish_normalizer():
+    """Return the NeMo Spanish normalizer, or ``None`` when unavailable.
+
+    Cached like the zh/en and Japanese backends: constructing ``Normalizer``
+    compiles its FST grammars, which costs seconds. Doing that per request
+    made Spanish an order of magnitude slower than every other language.
+    """
+    # NeMo is optional in the upstream implementation and falls back to
+    # raw text when its grammar package is unavailable.
+    try:
+        from nemo_text_processing.text_normalization.normalize import (
+            Normalizer,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "nemo_text_processing":
+            raise
+        return None
+    return Normalizer(input_case="cased", lang="es")
+
+
 def _normalize_with_official_backend(text: str, lang: str) -> str:
     if lang in {"zh", "en", "zhen"}:
         return _normalize_zh_or_en(text)
     if lang == "es":
-        # NeMo is optional in the upstream implementation and falls back to
-        # raw text when its grammar package is unavailable.
-        try:
-            from nemo_text_processing.text_normalization.normalize import (
-                Normalizer,
-            )
-
-            normalizer = Normalizer(input_case="cased", lang="es")
-            return normalizer.normalize(text, verbose=False)
-        except ModuleNotFoundError as exc:
-            if exc.name != "nemo_text_processing":
-                raise
+        normalizer = _load_spanish_normalizer()
+        if normalizer is None:
             return text
+        return normalizer.normalize(text, verbose=False)
     return text
 
 
