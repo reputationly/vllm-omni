@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base contract for per-model TTS serving adapters.
 
 This package factors the per-model ``if self._tts_model_type == ...`` dispatch
@@ -155,6 +156,9 @@ class TTSModelAdapter(ABC):
     backend: ClassVar[str] = "ar"
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Target sample rates validated for this adapter's output path. An empty
+    #: set means that the adapter does not expose per-request resampling.
+    supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
 
     max_new_tokens_min = 1
 

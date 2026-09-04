@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import hashlib
@@ -34,7 +37,7 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     BatchSpeechRequest,
@@ -1266,6 +1269,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        sample_rate_error = self._validate_speech_sample_rate(request)
+        if sample_rate_error is not None:
+            return sample_rate_error
+
         adapter = self._get_tts_adapter()
         if adapter is not None:
             return adapter.validate(request)
@@ -1279,6 +1286,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             engine_client=self.engine_client,
         )
         return adapter_cls(ctx).validate(request)
+
+    def _validate_speech_sample_rate(self, request: OpenAICreateSpeechRequest) -> str | None:
+        if request.sample_rate is None:
+            return None
+
+        adapter_cls = resolve_adapter(self._tts_model_type)
+        supported_rates = adapter_cls.supported_output_sample_rates if adapter_cls is not None else frozenset()
+        if request.sample_rate not in supported_rates:
+            if supported_rates:
+                rates = ", ".join(str(rate) for rate in sorted(supported_rates))
+                return (
+                    f"sample_rate={request.sample_rate} is not supported by the current TTS model; "
+                    f"supported rates: {rates}"
+                )
+            return "sample_rate is not supported by the current TTS model"
+        return None
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
         """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
@@ -2163,6 +2186,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         include_sample_rate: bool = False,
         usage_acc: SpeechOutputTokenCounter | None = None,
         collect: dict | None = None,
+        target_sample_rate: int | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2186,6 +2210,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         first_audio_chunk_s: float | None = None
         stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
         artifact_ready = False
+        source_sample_rate: int | None = None
+        resampler: StreamingAudioResampler | None = None
 
         try:
             async for res in generator:
@@ -2204,7 +2230,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sr_raw is not None:
                     sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
                     sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-
+                    if source_sample_rate is not None and sample_rate_val != source_sample_rate:
+                        raise ValueError(
+                            "Audio sample rate changed during streaming: "
+                            f"{source_sample_rate} Hz to {sample_rate_val} Hz"
+                        )
                 audio_val = audio_output[audio_key]
                 if isinstance(audio_val, list):
                     # Cumulative mode: each update grows the list; emit only new tail.
@@ -2218,12 +2248,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     else:
                         new_chunks = []
 
+                if new_chunks and source_sample_rate is None:
+                    if response_format == "wav" and sr_raw is None:
+                        raise ValueError("First audio output must include sample rate metadata for WAV streaming")
+                    source_sample_rate = sample_rate_val
+                    if target_sample_rate is not None and target_sample_rate != source_sample_rate:
+                        resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
+
+                output_sample_rate = target_sample_rate or sample_rate_val
+
                 for chunk_tensor in new_chunks:
                     chunk_np = (
                         chunk_tensor.float().detach().cpu().numpy() if hasattr(chunk_tensor, "float") else chunk_tensor
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if resampler is not None:
+                        chunk_np = resampler.process(chunk_np)
+                        if chunk_np.size == 0:
+                            continue
                     if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(chunk_np)) == 0:
                         # Zero-size chunks must not emit a WAV header or count
                         # as first audio; the post-loop guard below needs to
@@ -2231,14 +2274,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         continue
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
-                        # Assert that sample rate has been set from chunk metadata (not just default)
-                        # This ensures the WAV header contains the correct sample rate
-                        assert sr_raw is not None, (
-                            "First audio chunk must include sample rate metadata for WAV streaming"
-                        )
                         num_channels = _infer_audio_num_channels(np.asarray(chunk_np))
                         wav_header = _create_wav_header(
-                            sample_rate=sample_rate_val,
+                            sample_rate=output_sample_rate,
                             num_channels=num_channels,
                             bits_per_sample=16,
                         )
@@ -2248,7 +2286,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     # Convert audio to PCM bytes
                     audio_obj = CreateAudio(
                         audio_tensor=chunk_np,
-                        sample_rate=sample_rate_val,
+                        sample_rate=output_sample_rate,
                         response_format="pcm",
                         speed=1.0,
                         base64_encode=False,
@@ -2257,7 +2295,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         first_audio_chunk_s = time.perf_counter()
                     audio_bytes = self.create_audio(audio_obj).audio_data
                     if include_sample_rate:
-                        yield audio_bytes, sample_rate_val
+                        yield audio_bytes, output_sample_rate
+                    else:
+                        yield audio_bytes
+
+            if resampler is not None:
+                final_chunk = resampler.process(np.empty((0,), dtype=np.float32), final=True)
+                if final_chunk.size:
+                    output_sample_rate = target_sample_rate or sample_rate_val
+                    if response_format == "wav" and first_chunk:
+                        yield _create_wav_header(
+                            sample_rate=output_sample_rate,
+                            num_channels=1,
+                            bits_per_sample=16,
+                        )
+                        first_chunk = False
+                    audio_obj = CreateAudio(
+                        audio_tensor=final_chunk,
+                        sample_rate=output_sample_rate,
+                        response_format="pcm",
+                        speed=1.0,
+                        base64_encode=False,
+                    )
+                    if first_audio_chunk_s is None:
+                        first_audio_chunk_s = time.perf_counter()
+                    audio_bytes = self.create_audio(audio_obj).audio_data
+                    if include_sample_rate:
+                        yield audio_bytes, output_sample_rate
                     else:
                         yield audio_bytes
             if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and first_audio_chunk_s is None:
@@ -2356,6 +2420,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raw_request=raw_request,
                 request_start_s=request_start_s,
                 usage_acc=usage_acc,
+                tts_params=tts_params,
+                target_sample_rate=request.sample_rate if request is not None else None,
             ):
                 payload = {
                     "type": "speech.audio.delta",
@@ -2957,6 +3023,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        sample_rate_error = self._validate_speech_sample_rate(request)
+        if sample_rate_error is not None:
+            raise ValueError(sample_rate_error)
+
         request_id = request_id or f"speech-{random_uuid()}"
         qwen3_ref_audio_warmup_artifact_key: str | None = None
 
@@ -3098,7 +3168,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(
-        self, generator, request_id: str, *, include_sample_rate: bool = False, collect: dict | None = None
+        self,
+        generator,
+        request_id: str,
+        *,
+        include_sample_rate: bool = False,
+        tts_params: dict[str, Any] | None = None,
+        collect: dict | None = None,
+        target_sample_rate: int | None = None,
     ):
         """Yield raw PCM byte chunks from the engine generator.
 
@@ -3113,14 +3190,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             response_format="pcm",
             include_sample_rate=include_sample_rate,
             collect=collect,
+            target_sample_rate=target_sample_rate,
         ):
             yield chunk
 
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, tts_params = await self._prepare_speech_generation(request)
         try:
-            async for chunk in self._generate_pcm_chunks(generator, request_id):
+            async for chunk in self._generate_pcm_chunks(
+                generator,
+                request_id,
+                tts_params=tts_params,
+                target_sample_rate=request.sample_rate,
+            ):
                 yield chunk
         finally:
             self._discard_ref_audio_artifact_warmup(request_id)
@@ -3268,6 +3351,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate,
+                output_sample_rate=request.sample_rate,
                 response_format=request.response_format or "wav",
                 speed=self._audio_encode_speed(request),
                 base64_encode=base64_encode,
@@ -3398,6 +3482,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate,
+                output_sample_rate=request.sample_rate,
                 response_format=request.response_format or "wav",
                 speed=self._audio_encode_speed(request),
                 base64_encode=False,
@@ -3468,6 +3553,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_audio: Reference audio for voice cloning (Base task)
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
+        - sample_rate: Target output sample rate (8000 or 24000 Hz)
 
         Streaming is supported via the ``stream=True`` switch or ``stream_format='sse'``,
         which return OpenAI ``speech.audio.*`` SSE events. ``stream_format='audio'``
@@ -3478,6 +3564,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.voice is not None:
             if _is_default_voice(request.voice.lower(), self._get_available_speakers()):
                 request.voice = None
+
+        sample_rate_error = self._validate_speech_sample_rate(request)
+        if sample_rate_error is not None:
+            return self.create_error_response(sample_rate_error)
 
         if self._diffusion_mode:
             return await self._create_diffusion_speech(request)
@@ -3516,7 +3606,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return error
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                _, generator, raw_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
                 return StreamingResponse(
                     self._generate_audio_chunks(
                         generator,
@@ -3524,6 +3614,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         response_format,
                         raw_request=raw_request,
                         request_start_s=request_start_s,
+                        tts_params=raw_tts_params,
+                        target_sample_rate=request.sample_rate,
                     ),
                     media_type=media_type,
                 )
@@ -3638,6 +3730,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             voice=_pick("voice"),
             instructions=_pick("instructions"),
             response_format=_pick("response_format") or "wav",
+            sample_rate=_pick("sample_rate"),
             speed=picked_speed if picked_speed is not None else 1.0,
             stream=False,
             task_type=_pick("task_type"),

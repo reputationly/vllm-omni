@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
 import base64
@@ -3209,11 +3212,60 @@ class TestMergeBatchItem:
 
         assert merged.non_streaming_mode is False
 
+    def test_sample_rate_batch_default_used(self):
+        """Batch-level sample_rate should be used when the item omits it."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi")],
+            sample_rate=8000,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.sample_rate == 8000
+
+    def test_sample_rate_item_override_wins(self):
+        """Per-item sample_rate should override the batch-level default."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", sample_rate=24000)],
+            sample_rate=8000,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.sample_rate == 24000
+
 
 def test_streaming_speech_session_config_accepts_non_streaming_mode():
     config = StreamingSpeechSessionConfig(non_streaming_mode=True)
 
     assert config.non_streaming_mode is True
+
+
+@pytest.mark.parametrize("sample_rate", [8000, 24000])
+def test_speech_requests_accept_supported_sample_rates(sample_rate):
+    assert OpenAICreateSpeechRequest(input="hello", sample_rate=sample_rate).sample_rate == sample_rate
+
+
+@pytest.mark.parametrize("sample_rate", [0, -8000])
+def test_speech_request_rejects_non_positive_sample_rate(sample_rate):
+    with pytest.raises(ValidationError):
+        OpenAICreateSpeechRequest(input="hello", sample_rate=sample_rate)
+
+
+def test_sample_rate_uses_adapter_capabilities():
+    server = object.__new__(OmniOpenAIServingSpeech)
+    request = OpenAICreateSpeechRequest(input="hello", sample_rate=8000)
+
+    server._tts_model_type = "qwen3_tts"
+    assert server._validate_speech_sample_rate(request) is None
+
+    request.sample_rate = 16000
+    assert server._validate_speech_sample_rate(request) == (
+        "sample_rate=16000 is not supported by the current TTS model; supported rates: 8000, 24000"
+    )
+
+    server._tts_model_type = "fish_speech"
+    assert server._validate_speech_sample_rate(request) == ("sample_rate is not supported by the current TTS model")
 
 
 def test_streaming_speech_session_config_scopes_native_speed_to_http():

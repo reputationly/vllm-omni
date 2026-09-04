@@ -2,7 +2,7 @@
 
 vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation. Supported TTS models include:
 
-- **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
+- **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Native output: 24 kHz; API output can be resampled to 8 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
@@ -105,7 +105,7 @@ Content-Type: application/json
 #### OpenAI Standard Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `input` | string | **required** | The text to synthesize into speech |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
@@ -115,7 +115,8 @@ Content-Type: application/json
 #### vLLM-Omni Extension Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
+| `sample_rate` | integer | model native | Target output sample rate. Qwen3-TTS supports 8000 or 24000 Hz; the model remains native 24 kHz internally and is resampled before encoding. |
 | `task_type` | string | "CustomVoice" | TTS task type: CustomVoice, VoiceDesign, or Base |
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
@@ -130,7 +131,7 @@ Content-Type: application/json
 #### Voice Clone Parameters (Base task)
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
@@ -239,7 +240,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 **Form Parameters:**
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| ----------- | ------ | ---------- | ------------- |
 | `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
@@ -288,7 +289,7 @@ The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and 
 Client -> Server:
 
 | Message | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
 | `{"type": "input.text", "text": "..."}` | Text chunk |
 | `{"type": "input.done"}` | End of utterance: flushes the buffer and keeps the connection open |
@@ -297,7 +298,7 @@ Client -> Server:
 Server -> Client:
 
 | Message | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
 | `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
@@ -311,17 +312,17 @@ text, emits `session.done`, and then waits on the same connection for the next
 utterance, so a client that speaks repeatedly (for example one driven by an
 upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
-* The session config is sticky. Send `input.text` again straight after
+- The session config is sticky. Send `input.text` again straight after
   `session.done` to reuse it, or send another `session.config` first to change
   voice, format, or reference audio. A `session.config` sent while text is
   still buffered is rejected so no pending input is silently dropped.
-* An utterance is the flush unit, not a linguistic one: it is whatever text was
+- An utterance is the flush unit, not a linguistic one: it is whatever text was
   buffered when `input.done` arrived, of any length, synthesized as one request.
   `utterance_index` counts those flushes across the connection, so it tells you
   which `input.done` a frame belongs to. `sentence_index` counts within one
   flush and so pairs with `total_sentences`, which means every utterance reports
   `sentence_index: 0` of `total_sentences: 1` (or `0` for an empty buffer).
-* End the connection with `session.close`, or by closing the socket. An idle
+- End the connection with `session.close`, or by closing the socket. An idle
   connection is still closed after the server's idle timeout, which now also
   applies to the gap between utterances.
 
@@ -332,7 +333,6 @@ All REST API parameters are supported, plus:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
-
 
 ```bash
 DELETE /v1/audio/voices/{name}
@@ -433,6 +433,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ### Upload Voice
 
 Upload voice (speaker embedding only):
+
 ```bash
 curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
@@ -441,6 +442,7 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ```
 
 Upload voice with transcript (in-context cloning, higher quality):
+
 ```bash
 curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
@@ -450,6 +452,7 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ```
 
 ### Use Uploaded Voice
+
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
@@ -536,7 +539,7 @@ Content-Type: application/json
 ### Request Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `items` | array | **required** | List of items to synthesize (1–32) |
 | `model` | string | server's model | Model to use |
 | `voice` | string | null | Default voice for all items |
@@ -553,7 +556,7 @@ Content-Type: application/json
 Each item in the `items` array requires only `input` (the text). All other fields are optional and override the batch-level defaults when set:
 
 | Field | Type | Description |
-|-------|------|-------------|
+| ------- | ------ | ------------- |
 | `input` | string | **required** — text to synthesize |
 | `voice` | string | Override voice for this item |
 | `response_format` | string | Override format for this item |
@@ -708,7 +711,7 @@ The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only th
 ### Qwen3-TTS
 
 | Model | Task Type | Description |
-|-------|-----------|-------------|
+| ------- | ----------- | ------------- |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | CustomVoice | Predefined speaker voices with optional style control |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | VoiceDesign | Natural language voice style description |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio |
@@ -790,6 +793,7 @@ Model not found:
 ### "TTS model did not produce audio output"
 
 Ensure you're using the correct model variant for your task type:
+
 - CustomVoice task → CustomVoice model
 - VoiceDesign task → VoiceDesign model
 - Base task → Base model
@@ -804,6 +808,7 @@ curl http://localhost:8091/v1/audio/voices
 ### Out of Memory
 
 If you encounter OOM errors:
+
 1. Use smaller model variant: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
 2. Reduce `--gpu-memory-utilization`
 

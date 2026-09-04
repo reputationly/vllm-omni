@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS serving adapter."""
 
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
+    supported_output_sample_rates = frozenset({8000, 24000})
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is
