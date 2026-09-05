@@ -64,6 +64,68 @@ from .ltx2_request import (
 )
 
 
+def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
+    """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
+    if not hasattr(vocoder, "bwe_generator"):
+        return vocoder(generated_mel)
+
+    input_dtype = generated_mel.dtype
+    device_type = generated_mel.device.type
+    module_dtype = next(vocoder.parameters()).dtype
+    if device_type == "mps":
+        if module_dtype != torch.float32:
+            vocoder.float()
+        try:
+            return vocoder(generated_mel.float()).to(input_dtype)
+        finally:
+            if module_dtype != torch.float32:
+                vocoder.to(module_dtype)
+
+    # BF16 errors compound through the BWE model's long convolution stack.
+    # FP32 autocast upcasts each op without materializing a second FP32 model.
+    with torch.autocast(device_type=device_type, dtype=torch.float32):
+        return vocoder(generated_mel.float()).to(input_dtype)
+
+
+def _prepare_ltx2_video_output(
+    video: torch.Tensor,
+    *,
+    do_normalize: bool,
+) -> torch.Tensor:
+    """Consume decoded BCTHW video and return contiguous uint8 BTHWC frames.
+
+    Keep denormalization, scaling, and rounding in the decoder output dtype,
+    then convert directly to uint8.  ``do_normalize=False`` means the decoder
+    output is expected to already be in ``[0, 1]``; the clamp remains a
+    defensive bound before byte conversion. Performing the reduction before
+    worker IPC cuts the video D2H payload from FP32 to uint8 without
+    materializing a full-size FP32 CUDA tensor.
+    """
+    if video.ndim != 5:
+        raise ValueError(f"Expected decoded BCTHW video, got shape {tuple(video.shape)}")
+    if video.shape[1] != 3:
+        raise ValueError(f"Expected RGB BCTHW video, got shape {tuple(video.shape)}")
+    if not video.is_floating_point():
+        raise ValueError(f"Expected floating-point decoded video, got {video.dtype}")
+
+    video = video.detach()
+    if do_normalize:
+        # Match VaeImageProcessor.denormalize in the source dtype. These
+        # in-place operations have the same dtype-rounding boundaries while
+        # avoiding another full-size decoded-video allocation.
+        video.mul_(0.5).add_(0.5).clamp_(0.0, 1.0)
+    else:
+        video.clamp_(0.0, 1.0)
+
+    # Source-dtype quantization can differ from the legacy FP32 presentation
+    # path by at most one uint8 level, while avoiding a full-size FP32 tensor.
+    video.mul_(255.0).round_()
+    return video.permute(0, 2, 3, 4, 1).to(
+        dtype=torch.uint8,
+        memory_format=torch.contiguous_format,
+    )
+
+
 def _expand_per_prompt_decode_value(
     value: float | list[float],
     *,
@@ -193,7 +255,16 @@ class LTXRuntime(
         initialize_pipeline_components(self, od_config)
         self._phase_adapter: LTXPhaseAdapterRuntime | None = build_ltx_phase_adapter(self)
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "vae.encode",
+                "vae.decode",
+                "text_encoder.forward",
+                "video_processor.postprocess_video",
+                "_prepare_video_output_for_transport",
+                "audio_vae.decode",
+                "vocoder.forward",
+            ],
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
         )
 
     def _forward_request(
@@ -531,6 +602,12 @@ class LTXRuntime(
             )
         return DiffusionOutput(output=output)
 
+    def _prepare_video_output_for_transport(self, video: torch.Tensor) -> torch.Tensor:
+        return _prepare_ltx2_video_output(
+            video,
+            do_normalize=bool(self.video_processor.config.do_normalize),
+        )
+
     def _postprocess_video_chunked(self, video: torch.Tensor, output_type: str):
         """按帧分块做 postprocess，把整段 fp32 副本换成一块的大小。
 
@@ -576,7 +653,10 @@ class LTXRuntime(
         默认关。开了以后下一次去噪要把 DiT 搬回卡上(PCIe 上 19 GB,数秒),所以这是一个
         "长时长档用显存换一点吞吐"的取舍,交给部署侧按档位决定,与 H3 的处理一致。
         """
-        if not bool(getattr(self.od_config, "enable_cpu_offload", False)):
+        # nn.Module.__getattr__ raises instead of returning None, so read od_config
+        # defensively: a pipeline constructed without one (as upstream's decoder
+        # tests do) demonstrably has no model-level offload to undo.
+        if not bool(getattr(getattr(self, "od_config", None), "enable_cpu_offload", False)):
             return
         if os.getenv(LTX2_OFFLOAD_DIT_BEFORE_VAE_ENV, "0") != "1":
             return
@@ -666,9 +746,12 @@ class LTXRuntime(
             )
 
         if video.numel() > 0:
-            video = self._postprocess_video_chunked(video, output_type)
+            if output_type == "np":
+                video = self._prepare_video_output_for_transport(video)
+            else:
+                video = self._postprocess_video_chunked(video, output_type)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
-        audio = self.vocoder(generated_mel)
+        audio = _run_ltx_vocoder(self.vocoder, generated_mel)
         return self._make_output((video, audio))
 
     def _prepare_video_latents_stage(

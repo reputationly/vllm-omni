@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Assertion and response validation helpers for tests."""
 
 import io
@@ -883,6 +886,13 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             )
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
+
+    expected_sample_rate = request_config.get("sample_rate")
+    if expected_sample_rate is not None and req_fmt == "wav" and response.audio_bytes:
+        info = sf.info(io.BytesIO(response.audio_bytes))
+        assert info.samplerate == int(expected_sample_rate), (
+            f"Expected sample_rate={expected_sample_rate}, got {info.samplerate}"
+        )
 
     if run_level in {"advanced_model", "full_model"}:
         if req_fmt == "pcm" and response.audio_bytes:

@@ -9,11 +9,14 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from vllm.sampling_params import SamplingParams
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import (
     TTS_ADAPTER_REGISTRY,
     ARTTSAdapter,
     DiffusionTTSAdapter,
+    SpeechServingContext,
     all_tts_model_types,
     detect_tts_model_type,
     resolve_adapter,
@@ -113,6 +116,45 @@ def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
     assert stage_defaults[0].max_tokens == 4096
 
 
+def _build_moss_tts_request(adapter_cls, mocker, *, request_seed):
+    server = mocker.Mock()
+    server._build_moss_tts_params = mocker.AsyncMock(return_value={})
+    adapter = adapter_cls(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="hello", seed=request_seed)
+
+    return asyncio.run(
+        adapter.build(
+            request,
+            [SamplingParams(seed=42)],
+            has_inline_ref_audio=False,
+        )
+    )
+
+
+# Full-family coverage pins the adapter contract; only Nano consumes this seed end to end today.
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+@pytest.mark.parametrize("request_seed", [0, 1234])
+def test_moss_tts_request_seed_overrides_stage_default(adapter_cls, request_seed, mocker):
+    prepared = _build_moss_tts_request(
+        adapter_cls,
+        mocker,
+        request_seed=request_seed,
+    )
+
+    assert prepared.tts_params["seed"] == [request_seed]
+
+
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+def test_moss_tts_seed_falls_back_to_stage_default(adapter_cls, mocker):
+    prepared = _build_moss_tts_request(
+        adapter_cls,
+        mocker,
+        request_seed=None,
+    )
+
+    assert prepared.tts_params["seed"] == [42]
+
+
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
@@ -179,6 +221,13 @@ def test_indextts25_speed_does_not_change_conditioning_cache_salt():
         fast_request,
         fast_params,
     ) == indextts2_conditioning_cache_salt(slow_request, slow_params)
+
+
+def test_indextts2_conditioning_cache_salt_changes_with_ref_audio_cache_key():
+    request = SimpleNamespace(input="hello", ref_audio="file:///data/spk.wav")
+    salt_a = indextts2_conditioning_cache_salt(request, {"ref_audio_cache_key": ["key_aaa"]})
+    salt_b = indextts2_conditioning_cache_salt(request, {"ref_audio_cache_key": ["key_bbb"]})
+    assert salt_a != salt_b
 
 
 @pytest.mark.parametrize(

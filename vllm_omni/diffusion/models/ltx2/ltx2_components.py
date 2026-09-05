@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared component construction helpers for the LTX model family."""
 
@@ -501,6 +501,13 @@ def get_ltx2_post_process_func(od_config: Any):
         if not (isinstance(output, tuple) and len(output) == 2):
             return output
         video, audio = output
+        if isinstance(video, torch.Tensor) and video.dtype == torch.uint8:
+            if video.ndim != 5 or video.shape[-1] != 3 or not video.is_contiguous():
+                raise ValueError(
+                    "LTX uint8 video output must be contiguous BTHWC RGB, "
+                    f"got shape={tuple(video.shape)} stride={video.stride()}"
+                )
+            video = video.detach().cpu().numpy()
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
         result: dict[str, Any] = {"video": video, "audio": audio}
@@ -637,14 +644,18 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
         if os.path.isfile(upsampler_config) or not local_files_only:
             try:
-                pipeline.latent_upsampler = _load_component(
-                    LTX2LatentUpsamplerModel,
-                    model,
-                    "latent_upsampler",
-                    local_files_only=local_files_only,
-                    dtype=dtype,
-                    revision=revision,
-                )
+                # Diffusers builds the rational-resampler kernel with Long
+                # tensors; constructing it under a CUDA default-device context
+                # attempts an unsupported Long addmm before weights are loaded.
+                with torch.device("cpu"):
+                    pipeline.latent_upsampler = _load_component(
+                        LTX2LatentUpsamplerModel,
+                        model,
+                        "latent_upsampler",
+                        local_files_only=local_files_only,
+                        dtype=dtype,
+                        revision=revision,
+                    )
             except (OSError, ValueError):
                 if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
                     raise
