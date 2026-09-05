@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any
 
 from vllm_omni.lora.request import LoRARequest
@@ -81,6 +83,49 @@ def resolve_diffusion_od_config(engine_client: Any, diffusion_engine: Any = None
         else:
             od_config = getattr(diffusion_engine, "od_config", None)
     return od_config
+
+
+def max_multimodal_image_inputs(od_config: Any) -> int | None:
+    """How many input images this instance admits, or ``None`` for "no limit".
+
+    ``None`` also covers "the answer is not knowable from here": a serving
+    surface that cannot see a real diffusion config must not invent a rejection,
+    so every caller treats it as "admit and let the pipeline decide".
+
+    Every route that admits reference images shares this one rule. Answering it
+    per-endpoint is what let the same request be a 400 on ``/v1/images/edits``
+    and a 500 (or a silently truncated result) on ``/v1/chat/completions``.
+    """
+    if od_config is None:
+        # Preserve the existing compatibility behavior when the diffusion
+        # config is not exposed on the serving surface.
+        return None
+
+    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", None)
+    if not isinstance(supports_multimodal_inputs, bool):
+        # Older serving surfaces and mocked engines may expose a placeholder
+        # object instead of a real diffusion config. Treat that as "unknown"
+        # so existing single-image flows keep working.
+        return None
+
+    if not supports_multimodal_inputs:
+        return 1
+
+    max_input_images = getattr(od_config, "max_multimodal_image_inputs", None)
+    if max_input_images is None:
+        return None
+    if isinstance(max_input_images, bool) or not isinstance(max_input_images, Integral):
+        return None
+    if max_input_images < 1:
+        return None
+    return int(max_input_images)
+
+
+def too_many_input_images_message(received: int, limit: int) -> str:
+    """The rejection text every image-admitting route returns."""
+    if limit == 1:
+        return "Received multiple input images. Only a single image is supported by this model."
+    return f"Received {received} input images. At most {limit} images are supported by this model."
 
 
 def is_single_stage_diffusion(engine_client: Any) -> bool:

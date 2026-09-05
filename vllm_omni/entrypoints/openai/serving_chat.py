@@ -141,8 +141,10 @@ from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     get_supported_speakers_from_hf_config,
     is_single_stage_diffusion,
+    max_multimodal_image_inputs,
     parse_lora_request,
     resolve_diffusion_od_config,
+    too_many_input_images_message,
     validate_requested_speaker,
 )
 from vllm_omni.errors import OmniClientError
@@ -3243,19 +3245,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if len(pil_images) == 1:
                 gen_prompt["multi_modal_data"] = {"image": pil_images[0]}
             else:
-                od_config = getattr(engine, "od_config", None)
-                supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
-                if od_config is None:
-                    supports_multimodal_inputs = True
-                if supports_multimodal_inputs:
-                    gen_prompt["multi_modal_data"] = {"image": pil_images}
-                else:
+                max_input_images = max_multimodal_image_inputs(resolve_diffusion_od_config(engine))
+                if max_input_images is not None and len(pil_images) > max_input_images:
                     return self._create_error_response(
-                        "Multiple input images are not supported by the current diffusion model. "
-                        "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
-                        "and send multiple images in the user message content.",
+                        too_many_input_images_message(len(pil_images), max_input_images),
                         status_code=400,
                     )
+                gen_prompt["multi_modal_data"] = {"image": pil_images}
 
         if mask_image:
             try:
@@ -3678,21 +3674,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     gen_prompt["multi_modal_data"] = {}
                     gen_prompt["multi_modal_data"]["image"] = pil_images[0]
                 else:
-                    od_config = getattr(self._diffusion_engine, "od_config", None)
-                    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
-                    if od_config is None:
-                        # TODO: entry is asyncOmni. We hack the od config here.
-                        supports_multimodal_inputs = True
-                    if supports_multimodal_inputs:
-                        gen_prompt["multi_modal_data"] = {}
-                        gen_prompt["multi_modal_data"]["image"] = pil_images
-                    else:
+                    max_input_images = max_multimodal_image_inputs(resolve_diffusion_od_config(self._diffusion_engine))
+                    if max_input_images is not None and len(pil_images) > max_input_images:
                         return self._create_error_response(
-                            "Multiple input images are not supported by the current diffusion model. "
-                            "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
-                            "and send multiple images in the user message content.",
+                            too_many_input_images_message(len(pil_images), max_input_images),
                             status_code=400,
                         )
+                    gen_prompt["multi_modal_data"] = {}
+                    gen_prompt["multi_modal_data"]["image"] = pil_images
 
             if reference_videos:
                 gen_params.extra_args["video_path"] = reference_videos[0]

@@ -170,7 +170,12 @@ from vllm_omni.entrypoints.openai.stores import (
     VIDEO_STORE,
     VIDEO_TASKS,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import (
+    get_stage_type,
+    max_multimodal_image_inputs,
+    parse_lora_request,
+    too_many_input_images_message,
+)
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
     decode_audio_url,
@@ -2307,14 +2312,7 @@ async def edit_images(
         # CPU, and memory on work that will be rejected anyway.
         max_input_images = _get_max_edit_input_images(raw_request.app.state, engine_client)
         if max_input_images is not None and len(input_images_list) > max_input_images:
-            detail = (
-                "Received multiple input images. Only a single image is supported by this model."
-                if max_input_images == 1
-                else (
-                    f"Received {len(input_images_list)} input images. "
-                    f"At most {max_input_images} images are supported by this model."
-                )
-            )
+            detail = too_many_input_images_message(len(input_images_list), max_input_images)
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=detail,
@@ -2653,30 +2651,9 @@ def _get_diffusion_od_config(app_state: Any, engine_client: Any) -> Any:
 
 
 def _get_max_edit_input_images(app_state: Any, engine_client: Any) -> int | None:
-    od_config = _get_diffusion_od_config(app_state, engine_client)
-    if od_config is None:
-        # Preserve the existing compatibility behavior when the diffusion
-        # config is not exposed on the serving surface.
-        return None
-
-    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", None)
-    if not isinstance(supports_multimodal_inputs, bool):
-        # Older serving surfaces and mocked engines may expose a placeholder
-        # object instead of a real diffusion config. Treat that as "unknown"
-        # so existing single-image flows keep working.
-        return None
-
-    if not supports_multimodal_inputs:
-        return 1
-
-    max_input_images = getattr(od_config, "max_multimodal_image_inputs", None)
-    if max_input_images is None:
-        return None
-    if isinstance(max_input_images, bool) or not isinstance(max_input_images, Integral):
-        return None
-    if max_input_images < 1:
-        return None
-    return int(max_input_images)
+    # The rule itself lives next to the other engine-capability helpers so the
+    # chat routes answer it identically; this only resolves the config.
+    return max_multimodal_image_inputs(_get_diffusion_od_config(app_state, engine_client))
 
 
 def _get_lora_from_json_str(lora_body):
@@ -5003,14 +4980,7 @@ async def create_image_task(request: ImageTaskRequest, raw_request: Request) -> 
     if max_input_images is not None and len(input_paths) > max_input_images:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=(
-                "Received multiple input images. Only a single image is supported by this model."
-                if max_input_images == 1
-                else (
-                    f"Received {len(input_paths)} input images. "
-                    f"At most {max_input_images} images are supported by this model."
-                )
-            ),
+            detail=too_many_input_images_message(len(input_paths), max_input_images),
         )
 
     task_id = request.task_id or f"image_task_{random_uuid()}"
