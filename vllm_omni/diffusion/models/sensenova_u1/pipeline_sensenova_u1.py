@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-U1 Pipeline for vLLM-Omni.
 
 SenseNova-U1 is a unified Qwen3-based model that uses Mixture-of-Tokenizers
@@ -351,6 +351,32 @@ def _build_t2i_query(prompt_text, system_message=None, append_text=None):
     if append_text is not None:
         query += append_text
     return query
+
+
+def _ensure_image_placeholders(prompt: str, n_images: int) -> str:
+    """Make *prompt* carry one ``<image>`` placeholder per input image.
+
+    Callers expand the placeholders one-for-one against ``grid_hw``, so a prompt
+    with fewer of them than there are images leaves the trailing images without
+    ``<IMG_CONTEXT>`` slots -- and the ViT features for those images then have
+    nowhere to land in ``_build_it2i_inputs``.
+
+    Upstream applies this only on its editing path (``it2i_generate``); its
+    understanding path (``NEOChatModel.chat``) prepends a single ``<image>`` and
+    relies on the caller to write the rest by hand. Serving both paths from one
+    helper is a deliberate divergence: an HTTP caller that attaches N images has
+    no way to know it also had to author N markers, and the resulting shape
+    mismatch surfaces as a 500 from inside the worker. The multi-image form is
+    upstream's own (``Image-1:``/``Image-2:`` ...), just applied consistently.
+    """
+    image_count = prompt.count("<image>")
+    if n_images <= image_count:
+        return prompt
+    if image_count == 0 and n_images > 1:
+        prefix = "".join(f"Image-{i + 1}:<image>\n" for i in range(n_images))
+    else:
+        prefix = "<image>\n" * (n_images - image_count)
+    return prefix + prompt
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +861,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
         if input_images is not None:
             pixel_values, grid_hw = self._prepare_input_images(input_images)
-            query = self._build_chat_query(p.prompt, has_images=True)
+            query = self._build_chat_query(_ensure_image_placeholders(p.prompt, grid_hw.shape[0]), has_images=True)
             # Expand <image> placeholders
             for i in range(grid_hw.shape[0]):
                 h, w = grid_hw[i]
@@ -962,14 +988,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         """Build the tokenizer query string for img2img, expanding ``<image>``
         placeholders into ``<img><IMG_CONTEXT>...<IMG_CONTEXT></img>`` with the
         correct number of patches per image."""
-        image_count = prompt.count("<image>")
-        n_images = len(images["grid_hw"])
-        if n_images > image_count:
-            if image_count == 0 and n_images > 1:
-                prefix = "".join(f"Image-{i + 1}:<image>\n" for i in range(n_images))
-            else:
-                prefix = "<image>\n" * (n_images - image_count)
-            prompt = prefix + prompt
+        prompt = _ensure_image_placeholders(prompt, len(images["grid_hw"]))
 
         think_content = "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
         query = _build_t2i_query(prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
