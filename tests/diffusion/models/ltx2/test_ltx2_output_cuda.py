@@ -69,9 +69,7 @@ def test_ltx_uint8_output_defensively_clamps_unnormalized_values_on_cuda():
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-# The diff-vae case is dropped with the #6189 revert: this branch has no DiffVAE
-# path to exercise. Restore [False, True] when that commit is re-applied.
-@pytest.mark.parametrize("use_diffusion_decoder", [False], ids=["conv-vae"])
+@pytest.mark.parametrize("use_diffusion_decoder", [False, True], ids=["conv-vae", "diff-vae"])
 def test_ltx_bf16_decoder_output_uses_cuda_transport_path(use_diffusion_decoder):
     decoded_video = torch.linspace(
         -1.2,
