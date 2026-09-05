@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -19,6 +19,7 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+    SENSENOVA_U1_MAX_INPUT_IMAGES,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -185,6 +186,22 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_sensenova_u1_advertises_multi_image_edit_support():
+    # The pipeline has always had a multi-image img2img path (upstream's
+    # ``Image-1:<image>`` prefix), but with no metadata entry the serving layer
+    # capped input images at 1 and rejected multi-reference edits with a 400
+    # before the pipeline ever ran.
+    od_config = OmniDiffusionConfig(
+        model="SenseNova/SenseNova-U1.5-8B-MoT",
+        model_class_name="SenseNovaU1Pipeline",
+    )
+
+    od_config.update_multimodal_support()
+
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == SENSENOVA_U1_MAX_INPUT_IMAGES
 
 
 def test_task_type_roundtrip():

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,14 @@ QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+# SenseNova-U1 / U1.5 img2img takes several reference images: the pipeline emits
+# the upstream ``Image-1:<image>`` ... prefix and splits a pixel budget across
+# them (``_prepare_input_images``). Upstream states no maximum -- its reference
+# harness takes ``--image`` with ``nargs="+"`` and never validates the count --
+# so this is purely a serving-side admission limit. Nine leaves each reference
+# ~1365x1365 of the budget, well above the 512x512 min_pixels floor; the largest
+# example in upstream's u1.5 best-practices doc uses five.
+SENSENOVA_U1_MAX_INPUT_IMAGES = 9
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
@@ -58,6 +67,14 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+    ),
+    # Shared by U1 and U1.5 (both resolve from ``model_type == "neo_chat"``).
+    # Without an entry here the serving layer read the dataclass default as "one
+    # input image maximum" and rejected every multi-reference edit at the HTTP
+    # boundary, before the pipeline's multi-image path could run.
+    "SenseNovaU1Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=SENSENOVA_U1_MAX_INPUT_IMAGES,
     ),
     "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
@@ -98,7 +115,7 @@ def get_diffusion_model_metadata(model_class_name: str | None) -> DiffusionModel
 _MINIMAX_H3_PIPELINES = ("MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline")
 
 
-def _minimax_h3_strategy(od_config: object | None) -> object | None:
+def _minimax_h3_strategy(od_config: object | None) -> Any | None:
     """The contract this instance serves, as the serving layer can see it.
 
     ``None`` when the contract cannot be resolved. Every caller treats that as
