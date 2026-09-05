@@ -85,17 +85,33 @@ FL2VA 与 Ref2VA 是同一基座的两个微调分支，主干几乎相同（flo
 | `MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-BF16-v2-vLLM` | 4 步 | 剪枝 BF16 | BF16 | 37.5 GiB |
 | `MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-vLLM` | 4 步 | 剪枝 INT8 | BF16 | 19.5 GiB |
 | `MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-v2-encINT8-vLLM` | 4 步 | 剪枝 INT8 **W8A8** | INT8 | 19.5 GiB |
+| **`MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-W8A16-encINT8-vLLM`** | **4 步** | **剪枝 INT8 W8A16** | **INT8** | **19.5 GiB** |
 | **`MiniMax-H3-Ref2VA-Pruned-r8-INT8-W8A16-encINT8-vLLM`** | **无** | **剪枝 INT8 W8A16** | **INT8** | **19.5 GiB** |
 | `MiniMax-H3-Ref2VA-Pruned-r8-BF16-encINT8-vLLM` | 无 | 剪枝 BF16 | INT8 | 37.5 GiB |
+| `MiniMax-H3-Ref2VA-Pruned-r8-Turbo8-768p-INT8-W8A16-encINT8-vLLM` | 8 步 | 剪枝 INT8 W8A16 | INT8 | 19.5 GiB |
 | `MiniMax-H3-Ref2VA-INT8-vLLM` | 无 | 满血 INT8 | BF16 | 43.8 GiB |
 | `MiniMax-H3-Ref2VA-INT8-encINT8-vLLM` | 无 | 满血 INT8 | INT8 | 43.8 GiB |
 | `MiniMax-H3-Ref2VA-encINT8-vLLM` | 无 | 满血 BF16 | INT8 | 61.7 GiB |
 | `Qwen3-VL-32B-H3Encoder-INT8` | — | — | INT8 编码器本体 | 25.3 GiB |
 
+**2026-09-05 新增最后一行（Turbo8）**：上游 09-03 才发布 ref2v 8-step v1.0 768p，本表原来
+没有 8 步档。链路与 Turbo4 完全相同（`transformer_ref` → 烘 LoRA → 转 partition →
+INT8 → W8A16 → 装配 + encINT8），剪枝起点已用 `norm_out.linear.weight` 逐位确认是
+Ref2VA 分支而非 FL2VA（§2 那个坑）。融合验真 312 targets / max_abs_error 0.0。
+
+⚠️ 两项未验：**shift 取 6/3 是推的**（Turbo4 用 12/3，但那份权重训练在 544p，
+新权重训练在 768p，而 768p 家族惯例是 6/3——ref2va 这条链路没有 768p 先例）；
+**W8A16 输入包络仍未重测**（§10 第一行，对 Turbo4 就悬着，对 Turbo8 同样）。
+
 **推荐的是 W8A16 那一行**（§1、§8）。它与 W8A8 版**共用同一份 Int8 张量文件**——
 `-W8A16-partition/transformer` 里的 safetensors 是指向 `-INT8-partition` 的符号链接，
 只有 `config.json` 的 `activation_scheme` 不同。所以两者磁盘占用不叠加。
-Turbo4 档的 W8A16 版尚未组装（见 §10）。
+Turbo4 档的 W8A16 版当时尚未组装；**已于 2026-08-22 20:42 补做**，serve 根目录
+`MiniMax-H3-Ref2VA-Pruned-r8-Turbo4-INT8-W8A16-encINT8-vLLM`（已加入下表）。
+现网 GPUStack 上注册名为 `minimax-h3-fast-ref2va`，模型路径就是它。此句保留原文以说明当时状态。
+
+> 注意目录名里没有 `-v2`，但它的 INT8 张量是软链到 `-Turbo4-INT8-v2-partition` 的——
+> `-v2` 是血统标记不是路径的一部分，别照着拼一个带 `-v2` 的 W8A16 目录名，盘上没有。
 
 ### 3.1 DiT 量化
 
