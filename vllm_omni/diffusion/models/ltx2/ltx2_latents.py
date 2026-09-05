@@ -69,13 +69,6 @@ def unpack_latents(
     return latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
 
-def resolve_video_latent_statistics(pipeline: Any) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Return statistics owned by the active video decoder."""
-    decoder = pipeline.diffusion_decoder if getattr(pipeline, "use_diffusion_decoder", False) else pipeline.vae
-    scaling_factor = getattr(getattr(decoder, "config", None), "scaling_factor", 1.0)
-    return decoder.latents_mean, decoder.latents_std, scaling_factor
-
-
 def normalize_latents(
     latents: torch.Tensor,
     latents_mean: torch.Tensor,
@@ -209,12 +202,11 @@ def prepare_video_latents(
 ) -> torch.Tensor:
     if latents is not None:
         if latents.ndim == 5:
-            latents_mean, latents_std, scaling_factor = resolve_video_latent_statistics(pipeline)
             latents = normalize_latents(
                 latents,
-                latents_mean,
-                latents_std,
-                scaling_factor,
+                pipeline.vae.latents_mean,
+                pipeline.vae.latents_std,
+                pipeline.vae.config.scaling_factor,
             )
             latents = pack_latents(
                 latents,

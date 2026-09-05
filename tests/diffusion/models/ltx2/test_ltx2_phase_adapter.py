@@ -4,7 +4,6 @@
 """Unit tests for the fixed LTX refinement-phase adapter."""
 
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
@@ -149,13 +148,10 @@ def test_ltx_phase_adapter_selects_execution_from_quantization(
 ):
     pipeline = _pipeline(dtype=dtype, quantization_config=quantization_config)
     manifest = object()
-    captured: dict[str, Any] = {}
+    captured = {}
 
     def resolve_artifact(*_args, **kwargs):
-        assert kwargs == {
-            "model_revision": None,
-            "artifact_revision": None,
-        }
+        assert not kwargs
         return "adapter"
 
     def parse(transformer, path):

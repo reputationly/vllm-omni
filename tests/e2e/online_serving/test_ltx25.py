@@ -73,8 +73,8 @@ def test_ltx25_pipeline_entries(
                 "form_data": {
                     "model": omni_server.model,
                     "prompt": PROMPT,
-                    "height": 256,
-                    "width": 256,
+                    "height": 128,
+                    "width": 128,
                     "num_frames": 9,
                     "fps": 24,
                     "num_inference_steps": num_inference_steps,
