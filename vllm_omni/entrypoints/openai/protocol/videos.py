@@ -20,6 +20,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
 
+# Bound int request fields to avoid overflow issues.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
 
 class VideoGenerationStatus(str, Enum):
     QUEUED = "queued"
@@ -48,10 +52,16 @@ def file_extension(media_type: str):
 class VideoParams(BaseModel):
     """Optional block for video-specific parameters."""
 
-    width: int | None = Field(default=None, ge=1, description="Video width in pixels")
-    height: int | None = Field(default=None, ge=1, description="Video height in pixels")
-    num_frames: int | None = Field(default=None, ge=1, description="Number of frames")
-    fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
+    width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
+    height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
+    num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames")
+    fps: float | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        allow_inf_nan=False,
+        description="Frames per second for output video",
+    )
 
     @property
     def size(self) -> str | None:
@@ -174,10 +184,16 @@ class VideoGenerationRequest(BaseModel):
     user: str | None = Field(default=None, description="User identifier for tracking")
 
     # Video-specific fields (top-level for OpenAI-style compatibility)
-    width: int | None = Field(default=None, ge=1, description="Video width in pixels")
-    height: int | None = Field(default=None, ge=1, description="Video height in pixels")
-    fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
-    num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
+    width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
+    height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
+    fps: float | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        allow_inf_nan=False,
+        description="Frames per second for output video",
+    )
+    num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
     aspect_ratio: str | None = Field(
         default=None,
         description=(
@@ -185,7 +201,6 @@ class VideoGenerationRequest(BaseModel):
             "FL2VA follows the input image; Ref2VA defaults to 16:9."
         ),
     )
-    short_edge: int | None = Field(default=None, ge=1, description="MiniMax H3 output short edge in pixels")
     delivery_short_edge: int | None = Field(
         default=None,
         ge=1,
@@ -207,6 +222,12 @@ class VideoGenerationRequest(BaseModel):
             "texture-rich bright material and drop it to 0 for dark, noisy material where "
             "sharpening re-amplifies generator noise. Ignored when not upscaling."
         ),
+    )
+    short_edge: int | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        description="MiniMax H3 output short edge in pixels",
     )
     num_outputs_per_prompt: int = Field(
         default=1,
@@ -274,7 +295,7 @@ class VideoGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
     generate_sound: bool = Field(
         default=False,
         description="Request model-generated audio for video models that support sound generation.",
@@ -293,6 +314,7 @@ class VideoGenerationRequest(BaseModel):
     frame_interpolation_exp: int = Field(
         default=1,
         ge=1,
+        le=_INT64_MAX,
         description="Interpolation exponent: 1=2x temporal resolution, 2=4x, etc.",
     )
     frame_interpolation_scale: float = Field(
@@ -325,7 +347,17 @@ class VideoGenerationRequest(BaseModel):
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
 
-    def resolve_video_params(self) -> VideoParams:
+    def resolve_video_params(
+        self,
+        *,
+        default_fps: float | None = DEFAULT_FPS,
+        default_num_frames: int | None = None,
+    ) -> VideoParams:
+        """Resolve explicit fields with optional model-owned defaults.
+
+        Callers that know the active diffusion pipeline can supply its native
+        frame contract. Other callers retain the generic 24 fps behavior.
+        """
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
         if self.video_params is not None:
@@ -338,10 +370,13 @@ class VideoGenerationRequest(BaseModel):
             vp.width, vp.height = parse_size(self.size)
 
         if vp.fps is None:
-            vp.fps = DEFAULT_FPS
+            vp.fps = default_fps
 
-        if vp.num_frames is None and self.seconds is not None:
-            vp.num_frames = int(self.seconds) * int(vp.fps)
+        if vp.num_frames is None:
+            if default_num_frames is not None:
+                vp.num_frames = default_num_frames
+            elif self.seconds is not None and vp.fps is not None:
+                vp.num_frames = int(float(self.seconds) * float(vp.fps))
 
         return vp
 

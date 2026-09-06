@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 class _DiffusionBackendEnumMeta(EnumMeta):
     """Metaclass for DiffusionAttentionBackendEnum to provide better error messages."""
 
-    def __getitem__(cls, name: str) -> "DiffusionAttentionBackendEnum":
+    def __getitem__(cls, name: str) -> "DiffusionAttentionBackendEnum":  # type: ignore[override]
         """Get backend by name with helpful error messages."""
         try:
             return super().__getitem__(name)  # type: ignore[return-value]
@@ -62,6 +62,7 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     SAGE_ATTN_3 = "vllm_omni.diffusion.attention.backends.sage_attn3.SageAttention3Backend"
     CUDNN_ATTN = "vllm_omni.diffusion.attention.backends.cudnn_attn.CuDNNAttentionBackend"
     FLASHINFER_ATTN = "vllm_omni.diffusion.attention.backends.flashinfer_attn.FlashInferAttentionBackend"
+    FASTVIDEO_VSA = "vllm_omni.diffusion.attention.backends.fastvideo_vsa.FastVideoVSABackend"
     FLASH_ATTN_HUB = "vllm_omni.diffusion.attention.backends.flash_attn_hub.FlashAttentionHubBackend"
     FLASH_ATTN_3_HUB = "vllm_omni.diffusion.attention.backends.flash_attn_hub.FlashAttention3HubBackend"
     TRTLLM_ATTN = "vllm_omni.diffusion.attention.backends.trtllm_attn.TrtllmAttentionBackend"

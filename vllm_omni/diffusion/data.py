@@ -77,11 +77,13 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
     diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
-    if diffusion_attn_backend is not None:
+    fastvideo_vsa_topk = normalized.pop("fastvideo_vsa_topk", None)
+    if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
         existing = normalized.get("diffusion_attention_config")
         normalized["diffusion_attention_config"] = parse_attention_config(
             existing,
             attention_backend=diffusion_attn_backend,
+            fastvideo_vsa_topk=fastvideo_vsa_topk,
         )
 
     # Check environment variable as fallback for cache_backend.
@@ -98,12 +100,44 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return normalized
 
 
+def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
+    """Validate HWR policy without touching the configured storage domain.
+
+    Filesystem locality and store construction belong to the eligible loader
+    path. Keeping this check purely structural is what lets disabled and
+    AllGather DLO configurations retain zero HWR interaction.
+    """
+    if mode not in {"disabled", "preferred", "required"}:
+        raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
+    if mode != "disabled" and (not isinstance(root, str) or not root.strip()):
+        raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+
+
+def validate_dlo_host_registration_options(
+    *,
+    limit_gib: object,
+    enable_dlo: bool,
+    use_allgather: bool,
+    hwr_mode: object,
+) -> float:
+    """Validate the optional transport budget without probing CUDA or HWR."""
+    if not isinstance(limit_gib, (int, float, str)):
+        raise TypeError(f"dlo_host_registration_limit_gib must be a number; got {type(limit_gib).__name__}")
+    value = float(limit_gib)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
+    if value and (not enable_dlo or use_allgather or hwr_mode == "disabled"):
+        raise ValueError("dlo_host_registration_limit_gib requires enabled no-AllGather DLO and Host Weight Runtime")
+    return value
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:
     """Parse a non-negative index selector such as "0-9,20,25-30"."""
     if selector is None:
         return None
+    values: set[int]
     if isinstance(selector, set):
         values = selector
     elif isinstance(selector, (list, tuple)):
@@ -112,7 +146,7 @@ def parse_kv_cache_skip_selector(
         text = selector.strip()
         if not text:
             return None
-        values: set[int] = set()
+        values = set()
         for chunk in text.split(","):
             token = chunk.strip()
             if not token:
@@ -191,6 +225,9 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
+    ulysses_a2a_permute: bool = False
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -245,6 +282,7 @@ class DiffusionParallelConfig:
         assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
         assert self.data_parallel_size is None or self.data_parallel_size > 0, "Data parallel size must be > 0"
         assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
+        assert self.sequence_parallel_size is not None
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
@@ -362,6 +400,7 @@ class DiffusionParallelConfig:
             self.world_size = world_size
             return 1
 
+        assert self.sequence_parallel_size is not None
         non_dp_size = (
             self.pipeline_parallel_size
             * self.tensor_parallel_size
@@ -592,14 +631,22 @@ def resolve_model_class_name(
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
-    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, resolve_native_diffusion_model_class
 
     if not model:
         return None
+    native_model_class = resolve_native_diffusion_model_class(model)
+    if native_model_class is not None:
+        return native_model_class
+
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from the pipeline index.
-    model_index = get_diffusion_model_index(model, revision=revision)
+    # Diffusers models: read _class_name from the pipeline index. Missing
+    # local paths can otherwise be interpreted as invalid Hub repo IDs.
+    try:
+        model_index = get_diffusion_model_index(model, revision=revision)
+    except Exception:
+        model_index = None
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -645,6 +692,19 @@ def resolve_model_class_name(
     if len(architectures) == 1:
         return architectures[0]
     return None
+
+
+def uses_diffusers_adapter(od_config: object) -> bool:
+    """Return whether execution uses the Diffusers adapter backend.
+
+    A custom pipeline takes precedence over ``diffusion_load_format`` in the
+    worker, so adapter-specific behavior must only apply when no custom
+    pipeline override is configured.
+    """
+    return (
+        getattr(od_config, "custom_pipeline_args", None) is None
+        and getattr(od_config, "diffusion_load_format", "default") == "diffusers"
+    )
 
 
 @dataclass
@@ -761,6 +821,14 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Final-layout Host Weight Runtime policy. The loader only activates this
+    # for eligible no-AllGather DLO; all other configurations preserve their
+    # existing loader/storage path.
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
+    # Optional per-worker ceiling for registering final-layout HWR mappings.
+    # Zero adds no ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_limit_gib: float = 0.0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -862,6 +930,7 @@ class OmniDiffusionConfig:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1046,10 +1115,9 @@ class OmniDiffusionConfig:
             "need_recv_cache", False
         ):
             raise ValueError(
-                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
-                "disable need_recv_cache until connector-aware admission is implemented"
+                "paged_scheduler Diffusion KV does not support imported AR KV; "
+                "disable need_recv_cache until connector-aware import is implemented"
             )
-
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
@@ -1086,6 +1154,7 @@ class OmniDiffusionConfig:
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
+            assert self.parallel_config.sequence_parallel_size is not None
             if self.parallel_config.use_hsdp:
                 incompatible_features.append("HSDP")
             if self.parallel_config.sequence_parallel_size > 1:
@@ -1158,6 +1227,17 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        validate_host_weight_runtime_options(
+            mode=self.host_weight_runtime_mode,
+            root=self.host_weight_runtime_root,
+        )
+        self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=self.dlo_host_registration_limit_gib,
+            enable_dlo=self.enable_distributed_layerwise_offload,
+            use_allgather=self.dlo_use_allgather,
+            hwr_mode=self.host_weight_runtime_mode,
+        )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(
@@ -1313,12 +1393,12 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+        from vllm_omni.diffusion.utils.hf_utils import (
+            get_diffusion_model_index,
+            resolve_native_diffusion_model_class,
+        )
 
-        # Default model_class_name for diffusers adapter
-        if self.model_class_name is None and self.diffusion_load_format == "diffusers":
-            self.model_class_name = "DiffusersAdapterPipeline"
-
+        assert self.model is not None
         try:
             config_dict = get_diffusion_model_index(
                 self.model,
@@ -1327,6 +1407,8 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
+                    if self.model_class_name is None and self.diffusion_load_format == "diffusers":
+                        self.model_class_name = "DiffusersAdapterPipeline"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter
@@ -1367,6 +1449,8 @@ class OmniDiffusionConfig:
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
+                if self.model_class_name is None:
+                    self.model_class_name = "DiffusersAdapterPipeline"
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
                     "Could not find a valid pipeline index per Diffusers format. "
@@ -1378,6 +1462,12 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
+                    native_model_class = resolve_native_diffusion_model_class(self.model)
+                    if native_model_class is not None:
+                        self.model_class_name = native_model_class
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before
@@ -1395,6 +1485,7 @@ class OmniDiffusionConfig:
 
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
+                assert self.model is not None
                 is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
@@ -1452,6 +1543,7 @@ class OmniDiffusionConfig:
                 elif model_type == "vla":
                     from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
+                    assert self.model is not None
                     if _looks_like_dreamzero(self.model):
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
@@ -1536,6 +1628,9 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # KV-recv wall-clock (ms) from the runner; feeds vllm_omni:diffusion_kv_load_s.
+    kv_recv_ms: float = 0.0
 
     # When True, move tensor fields to CPU at construction time. Useful when
     # the output is shipped across process boundaries (e.g. step-execution
@@ -1667,20 +1762,36 @@ class AttnQuantSpec:
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
             if v is not None and v not in self._VALID_DTYPES:
                 raise ValueError(f"quant.{name}={v!r} unsupported; use one of {sorted(self._VALID_DTYPES)}.")
-        for name, v in (("q_block_size", self.q_block_size), ("k_block_size", self.k_block_size)):
-            if v not in self._VALID_BLOCK_SIZES:
+        for block_name, block_value in (("q_block_size", self.q_block_size), ("k_block_size", self.k_block_size)):
+            if block_value not in self._VALID_BLOCK_SIZES:
                 raise ValueError(
-                    f"quant.{name}={v!r} unsupported; kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
+                    f"quant.{block_name}={block_value!r} unsupported; "
+                    f"kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
                 )
 
     @property
     def enabled(self) -> bool:
-        return self.dtype_qk is not None or self.dtype_vo is not None
+        # Include flashinfer_backend so a variant pin without dtypes is serialized.
+        return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN", "SLA_ATTN", "SLA_SAGE2_ATTN"})
+
+
+class RainFusionPrecision(str, Enum):
+    """Execution precision for block-sparse RainFusion (rf_v3) attention.
+
+    ``bf16``: no quantization, pure BF16 sparse attention (official baseline).
+    ``fp8``: BSA FP8 path - Hadamard rotation then full FP8 block quantization
+        of Q/K/V before the BSA kernel.
+    ``mix``: EagleQBSA mixed precision - Q/K per-block INT8 + V per-channel FP8.
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+    MIX = "mix"
 
 
 @dataclass
@@ -1691,10 +1802,13 @@ class BlockSparseSpec:
     ``start_step`` keeps the first N denoise steps dense and ``skip_layers`` (an
     index selector such as "0-3,38") exempts individual DiT blocks. Those two are
     the accuracy knobs to trade back quality at a fixed ``sparsity``.
+    ``precision`` selects the kernel precision mode (see ``RainFusionPrecision``).
     """
 
     sparsity: float = 0.8
     start_step: int = 0
+    end_step: int = 0
+    precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
 
@@ -1702,6 +1816,13 @@ class BlockSparseSpec:
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
+        if self.end_step < 0:
+            raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
+        precision = self.precision.value if isinstance(self.precision, RainFusionPrecision) else self.precision
+        valid = {member.value for member in RainFusionPrecision}
+        if precision not in valid:
+            raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
+        self.precision = precision
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -1712,6 +1833,7 @@ class AttentionSpec:
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
+    fastvideo_vsa_topk: int | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -1731,6 +1853,11 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
+        if self.fastvideo_vsa_topk is not None:
+            if self.backend.upper() != "FASTVIDEO_VSA":
+                raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
+            if self.fastvideo_vsa_topk <= 0:
+                raise ValueError("fastvideo_vsa_topk must be positive.")
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
@@ -1760,24 +1887,30 @@ class AttentionSpec:
                 kw["target_sparsity"] = ss.target_sparsity
             if ss.disabled_until_timestep:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
-        if self.quant is not None and self.quant.enabled:
+        if self.quant is not None:
             q = self.quant
-            quant_kw: dict[str, Any] = {
-                "dtype_qk": q.dtype_qk,
-                "q_block_size": q.q_block_size,
-                "k_block_size": q.k_block_size,
-            }
-            if q.dtype_vo is not None:
-                quant_kw["dtype_vo"] = q.dtype_vo
+            quant_kw: dict[str, Any] = {}
+            if q.dtype_qk is not None or q.dtype_vo is not None:
+                quant_kw["dtype_qk"] = q.dtype_qk
+                quant_kw["q_block_size"] = q.q_block_size
+                quant_kw["k_block_size"] = q.k_block_size
+                if q.dtype_vo is not None:
+                    quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
-            kw["quant"] = quant_kw
+            if quant_kw:
+                kw["quant"] = quant_kw
+        if self.fastvideo_vsa_topk is not None:
+            kw["topk"] = self.fastvideo_vsa_topk
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
             kw["start_step"] = bs.start_step
+            kw["end_step"] = bs.end_step
+            kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
+
         return kw or None
 
 
@@ -1847,7 +1980,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "block_sparse"}
+        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
@@ -1886,6 +2019,7 @@ def parse_attention_config(
     attention_config: AttentionConfig | Mapping[str, Any] | None = None,
     *,
     attention_backend: str | None = None,
+    fastvideo_vsa_topk: int | None = None,
 ) -> AttentionConfig:
     """Pure type-conversion: coerce *attention_config* to an AttentionConfig.
 
@@ -1912,6 +2046,14 @@ def parse_attention_config(
             )
         if attention_backend.lower() != "auto":
             normalized.default = AttentionSpec(backend=attention_backend)
+
+    if fastvideo_vsa_topk is not None:
+        if normalized.default is None:
+            raise ValueError("--fastvideo-vsa-topk requires --diffusion-attention-backend FASTVIDEO_VSA.")
+        if normalized.default.backend.upper() != "FASTVIDEO_VSA":
+            raise ValueError("--fastvideo-vsa-topk is only valid with the FASTVIDEO_VSA backend.")
+        normalized.default.fastvideo_vsa_topk = fastvideo_vsa_topk
+        normalized.default.__post_init__()
 
     return normalized
 

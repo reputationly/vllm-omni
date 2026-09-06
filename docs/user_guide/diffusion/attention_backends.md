@@ -20,6 +20,7 @@ For the internal selector, registry, and platform contract, see
 | Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
+| Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 
 ## Backend options
 
@@ -37,6 +38,7 @@ For the internal selector, registry, and platform contract, see
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | `SLA_ATTN` | Block sparse | SLA (Sparse-Linear Attention) top-k block-sparse attention, CUDA/Triton | [SLA_ATTN backend](#sla_attn-backend-and-sparsity-distilled-checkpoints) |
 | `SLA_SAGE2_ATTN` | Block sparse, quantized | SLA top-k block selection computed with SpargeAttn's INT8 SageAttention2 kernel | [SageAttention](attention_backends/sage.md#sla_sage2_attn) |
+| `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 
 ## Configuration
 
@@ -107,6 +109,7 @@ Backend-specific typed blocks are documented with their consumers:
   and [TRTLLM SAGE](attention_backends/trtllm.md#sage-quantization).
 - `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
+- `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
 
 ## Platform defaults
 

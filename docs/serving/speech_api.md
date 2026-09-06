@@ -95,7 +95,7 @@ response.stream_to_file("output.wav")
 
 ### Endpoint
 
-```
+```text
 POST /v1/audio/speech
 Content-Type: application/json
 ```
@@ -116,8 +116,8 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
+| `task_type` | string | null (inferred) | TTS task type: CustomVoice, VoiceDesign, or Base. For Qwen3-TTS, `ref_audio` or `ref_text` infers Base when this field is omitted, while an uploaded/precomputed voice always selects Base. Other omitted values select CustomVoice; VoiceDesign must be specified explicitly. |
 | `sample_rate` | integer | model native | Target output sample rate. Qwen3-TTS supports 8000 or 24000 Hz; the model remains native 24 kHz internally and is resampled before encoding. |
-| `task_type` | string | "CustomVoice" | TTS task type: CustomVoice, VoiceDesign, or Base |
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
@@ -205,7 +205,7 @@ The `usage` object on `speech.audio.done` is the same shape returned per item by
 
 ### Voices Endpoint
 
-```
+```text
 GET /v1/audio/voices
 ```
 
@@ -230,7 +230,7 @@ Lists available voices for the loaded model.
 
 `uploaded_voices` is always present (empty list when no custom voices have been uploaded). Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
 
-```
+```text
 POST /v1/audio/voices
 Content-Type: multipart/form-data
 ```
@@ -331,7 +331,7 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
 
 ```bash
@@ -343,7 +343,7 @@ Delete an uploaded voice sample.
 **Path Parameters:**
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| ----------- | ------ | ---------- | ------------- |
 | `name` | string | Yes | Name of the voice to delete |
 
 **Response Example:**
@@ -462,6 +462,11 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output cloned.wav
 ```
 
+For Qwen3-TTS, an uploaded voice is a Base voice-cloning input. The server
+infers `task_type="Base"` when `voice` names an uploaded entry, so the request
+must be sent to a Base checkpoint. Built-in presets such as `vivian` and
+`ryan` remain CustomVoice speakers and require a CustomVoice checkpoint.
+
 ### Voice Storage & Caching
 
 Uploaded voices are persisted to disk as a single `.safetensors` file per voice
@@ -481,6 +486,9 @@ once.
 ### Precomputed Custom Voices
 
 Qwen3-TTS Base and VoxCPM2 can load offline-precomputed voices at startup.
+Qwen3-TTS precomputed voices follow the same Base task and checkpoint-matching
+rules as uploaded voices.
+
 Generate a directory containing `custom_voice_manifest.json` plus one
 `.safetensors` file per voice, then set the pipeline-wide deploy config field:
 
@@ -519,7 +527,7 @@ by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| ---------- | --------- | ------------- |
 | `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
 | `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
 
@@ -531,7 +539,7 @@ The batch endpoint synthesizes multiple texts in a single request, returning all
 
 ### Endpoint
 
-```
+```text
 POST /v1/audio/speech/batch
 Content-Type: application/json
 ```
@@ -688,7 +696,7 @@ for result in response.json()["results"]:
 ### Configuration
 
 | Parameter | Source | Default | Description |
-|-----------|--------|---------|-------------|
+| ----------- | -------- | --------- | ------------- |
 | `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
 
 All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_num_seqs` and queues the rest — no client-side throttling needed.
@@ -714,14 +722,14 @@ The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only th
 | ------- | ----------- | ------------- |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | CustomVoice | Predefined speaker voices with optional style control |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | VoiceDesign | Natural language voice style description |
-| `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio |
+| `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio or an uploaded/precomputed voice |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant |
-| `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Base | Smaller/faster variant for voice cloning |
+| `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Base | Smaller/faster Base variant for voice cloning, including uploaded/precomputed voices |
 
 ### Fish Speech S2 Pro
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
 Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
@@ -729,31 +737,31 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 ### Voxtral TTS
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
 
 ### CosyVoice3
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
 
 ### OmniVoice
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
 
 ### VoxCPM2
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
 
 ### MOSS-TTS-Nano
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
 
 ## Error Responses
@@ -766,6 +774,19 @@ Invalid parameters:
 {
     "error": {
         "message": "Input text cannot be empty",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+    }
+}
+```
+
+Qwen3-TTS task/checkpoint mismatch:
+
+```json
+{
+    "error": {
+        "message": "Qwen3-TTS CustomVoice checkpoint does not support task_type='Base'. Use task_type='CustomVoice' or load the matching Base checkpoint.",
         "type": "BadRequestError",
         "param": null,
         "code": 400
@@ -798,6 +819,10 @@ Ensure you're using the correct model variant for your task type:
 - VoiceDesign task → VoiceDesign model
 - Base task → Base model
 
+Uploaded and precomputed Qwen3-TTS voices select the Base task, even when the
+client supplies a different `task_type`; serve them with a Base checkpoint.
+Built-in Qwen3-TTS presets remain CustomVoice voices.
+
 ### Server Not Running
 
 ```bash
@@ -815,6 +840,51 @@ If you encounter OOM errors:
 ### Unsupported Speaker
 
 Use `/v1/audio/voices` to list available voices for the loaded model.
+
+## Orchestration Loop (experimental)
+
+Multi-stage omni deployments route stage outputs through a single orchestrator
+loop. By default that loop polls every stage replica on a 1 ms cadence. An
+opt-in event-driven mode replaces the poll with one reader task per live stage
+replica awaiting its client directly, and switches the serving-side
+final-output drain to a condition-variable wakeup at the same time.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+
+Set it on the process that runs the orchestrator (stage 0 of an omni
+deployment) before starting the server:
+
+```bash
+export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --port 8091
+```
+
+The server logs the selected loop mode and its reader/poller counts once at
+startup, so you can confirm which loop is live.
+
+Routing, output ordering, and terminal-state behavior are identical on both
+loops; only the poll cadence changes. Leaving the variable unset keeps the
+legacy poll loop, which is the supported default.
+
+**Known limitations:**
+
+- The measured serving A/B (idle CPU 2.43% to 0.07%; TTFP p99 -32% at
+  concurrency 8) predates the rebuild on the per-replica fault-isolation work
+  in [#4285](https://github.com/vllm-project/vllm-omni/pull/4285). That work
+  changed dead-replica handling and reader/poller lifecycle rather than the
+  steady-state output path, and the parity suite covers it, but the serving
+  A/B has not been re-run on the current head.
+- The diffusion-poller branch is covered by unit tests only. Deployments whose
+  stages all run as standard engine cores never exercise it, including GLM-TTS,
+  which deploys its DiT without `stage_type: diffusion`.
+- Concurrency 1 and 32 measured at parity with the legacy loop. At 32 the
+  latency is admission-bound, which this mode does not address.
 
 ## Development
 

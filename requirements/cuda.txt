@@ -1,5 +1,13 @@
 -r common.txt
 onnxruntime>=1.23.2
 fa3-fwd==0.0.3
+# BitsAndBytes moved out of tree in vLLM 0.28 (vllm#43529), which also dropped the
+# transitive bitsandbytes dependency. The plugin registers the "bitsandbytes"
+# quantization config and model loader through a vllm.general_plugins entry point,
+# so importing it is not required -- but without it installed,
+# get_quantization_config("bitsandbytes") raises and HunyuanImage-3.0's
+# pre-quantized NF4 checkpoint cannot load at all. Online 4-bit quantization of
+# diffusion transformers uses our own DiffusionBitsAndBytesConfig and is unaffected.
+vllm-bnb-plugin>=0.0.3
 # nvidia-cublas-cu12 is pinned to 12.9.1.4 via force-reinstall in Dockerfile.ci
 # because torch pins its own cublas version, making it unsatisfiable at resolve time.

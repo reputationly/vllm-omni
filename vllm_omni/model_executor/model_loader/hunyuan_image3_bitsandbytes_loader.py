@@ -11,10 +11,22 @@ from vllm.distributed import (
 )
 from vllm.lora.utils import is_moe_model
 from vllm.model_executor.model_loader import register_model_loader
-from vllm.model_executor.model_loader.bitsandbytes_loader import (
-    BitsAndBytesModelLoader,
-)
-from vllm.model_executor.model_loader.utils import ParamMapping
+
+try:
+    # vLLM 0.28 moved BitsAndBytes out of tree (vllm#43529) to get its branches
+    # out of the shared weight-loading path; the code itself lives on in the
+    # official vllm-project/vllm-bnb-plugin, which also absorbed ParamMapping.
+    # Import from both so one image can be validated against either base.
+    from vllm_bnb_plugin.bitsandbytes_loader import (
+        BitsAndBytesModelLoader,
+        ParamMapping,
+    )
+except ModuleNotFoundError:  # vLLM <= 0.26
+    from vllm.model_executor.model_loader.bitsandbytes_loader import (
+        BitsAndBytesModelLoader,
+    )
+    from vllm.model_executor.model_loader.utils import ParamMapping
+
 from vllm.model_executor.models import is_pooling_model
 from vllm.model_executor.utils import (
     get_moe_expert_mapping,

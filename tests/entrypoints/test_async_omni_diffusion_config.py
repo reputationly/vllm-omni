@@ -33,6 +33,19 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 4,
+            "ulysses_a2a_permute": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.ulysses_degree == 4
+    assert parallel_config.ulysses_a2a_permute is True
+
+
 def test_default_stage_config_preserves_model_extras():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_conv_vae": True}})[0]
 
@@ -315,6 +328,29 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_serve_cli_accepts_text_encoder_tp_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--text-encoder-tp-size",
+            "4",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.text_encoder_tp_size == 4
+    assert parallel_config.text_encoder_tp_size == 4
+
+
 def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -420,6 +456,39 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert engine_args["dlo_resident_layers"] == 20
 
 
+def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+            "--host-weight-runtime-mode",
+            "preferred",
+            "--host-weight-runtime-root",
+            "/var/cache/vllm-omni/hwr",
+            "--dlo-host-registration-limit-gib",
+            "80",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert explicit_kwargs["host_weight_runtime_mode"] == "preferred"
+    assert explicit_kwargs["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
+    assert explicit_kwargs["dlo_host_registration_limit_gib"] == 80
+    assert engine_args["host_weight_runtime_mode"] == "preferred"
+    assert engine_args["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
+    assert engine_args["dlo_host_registration_limit_gib"] == 80
+
+
 def test_serve_cli_accepts_diffusion_compile_controls():
     """Ensure both compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
@@ -458,7 +527,9 @@ def test_serve_cli_accepts_diffusion_attention_backend():
             "Qwen/Qwen-Image",
             "--omni",
             "--diffusion-attention-backend",
-            "FLASH_ATTN",
+            "FASTVIDEO_VSA",
+            "--fastvideo-vsa-topk",
+            "96",
         ]
     )
 
@@ -466,10 +537,12 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
     diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
 
-    assert args.diffusion_attention_backend == "FLASH_ATTN"
+    assert args.diffusion_attention_backend == "FASTVIDEO_VSA"
+    assert args.fastvideo_vsa_topk == 96
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
-    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+    assert diffusion_attention_config.default.backend == "FASTVIDEO_VSA"
+    assert diffusion_attention_config.default.backend_kwargs() == {"topk": 96}
 
 
 def test_serve_cli_accepts_request_batch_max_wait_ms():
@@ -535,6 +608,66 @@ def test_serve_cli_accepts_additional_config():
 
     assert args.additional_config == {"torchair_graph_config": {"enabled": True}}
     assert engine_args["additional_config"] == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_default_stage_resolves_video_output_from_checkpoint(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    resolver = mocker.patch(
+        "vllm_omni.engine.async_omni_engine.resolve_model_class_name",
+        return_value="MiniMaxH3Pipeline",
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/MiniMax-H3/FL2VA",
+        {},
+        trust_remote_code=False,
+    )
+
+    resolver.assert_called_once_with("/models/MiniMax-H3/FL2VA", "default")
+    assert captured["final_output_type"] == "video"
+
+
+def test_default_diffusers_stage_preserves_video_model_identity(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    mocker.patch(
+        "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+        return_value={"_class_name": "WanImageToVideoPipeline"},
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/Wan2.2-I2V",
+        {"diffusion_load_format": "diffusers"},
+        trust_remote_code=False,
+    )
+
+    assert captured["engine_args"]["model_class_name"] == "WanImageToVideoPipeline"
+    assert captured["final_output_type"] == "video"
 
 
 def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):
