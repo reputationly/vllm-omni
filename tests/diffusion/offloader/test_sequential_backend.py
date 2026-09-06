@@ -129,6 +129,26 @@ def test_direct_component_activation_failure_still_offloads(
 
 
 class TestMoveParamsPinMemory:
+    def test_regular_tensor_calls_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+        """Regular tensor should call pin_memory when moving to CPU."""
+        module = _create_simple_module().to(accelerator_device)
+        tracker, mock_pin = _track_pin_memory_calls()
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
+        hook = SequentialOffloadHook(
+            offload_targets=[],
+            device=accelerator_device,
+            pin_memory=True,
+            use_hsdp=False,
+        )
+        hook._move_params(
+            module,
+            torch.device("cpu"),
+            non_blocking=False,
+            pin_memory=True,
+        )
+        assert tracker["called"], "pin_memory should be called for regular tensors"
+
     def test_dtensor_skips_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
         """DTensor should skip pin_memory to avoid RuntimeError."""
         module = _create_simple_module().to(accelerator_device)
