@@ -1640,11 +1640,10 @@ class AsyncOmni(EngineClient, OmniBase):
         if stage_ids is None:
             stage_ids = list(range(len(self.engine.stage_clients)))
 
-        level2_stages = sorted(sid for sid in stage_ids if self._level2_sleeping.get(sid))
-        if level2_stages:
+        if getattr(self, "_level2_sleeping", False):
             raise NotImplementedError(
-                f"wake_up() after sleep(level=2) is not yet implemented (stages {level2_stages}): "
-                "weights were discarded from GPU and reloading from disk is not yet supported. "
+                "wake_up() after sleep(level=2) is not yet implemented: weights were "
+                "discarded from GPU and reloading from disk is not yet supported. "
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
                 "and supports fast DMA restore."
             )
@@ -1724,30 +1723,17 @@ class AsyncOmni(EngineClient, OmniBase):
         await asyncio.sleep(0.1)
         return final_acks
 
-    def _sleeping_stage_tags(self) -> dict[int, set[str]]:
-        """Per-stage sleeping-tag map, migrating any legacy engine-wide set.
-
-        Older builds stored a single ``set[str]``. Instances restored from such a
-        state (or subclasses that assign the old shape) are normalized here by
-        attributing the legacy tags to every stage, which is the conservative
-        reading: the old code could only ever sleep the whole engine.
-        """
-        tags = getattr(self, "_sleeping_tags", None)
-        if isinstance(tags, dict):
-            return tags
-        migrated: dict[int, set[str]] = {}
-        if tags:
-            num_stages = len(getattr(self.engine, "stage_clients", []) or []) or 1
-            for sid in range(num_stages):
-                migrated[sid] = set(tags)
-        self._sleeping_tags = migrated
-        if not isinstance(getattr(self, "_level2_sleeping", None), dict):
-            self._level2_sleeping = {}
-        return migrated
-
     def sleeping_stage_ids(self) -> list[int]:
-        """Stage ids currently offloaded, for callers coordinating residency."""
-        return sorted(sid for sid, tags in self._sleeping_stage_tags().items() if tags)
+        """Stage ids currently offloaded, for callers coordinating residency.
+
+        Reads upstream's ``_stage_sleeping_tags`` directly. Our fork used to keep
+        its own per-stage map inside ``_sleeping_tags``; upstream now splits the
+        two (``_stage_sleeping_tags`` per stage, ``_sleeping_tags`` the union),
+        so the old accessor would have written a dict into the field upstream
+        declares as ``set[str]`` and corrupted every union read after it.
+        """
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        return sorted(sid for sid, tags in per_stage.items() if tags)
 
     async def is_sleeping(self) -> bool:
         """Return whether ALL stages are sleeping.
