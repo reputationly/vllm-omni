@@ -157,7 +157,7 @@ def _is_checkpoint_quantized(quant_cfg: object) -> bool:
     return False
 
 
-class DiffusersPipelineLoader:
+class DiffusersPipelineLoader(HWRLoaderMixin):
     """Model loader that can load diffusers pipeline components from disk."""
 
     @dataclasses.dataclass

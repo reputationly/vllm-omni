@@ -137,7 +137,9 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
-                skip_with_substr=self.ignored_layers_match == "substring",
+                # vLLM 0.28 replaced skip_with_substr with match_mode;
+                # "substring" preserves skip_with_substr=True verbatim.
+                match_mode="substring" if self.ignored_layers_match == "substring" else "exact",
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_cuda():

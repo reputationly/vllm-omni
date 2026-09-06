@@ -62,7 +62,7 @@ def ssh(host: str, command: str, timeout: int = 60) -> subprocess.CompletedProce
     )
 
 
-def build_run_command(model: dict, image: str, container: str) -> str:
+def build_run_command(model: dict, image: str, container: str, source_override: str | None) -> str:
     # backend_parameters rows are inconsistent: some entries are one flag per
     # element ("--num-gpus", "2"), others pack flag and value into a single
     # string ("--residency-config /path"). shlex.split over the joined string
@@ -76,6 +76,12 @@ def build_run_command(model: dict, image: str, container: str) -> str:
     mount_args: list[str] = []
     for mount in MOUNTS:
         mount_args += ["-v", mount]
+    # Iterating on a merge conflict costs a 40-minute image rebuild plus a pull to
+    # every host. Overlaying the tree straight onto site-packages keeps that loop
+    # to an rsync. Only for pre-merge iteration -- the run that gates a release
+    # must use the image as built, with this off.
+    if source_override:
+        mount_args += ["-v", f"{source_override}:/usr/local/lib/python3.12/dist-packages/vllm_omni:ro"]
 
     argv = [
         "docker",
@@ -105,10 +111,10 @@ def build_run_command(model: dict, image: str, container: str) -> str:
     return " ".join(shlex.quote(a) for a in argv)
 
 
-def launch(host: str, model: dict, image: str) -> tuple[str, str, str]:
+def launch(host: str, model: dict, image: str, source_override: str | None) -> tuple[str, str, str]:
     container = f"val-{model['name'].replace('.', '-')}"
     ssh(host, f"docker rm -f {container} >/dev/null 2>&1; true")
-    result = ssh(host, build_run_command(model, image, container), timeout=180)
+    result = ssh(host, build_run_command(model, image, container, source_override), timeout=180)
     if result.returncode != 0:
         return model["name"], "LAUNCH_FAILED", result.stderr.strip()[-400:]
     return model["name"], "STARTED", container
@@ -137,8 +143,8 @@ def wait_ready(host: str, model: dict, container: str, deadline_s: int) -> tuple
     return "TIMEOUT", logs.stdout.strip()[-2000:]
 
 
-def run_one(host: str, model: dict, image: str, deadline_s: int) -> dict:
-    name, status, detail = launch(host, model, image)
+def run_one(host: str, model: dict, image: str, deadline_s: int, source_override: str | None) -> dict:
+    name, status, detail = launch(host, model, image, source_override)
     if status != "STARTED":
         return {"model": name, "host": host, "status": status, "detail": detail}
     status, detail = wait_ready(host, model, detail, deadline_s)
@@ -156,6 +162,11 @@ def main() -> None:
         type=int,
         default=2700,
         help="seconds to wait per model; H3 deploy-configs set --init-timeout 2400 (default: 2700)",
+    )
+    parser.add_argument(
+        "--source-override",
+        help="host path to a vllm_omni tree to bind over site-packages; for pre-merge "
+        "iteration only, leave unset for the run that gates a release",
     )
     parser.add_argument("--out", type=Path, default=Path("startup_matrix_result.json"))
     args = parser.parse_args()
@@ -175,7 +186,7 @@ def main() -> None:
     print()
 
     with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
-        results = list(pool.map(lambda p: run_one(p[0], p[1], args.image, args.deadline), pairs))
+        results = list(pool.map(lambda p: run_one(p[0], p[1], args.image, args.deadline, args.source_override), pairs))
 
     args.out.write_text(json.dumps(results, ensure_ascii=False, indent=2))
     print(f"\n{'模型':<26}{'机器':<8}{'结果':<10}")

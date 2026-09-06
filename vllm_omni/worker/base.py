@@ -124,6 +124,12 @@ class OmniGPUWorkerBase(GPUWorker):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
+        # vLLM's own determine_available_memory() sets total_consumed and
+        # peak_activation_memory together, and compile_or_warm_up_model()
+        # guards its kv-cache-size suggestion on hasattr(peak_activation_memory)
+        # alone -- so setting only one of the pair passes the guard and then
+        # raises AttributeError on the other. Keep them assigned together.
+        self.total_consumed = profile_result.total_consumed
 
         process_memory = (
             get_process_gpu_memory(self.local_rank)

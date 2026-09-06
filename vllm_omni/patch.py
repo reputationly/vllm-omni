@@ -590,8 +590,26 @@ def _preserve_hunyuan_image3_bnb_load_format() -> None:
     quantization method is BitsAndBytes. That is correct for generic models,
     but it prevents an explicitly registered model-specific BnB loader from
     ever being selected.
+
+    On vLLM 0.28 the same overwrite lives in vllm-bnb-plugin, which moved it
+    *after* create_engine_config() returns (it mutates the finished
+    ``load_config``). Guarding create_load_config() is therefore no longer
+    enough: whoever wraps last wins. Register the plugin first so our wrapper
+    is the outer one, then put the format back on the returned config. Without
+    this the DiT stage dies with "Prequant BitsAndBytes models with tensor
+    parallelism is not supported" -- which is precisely the restriction the
+    Hunyuan loader exists to lift (TP4+EP4 keeps every packed expert whole).
     """
     from vllm.engine.arg_utils import EngineArgs
+
+    try:
+        import vllm_bnb_plugin
+
+        # Idempotent (guarded by its own _REGISTERED flag); called here only to
+        # pin the ordering, not to enable anything.
+        vllm_bnb_plugin.register()
+    except ModuleNotFoundError:  # vLLM <= 0.26 keeps BitsAndBytes in tree
+        pass
 
     custom_format = "hunyuan_image3_bitsandbytes"
     original_create_engine_config = EngineArgs.create_engine_config
@@ -609,7 +627,12 @@ def _preserve_hunyuan_image3_bnb_load_format() -> None:
         if requested_format == custom_format:
             self._omni_requested_load_format = custom_format
         try:
-            return original_create_engine_config(self, *args, **kwargs)
+            config = original_create_engine_config(self, *args, **kwargs)
+            if requested_format == custom_format:
+                # Undo any post-hoc "bitsandbytes" stamp applied by a wrapper
+                # inside this one (vllm-bnb-plugin does exactly that).
+                config.load_config.load_format = custom_format
+            return config
         finally:
             self.__dict__.pop("_omni_requested_load_format", None)
 

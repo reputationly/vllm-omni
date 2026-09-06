@@ -1729,16 +1729,12 @@ class MiniMaxH3Pipeline(
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
             )
-            if rank < text_encoder_tp_size:
-                self.weights_sources.append(
-                    DiffusersPipelineLoader.ComponentSource(
-                        model_or_path=str(model_path),
-                        subfolder="text_encoder",
-                        revision=od_config.revision,
-                        prefix="text_encoder.",
-                        fall_back_to_pt=False,
-                    )
-                )
+            # No text_encoder ComponentSource here, unlike upstream: our encoder
+            # loads its own weights (load_to_device), which is what lets the
+            # INT8 text-encoder artifact ship separately from the DiT. Routing it
+            # through weights_sources would hand `text_encoder.*` names to
+            # load_weights(), whose source_prefix only accepts transformer
+            # prefixes and raises "unexpected MiniMax-H3 weight" on the first one.
         else:
             self.text_encoder_tp_size = 0
             self.text_encoder_group = None
