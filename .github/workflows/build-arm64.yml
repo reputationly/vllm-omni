@@ -27,8 +27,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: 'vLLM 官方 base(Docker Hub 公开,GHA runner 拉得快)。必须与 docker/Dockerfile.cuda 的默认基座同版本:仓库自上游 cbab1d4d 起已 rebase 到 vLLM 0.26,omni_ar_scheduler 直接读 Request.num_in_flight_tokens,0.25 基座上走 AR 调度的模型(TTS/LLM stage)首请求即 EngineDead。'
-        default: 'vllm/vllm-openai:v0.26.0'
+        description: 'vLLM 官方 base(Docker Hub 公开,GHA runner 拉得快)。必须与 docker/Dockerfile.cuda 的默认基座同版本,否则按基座版本分叉的 import 路径会在启动时才炸。自 2026-09-06 的上游同步起为 vLLM 0.28(上游那批提交本身就是 0.26->0.28 迁移)。历史:0.25->0.26 时 omni_ar_scheduler 改读 Request.num_in_flight_tokens,基座落后会让走 AR 调度的模型(TTS/LLM stage)首请求即 EngineDead。'
+        default: 'vllm/vllm-openai:v0.28.0'
         required: true
       dest_tag:
         description: '要发布的浮动 ACR tag'

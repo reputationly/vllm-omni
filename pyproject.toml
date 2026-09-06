@@ -94,6 +94,8 @@ models = [
     "torchdiffeq>=0.2.5",  # covo_audio token2wav ODE solver
     "cn2an>=0.5.22",       # Chinese number normalization (TTS)
     "funasr>=1.0.0",       # speaker/ASR frontends
+]
+
 server-vad = [
     "silero-vad==6.1",
 ]
