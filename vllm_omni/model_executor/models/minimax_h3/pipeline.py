@@ -13,17 +13,17 @@ Two entries, for two different jobs:
 """
 
 # MiniMax-H3 pipeline topology (deploy-only).
-# 
+#
 # H3 ships as a pure diffusers repo: no root ``config.json``, only a
 # ``model_index.json`` naming ``MiniMaxH3Pipeline``. Without a registered
 # ``PipelineConfig`` a deploy YAML has no topology to merge into, so
 # ``--deploy-config`` is refused outright (``entrypoints/utils.py``) and every
 # multi-GPU knob has to be repeated as a CLI flag — ~15 of them for the 4-card
 # A100-40G profile.
-# 
+#
 # Why this is a *deploy-only* key, same shape as ``hunyuan_image3_ar`` /
 # ``hunyuan_image3_dit``:
-# 
+#
 # * ``hf_architectures=()`` and no ``diffusers_class_name``, so neither the HF
 #   config path nor the ``model_index.json`` path in ``try_infer_model_type``
 #   can select it. The only way in is naming it from a deploy YAML's
@@ -43,7 +43,7 @@ Two entries, for two different jobs:
 #   ``vllm serve /nfs-data/models/MiniMax-H3-FL2VA-INT8``. It is only naming
 #   discipline, though — a future ``MiniMax-H3-DiT-*`` directory would match —
 #   which is exactly why the flag above, not this bullet, is what guarantees it.
-# 
+#
 # Net effect: launching without ``--deploy-config`` behaves exactly as before.
 
 from vllm_omni.config.stage_config import (

@@ -68,6 +68,8 @@ logger = init_logger(__name__)
 # fallbacks below are these ratios times hidden_size.
 MINIMAX_H3_ADALN_EXPAND_RATIO = 18
 MINIMAX_H3_FINAL_ADALN_EXPAND_RATIO = 2
+
+
 # Packed multi-request forwards require the attention backend to actually
 # consume cu_seqlens as a block-diagonal plan (not a padding-mask rebuild that
 # spans the full packed row). The pipeline gates on this capability before

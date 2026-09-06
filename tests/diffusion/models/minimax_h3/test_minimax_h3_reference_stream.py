@@ -592,9 +592,6 @@ def test_the_prepared_reference_is_unchanged_by_the_streaming_switch(admissible_
     frames, canvas, duration or soundtrack.
     """
     import torch
-
-    from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
-    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import decode_reference_video
     from vllm_omni.diffusion.models.minimax_h3.reference_video import (
         MINIMAX_H3_BASE_SHORT_EDGE,
         MINIMAX_H3_CANVAS_MULTIPLE,
@@ -602,6 +599,9 @@ def test_the_prepared_reference_is_unchanged_by_the_streaming_switch(admissible_
         _resolve_reference_canvas,
         prepare_reference_videos_official,
     )
+
+    from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import decode_reference_video
     from vllm_omni.diffusion.models.minimax_h3.reference_video_frames import normalize_reference_video_frames
 
     target_frame_count = 25
@@ -701,9 +701,9 @@ def test_a_container_that_does_not_start_at_zero_keeps_its_whole_soundtrack(offs
     seconds of sound, which on this three-second file is all of it.
     """
     import torch
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     with open_reference_video(str(offset_video)) as reader:
         first_at, _ = next(reader.iter_frames())
@@ -725,10 +725,10 @@ def test_a_container_that_does_not_start_at_zero_keeps_its_whole_soundtrack(offs
 def test_a_relative_start_cuts_both_streams_inside_a_nonzero_container_clock(offset_video):
     """A non-zero request offset must not be compared directly with absolute PTS."""
     import torch
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
     from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     start = 0.37  # deliberately between two 30 fps presentation timestamps
     with open_reference_video(str(offset_video)) as reader:
@@ -763,7 +763,6 @@ def test_a_relative_start_places_known_audio_content_without_reusing_the_trim_fo
 ):
     """The requested media-relative cut is observable in the audio content."""
     import torch
-
     from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     sample_rate = 48000
@@ -818,9 +817,9 @@ def test_a_soundtrack_that_starts_late_stays_late(delayed_audio_video):
     is what the container has in that second.
     """
     import torch
+    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import prepare_reference_videos_official
 
     with open_reference_video(str(delayed_audio_video)) as reader:
         video_at, _ = next(reader.iter_frames())
@@ -1024,6 +1023,7 @@ def test_a_reference_at_the_advertised_ceilings_is_admitted(width, height, fps):
 def test_the_compressed_size_gate_is_the_one_that_stayed():
     """Removing the decoded budget must not have taken the 50 MiB gate with it."""
     from vllm_omni.diffusion.models.minimax_h3.reference_video import _validate_reference_video_metadata
+
     from vllm_omni.errors import OmniClientError
 
     meta = _admissible_meta(1920, 1080, 30.0, 15.0)

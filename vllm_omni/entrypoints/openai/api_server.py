@@ -110,13 +110,13 @@ from vllm_omni.config.endpoint_policy import (
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.diffusion.progress import PHASE_SAVE
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
+from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.openai.audio_task_manager import (
     AUDIO_TASK_MANAGER,
     resolve_save_path,
     visible_task_status,
 )
-from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
-from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (

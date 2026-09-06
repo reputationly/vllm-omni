@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import sys
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
-from unittest.mock import Mock
 from typing import Any, TypeVar
 from unittest.mock import Mock, patch
 
@@ -612,6 +612,30 @@ def test_base_defaults_to_twenty_nfe_but_accepts_other_deployment_steps():
 def test_turbo_four_defaults_to_four_nfe_and_accepts_eight():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_minimax_h3_schedule,
+    )
+    from vllm_omni.diffusion.sched import DMD2SigmaSchedule
+
+    turbo4 = DMD2SigmaSchedule.from_positions([1.0, 0.75, 0.5, 0.25, 0.0])
+    steps, positions = _resolve_minimax_h3_schedule(turbo4, None)
+    assert steps == 4
+    assert positions == turbo4.base_schedule
+
+    steps, positions = _resolve_minimax_h3_schedule(turbo4, 8)
+    assert steps == 8
+    assert len(positions) == 9
+
+
+def test_base_schedule_overrides_the_uniform_sigma_positions():
+    from vllm_omni.diffusion.models.minimax_h3.time_request import (
+        minimax_h3_time_shift_sigmas,
+    )
+
+    base_schedule = [1.0, 0.7, 0.4, 0.15, 0.0]
+
+    video = minimax_h3_time_shift_sigmas(
+        num_steps=len(base_schedule),
+        shift_scale=12.0,
+        base_schedule=base_schedule,
     )
     audio = minimax_h3_time_shift_sigmas(
         num_steps=len(base_schedule),

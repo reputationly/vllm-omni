@@ -28,8 +28,6 @@ from vllm.parser.utils import (
     count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
 
-
-
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
