@@ -97,11 +97,6 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
-    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
-    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-
 
 def _plain_config_value(value: Any) -> Any:
     """A config value with its OmegaConf wrapper taken off, recursively.

@@ -15,9 +15,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.models.minimax_h3.reference_audio import MINIMAX_H3_AUDIO_RESAMPLE_OFFICIAL
 from vllm_omni.errors import OmniClientError
 
-from .reference_audio import MINIMAX_H3_AUDIO_RESAMPLE_OFFICIAL
 MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY = "minimax_h3_prepared_reference_videos"
 
 
@@ -543,7 +543,8 @@ def prepare_reference_videos_official(
         One dict per reference, carrying the normalized ``frames`` and the
         already-normalized ``audio`` (or None), in request order.
     """
-    from .reference_audio import normalize_reference_audio
+    from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
+
     from .reference_media_decode import open_reference_video
     from .reference_video_frames import normalize_reference_video_stream
 

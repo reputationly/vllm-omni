@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reference-audio encoding + speaker cache for the MOSS-TTS-family talker.
 
 This lives in the model package (not the shared serving layer) so all
@@ -22,6 +25,7 @@ so importing it from the API-server process does not pull the talker/codec.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 

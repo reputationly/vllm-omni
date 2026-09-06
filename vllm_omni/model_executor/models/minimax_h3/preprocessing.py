@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared MiniMax H3 media normalization and Qwen presentation building.
 
 Builds the positive presentation token stream:
@@ -22,9 +23,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.models.minimax_h3.ordered_references import render_condition_label
 from vllm_omni.errors import OmniClientError
-
-from .ordered_references import render_condition_label
 
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"

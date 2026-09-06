@@ -40,10 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,

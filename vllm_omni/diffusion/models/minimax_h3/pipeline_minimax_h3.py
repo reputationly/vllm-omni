@@ -46,15 +46,10 @@ from vllm_omni.diffusion.models.interface import (
     SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.offloader import (
     BoundedAllocatorCache,
     OffloadPlan,
-    apply_sequential_offload,
-    remove_sequential_offload,
-    sequential_offload_component,
 )
-from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -86,22 +81,16 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     minimax_h3_ref2va_video_presentation,
     minimax_h3_text_only_ids,
 )
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    resolve_minimax_h3_aspect_ratio as _resolve_minimax_h3_aspect_ratio,
-)
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    resolve_minimax_h3_output_canvas as _resolve_output_canvas,
-)
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    resolve_minimax_h3_reference_image_shape as _reference_image_shape,
-)
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
+    MINIMAX_H3_QWEN_TEMPORAL_PATCH,
+    MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
     deserialize_prepared_reference_videos,
     load_audio_file,
     load_video_audio,
     load_video_frames,
     prepare_reference_videos,
+    prepare_reference_videos_official,
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
@@ -120,8 +109,18 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .keyframes import prepare_fl2va_keyframes
-from .minimax_h3_transformer import MiniMaxH3DiTModel
+from .lora import load_minimax_h3_turbo_lora
+from .minimax_h3_transformer import (
+    MiniMaxH3Attention,
+    MiniMaxH3DiTModel,
+    _attention_isolates_packed_requests,
+)
+from .npu.lora import (
+    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
+    load_minimax_h3_native_lora,
+)
 from .ordered_references import (
     MINIMAX_H3_ORDER_BUCKETS,
     MINIMAX_H3_ORDER_REQUEST,
@@ -134,17 +133,6 @@ from .ordered_references import (
 )
 from .ordered_references import (
     condition_labels as reference_condition_labels,
-)
-from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
-from .lora import load_minimax_h3_turbo_lora
-from .minimax_h3_transformer import (
-    MiniMaxH3Attention,
-    MiniMaxH3DiTModel,
-    _attention_isolates_packed_requests,
-)
-from .npu.lora import (
-    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
-    load_minimax_h3_native_lora,
 )
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -169,24 +157,12 @@ from .reference_image_geometry import (
     parse_reference_image_no_upscale,
     parse_reference_image_short_edge,
 )
-from .reference_video import (
-    MINIMAX_H3_QWEN_TEMPORAL_PATCH,
-    MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-    load_audio_file,
-    load_video_audio,
-    load_video_frames,
-    prepare_reference_videos,
-    prepare_reference_videos_official,
-    sample_reference_video_frames,
-    validate_reference_audio_files,
-    validate_reference_audio_waveforms,
-)
+from .reference_video_frames import sample_conditioner_frames, vae_chunk_frame_count
+from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
-from .reference_video_frames import sample_conditioner_frames, vae_chunk_frame_count
-from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
 from .strategy import MiniMaxH3InferenceStrategy, contract_environ, legacy_strategy, resolve_strategy
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
@@ -407,6 +383,19 @@ def _resolve_minimax_h3_schedule(
     return steps, schedule.positions_for_num_inference_steps(steps)
 
 
+def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
+    """Hand one bounded allocator cache to every component that can share it.
+
+    Distributed layerwise offload moves components on and off device around each
+    stage; without a shared cache each one re-allocates its own staging buffers.
+    Components are passed positionally and may be None (the text encoder is None
+    on ranks outside the text-encoder group).
+    """
+    for component in components:
+        if component is not None:
+            component.set_omni_component_cache(cache)
+
+
 def _resolve_minimax_h3_model_root(
     model: str,
     revision: str | None,
@@ -447,9 +436,7 @@ def _resolve_minimax_h3_partition_path(
     local_path = Path(model)
     if local_path.is_dir() and _local_minimax_h3_partition(local_path) == partition:
         return local_path.parent, local_path
-    model_root = _resolve_minimax_h3_model_root(
-        model, revision, partition, load_text_encoder=load_text_encoder
-    )
+    model_root = _resolve_minimax_h3_model_root(model, revision, partition, load_text_encoder=load_text_encoder)
     name = "Ref2VA" if partition == "ref2va" else "FL2VA"
     return model_root, model_root / name
 
@@ -458,6 +445,8 @@ def _resolve_component_quant_config(quant_config, component: str):
     if hasattr(quant_config, "resolve"):
         return quant_config.resolve(component)
     return quant_config
+
+
 # Keys of ``_prepare_request_inputs`` that feed ``diffuse`` / ``_build_denoise_inputs``.
 _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "task",
@@ -941,6 +930,8 @@ def _log_reference_order(references: Sequence[MiniMaxH3OrderedReference], mode: 
     _, rank, _ = _dit_rank_world()
     if rank == 0:
         logger.info("MiniMax H3 reference order: %s", describe_order(references, mode))
+
+
 def _broadcast_rank0_exception(exc: Exception | None) -> None:
     """Synchronize a rank-0-only exception across every DiT rank.
 
@@ -1737,7 +1728,6 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
