@@ -559,7 +559,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "latent":
         return output
     if output_type == "np":
-        video = _minimax_h3_video_to_owned_numpy(video)
+        video = video.detach().cpu().numpy()
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
@@ -573,9 +573,11 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
 def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
     """Quantize decoded frames in place before worker-to-engine transfer.
 
-    Distinct from ``_minimax_h3_video_to_owned_numpy`` below, which serves the
-    ``output_type == "np"`` post-process path and keeps float32. This one runs
-    earlier, on the worker side, and cuts the transferred payload to uint8.
+    Runs on the worker side and cuts the transferred payload to uint8, and it
+    is the ONLY place the video is scaled or transposed: ``_minimax_h3_post_process``
+    downstream just calls ``.numpy()``. A second permute there produces
+    (H, W, C, T), which passes the uint8 (B,T,H,W,C) guard when B collapses and
+    only fails much later in av.VideoFrame.from_ndarray.
     """
     video = video.detach().float()
     video.clamp_(0, 1).mul_(255).round_()
@@ -583,38 +585,6 @@ def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
         dtype=torch.uint8,
         memory_format=torch.contiguous_format,
     )
-
-
-def _minimax_h3_video_to_owned_numpy(video: torch.Tensor) -> np.ndarray:
-    """Convert NCTHW video to an owned, contiguous float32 NTHWC array.
-
-    H3's VAE revert path normally supplies a multi-GiB CPU float32 tensor.
-    Building ``permute().clamp().numpy()`` first leaves NumPy borrowing a
-    torch allocation, so the engine's allocator-safety pass must copy the
-    entire video again.  Write the clamp result directly into the final
-    NumPy-owned buffer instead.  Frame chunking bounds temporary iterator
-    state without changing the normalized float32 output contract.
-    """
-
-    source = video.detach().float().cpu()
-    if source.ndim != 5:
-        raise ValueError(f"MiniMax H3 video output must be NCTHW, got {tuple(source.shape)}")
-    batch, channels, frames, height, width = (int(value) for value in source.shape)
-    output = np.empty(
-        (batch, frames, height, width, channels),
-        dtype=np.float32,
-        order="C",
-    )
-    output_tensor = torch.from_numpy(output)
-    source_nthwc = source.permute(0, 2, 3, 4, 1)
-    frame_chunk = 16
-    for start in range(0, frames, frame_chunk):
-        end = min(start + frame_chunk, frames)
-        # Keep clamp's exact value semantics, including the sign bit of -0.0.
-        # The ``out=`` form changes -0.0 to +0.0 on some torch builds.
-        clamped = source_nthwc[:, start:end].clamp(0, 1)
-        output_tensor[:, start:end].copy_(clamped)
-    return output
 
 
 def get_minimax_h3_post_process_func(

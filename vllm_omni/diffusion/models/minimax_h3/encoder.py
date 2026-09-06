@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
 
+from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
@@ -429,18 +430,23 @@ class MiniMaxH3Qwen3VLRowParallelLinear(_Int8WeightMixin, LinearBase):
 # ---------------------------------------------------------------------------
 
 
-class MiniMaxH3Qwen3VLRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
+    """Qwen3-VL RMSNorm on the common implementation.
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    Must NOT be a bare nn.Module with a one-argument forward: the decoder layer
+    calls ``post_attention_layernorm(hidden_states, residual)`` and unpacks two
+    return values. A one-argument version loads fine and the server reaches
+    READY -- it only dies on the first forward with "takes 2 positional
+    arguments but 3 were given", so a startup-only validation pass cannot see it.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__(hidden_size, eps=eps, dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
