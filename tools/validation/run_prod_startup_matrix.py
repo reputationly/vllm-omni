@@ -113,7 +113,11 @@ def build_run_command(model: dict, image: str, container: str, source_override: 
 
 def launch(host: str, model: dict, image: str, source_override: str | None) -> tuple[str, str, str]:
     container = f"val-{model['name'].replace('.', '-')}"
-    ssh(host, f"docker rm -f {container} >/dev/null 2>&1; true")
+    # Remove every val-* container, not just this name. These run with
+    # --network host, so a leftover from an earlier batch keeps port 40099 and
+    # the readiness probe answers 200 instantly from the wrong server -- a run
+    # that reports "READY 0s" for a model that needs minutes to load.
+    ssh(host, "for c in $(docker ps -aq --filter name=val-); do docker rm -f $c >/dev/null 2>&1; done; true")
     result = ssh(host, build_run_command(model, image, container, source_override), timeout=180)
     if result.returncode != 0:
         return model["name"], "LAUNCH_FAILED", result.stderr.strip()[-400:]
