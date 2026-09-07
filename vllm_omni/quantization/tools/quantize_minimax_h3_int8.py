@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Quantize the MiniMax-H3 DiT to serialized Int8 for vLLM-Omni.
 
 Reads the FL2VA (or Ref2VA) *original* checkpoint — the one vLLM-Omni loads,
@@ -110,6 +113,19 @@ def main() -> int:
     ap.add_argument("--src", required=True, help="FL2VA/Ref2VA partition root (contains transformer/)")
     ap.add_argument("--dst", required=True, help="output partition root")
     ap.add_argument("--dry-run", action="store_true", help="report the plan and sizes, write nothing")
+    ap.add_argument(
+        "--activation-scheme",
+        choices=("dynamic", "weight_only"),
+        default="dynamic",
+        help=(
+            "dynamic = W8A8 (activations quantized per token at runtime); "
+            "weight_only = W8A16 (activations stay BF16). The serialized weights are "
+            "identical either way -- this only records how they are to be consumed. "
+            "The Ref2VA measurement (docs/minimax-h3-ref2va-剪枝量化全量实测-2026-08-22.md) "
+            "rejected W8A8 on quality: it is cheaper and faster but clips high-dynamic "
+            "transients. Prefer weight_only unless the memory is genuinely needed."
+        ),
+    )
     args = ap.parse_args()
 
     src_tf = os.path.join(args.src, "transformer")
@@ -185,7 +201,7 @@ def main() -> int:
     config["quantization_config"] = {
         "quant_method": "int8",
         "is_checkpoint_int8_serialized": True,
-        "activation_scheme": "dynamic",
+        "activation_scheme": args.activation_scheme,
         "ignored_layers": sorted(ignored_layers),
         "ignored_layers_match": "substring",
     }
