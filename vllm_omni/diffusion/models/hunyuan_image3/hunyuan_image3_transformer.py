@@ -3515,8 +3515,24 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if hasattr(self.vae, "ffactor_temporal"):
             latents = latents.unsqueeze(2)
 
-        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
-            image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        # This is the SECOND VAE decode site for HunyuanImage-3, and the one the
+        # request-level path actually reaches; HunyuanImage3Pipeline.post_decode is
+        # the step-execution one. Both need the pre-decode DiT offload or enabling it
+        # silently does nothing on whichever path a deployment happens to take.
+        # ``self.model`` here is the outer HunyuanImage3Pipeline (constructed as
+        # ``HunyuanImage3Text2ImagePipeline(model=self, ...)``), so the helpers live
+        # on it; getattr keeps a bare-transformer construction working.
+        offload_dit = getattr(self.model, "_offload_dit_before_vae", None)
+        # Read the device before the offload: it follows the DiT's parameters, and
+        # parking them would flip it to "cpu" and autocast the decode onto the host.
+        autocast_device_type = self.device.type
+        dit_parked = bool(offload_dit()) if callable(offload_dit) else False
+        try:
+            with torch.autocast(device_type=autocast_device_type, dtype=torch.float16, enabled=True):
+                image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        finally:
+            if dit_parked:
+                self.model._restore_dit_after_vae()
 
         if hasattr(self.vae, "ffactor_temporal"):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"

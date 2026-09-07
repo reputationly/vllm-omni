@@ -1,0 +1,99 @@
+# HunyuanImage-3.0-Instruct-Distil (NF4) — DiT-only on TWO A100-40G cards.
+#
+# Serve with:
+#   VLLM_OMNI_HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE=1 \
+#     vllm serve <model> --omni --deploy-config /deploy-configs/hunyuan_image3_dit_a100_40g_tp2.yaml
+#
+# WHY TWO CARDS FIT, WHEN THE 4x FILES IMPLY THEY DO NOT
+#
+# Per-card weights are NOT total/N. Measured tensor accounting of the NF4
+# checkpoint (47.83 GiB, 25649 tensors): config.json's llm_int8_skip_modules keeps
+# attention, shared_mlp, VAE, vision_model, lm_head, wte and the DiT heads in BF16,
+# so ONLY the routed experts are quantized (37.13 GiB, 77.6%). Of the rest, 4.92
+# GiB (VAE 2.35 + vision 0.84 + DiT heads 0.70 + wte + gates) is REPLICATED on every
+# rank and does not shard. That gives
+#
+#     per-card = 42.89 / N + 4.92 GiB
+#
+# which predicts 15.64 at TP4 and 26.37 at TP2, against measured 15.45 and 26.14.
+# Halving the cards therefore costs far less than doubling -- the replicated 4.92
+# GiB is paid twice instead of four times.
+#
+# MEASURED (2x A100-40G, 8-step i2i, /nfs-output/hy3-cards-20260906):
+#   weights                26.14 GiB/card   (loader takes EP2 = 32 whole experts/rank)
+#   7-case soak            all pass, peak 40143 / 40960 MiB
+#   worst case (3 square inputs, each snapped to 1024x1024)  peak 39405 MiB
+#   fidelity vs TP4        median PSNR 42.97 dB (6 of 7 cases > 41 dB)
+#   hot request            9.80 s  vs  8.16 s at TP4  (~20% slower)
+#
+# HEADROOM IS UNDER 4 GiB AND THAT IS MEASURED, NOT ESTIMATED. A ballast sweep
+# (pin N GiB/card, then run the worst case) passes at 0 GiB and FAILS at 4, 6 and 8:
+# the 6/8 GiB runs die in the init dummy run with "28.68 GiB allocated by PyTorch,
+# 18.87 MiB reserved but unallocated" -- i.e. there is essentially no caching-
+# allocator slack to reclaim, the nvidia-smi high-water mark IS live usage.
+# Consequences: nothing else may share these two cards, and MPS/other tenants are
+# out.
+#
+# WHY THE ENV VAR, AND WHAT IT ACTUALLY BUYS (measured, runs S1/S2):
+# VLLM_OMNI_HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE=1 parks the DiT's 20.90 GiB/rank
+# in host RAM for the VAE decode window, where it is idle
+# (pipeline_hunyuan_image3.py::_offload_dit_before_vae).
+#
+#   run peak     39405 -> 39163 MiB   (242 MiB. NOT 20.90 GiB -- see below)
+#   cold request 38.23 -> 18.64 s
+#   hot requests 17.46 -> 13.77 s, 10.78 -> 9.19 s
+#   cost         0.06 s park + 1.25 s restore per request (first park 15.3 s: pinning)
+#
+# The peak barely moves because the binding phase is DENOISE, not decode. Enable it
+# for the WALL CLOCK: handing 20.9 GiB back for the decode stops the caching
+# allocator thrashing, and that is worth far more than the 1.3 s round trip.
+#
+# It does NOT make the deployment tolerant of memory pressure. The ballast sweep
+# still fails at 4 and 6 GiB with it ON, logging zero offload executions -- those
+# runs die in denoise before reaching a decode. Two cards is still all-or-nothing.
+#
+# Do NOT enable it on the TP4 files: they already have 2921 MiB of headroom and it
+# would only add the round trip.
+#
+# EP stays MANDATORY: 64 experts / EP2 = 32 COMPLETE experts per rank, so no packed
+# NF4 tensor is ever sliced. The loader rejects TP>1 without EP.
+#
+# Requires --gpus '"device=0,1"'. Two instances per 4-card node.
+pipeline: hunyuan_image3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    devices: "0,1"
+    distributed_executor_backend: "mp"
+    safetensors_load_strategy: lazy
+    enable_sleep_mode: false
+    # Tiling would also fit, and cheaper in wall clock, but it visibly changes the
+    # output (PSNR 22-25 dB vs untiled). The env-var offload above is the
+    # pixel-preserving way to buy the same headroom; keep both off here.
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 2
+      enable_expert_parallel: true
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 1.0
+      seed: 42

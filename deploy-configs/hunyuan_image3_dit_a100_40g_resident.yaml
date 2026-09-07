@@ -1,0 +1,76 @@
+# HunyuanImage-3.0-Instruct-Distil (NF4) — DiT-only, ALWAYS RESIDENT, A100 40G x4.
+#
+# Serve with (note: NO --residency-config):
+#   vllm serve <model> --omni --deploy-config /deploy-configs/hunyuan_image3_dit_a100_40g_resident.yaml
+#
+# WHAT THIS BUYS, AND WHAT IT COSTS
+#
+# The dual-engine file (hunyuan_image3_a100_40g_residency.yaml) parks every engine
+# asleep and has api_server's _terminal_engine_awake() wake the DiT and put it back
+# for EVERY request -- including requests that never touch AR. Measured wake/sleep
+# is 1.7871 s + 2.3726 s, so the plain (bot_task omitted / vanilla) path pays
+# ~4.16 s of pure transition per request that produces nothing.
+#
+# This file removes that by never sleeping: one DiT, permanently resident.
+#
+#   plain 8-step request   ~15.8 s  ->  ~11.6 s   (the 4.16 s transition, gone)
+#   boot to first request  ~260 s   ->  ~107 s    (no AR init 139.83 s + sleep 13.15 s)
+#
+# THE COST IS ABSOLUTE, NOT A TUNING KNOB: there is no AR engine here, so
+# bot_task=think / recaption / think_recaption have nothing to run on. Chain-of-
+# thought and prompt rewriting are GONE, not slower. Only use this where the caller
+# supplies its own final prompt. If any traffic needs reasoning, deploy the
+# residency pair instead and fix the transition cost there rather than here.
+#
+# Deliberately unchanged from hunyuan_image3_dit_a100_40g.yaml, so the two stay
+# diffable: TP4+EP4 (EP is MANDATORY -- the NF4 loader rejects TP>1 without it),
+# no load_format on the diffusion side, lazy safetensors, 8 steps, guidance_scale
+# 1.0 (NOT 0 -- a falsey 0 is rewritten by OmniDiffusionRequest.__post_init__ and
+# HunyuanImage3 then falls back to 5.0, giving cfg_factor 2 and two backbone
+# forwards per step). See that file's header for the full reasoning on each.
+#
+# Measured headroom at TP4 is 2921 MiB/card (peak 38039 / 40960, 7-case i2i soak,
+# /nfs-output/hy3-cards-20260906/out_A2_tp4_u90). Enough, but not enough to also
+# host a second model -- keep one instance per node.
+#
+# Requires --gpus '"device=0,1,2,3"'.
+pipeline: hunyuan_image3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    devices: "0,1,2,3"
+    distributed_executor_backend: "mp"
+    safetensors_load_strategy: lazy
+    # THE line that differs from the residency sibling. Level-1 sleep exists to let
+    # AR and DiT trade the same four cards; with no AR there is nothing to trade
+    # with, and leaving it on would only re-introduce the 4.16 s per request.
+    enable_sleep_mode: false
+    # Left off deliberately: measured peak was reached WITHOUT slicing/tiling, and
+    # tiling visibly changes output (PSNR 22-25 dB vs untiled). TP4 has the headroom.
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      enable_expert_parallel: true
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 1.0
+      seed: 42

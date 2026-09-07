@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared prompt-template construction for HunyuanImage-3.0-Instruct.
 
 Single source of truth for the AR-prefill prompt format used by the
@@ -215,6 +216,30 @@ def resolve_stop_token_ids(
 
 
 # Upstream "Multi-Image Fusion" caps reference images at 3 per request.
+#
+# This is a QUALITY boundary, not a capacity one, and raising it is a regression.
+# Nothing stops a 4th image mechanically: reference-image tokens carry 2D
+# intra-image RoPE (hunyuan_image3_transformer.py, image_rope2d_emb) rather than
+# sequence positions, so they never touch the 22800 max_position_embeddings
+# budget, and a diffusion stage in the default dense KV mode does not enforce a
+# max_model_len at all. Measured on 4x A100-40G: 8 reference images ran fine and
+# cost only +1.5 GiB/card over 3 (30195 -> 31695 MiB).
+#
+# What breaks is the output. A controlled run (identical seed; the same inputs
+# submitted first and last in one batch came back byte-identical at 99 dB, so the
+# pipeline is deterministic and these deltas are signal):
+#
+#   3 slots / 3 subjects  vs  4 slots / 3 subjects   9.25 dB
+#   4 slots / 3 subjects  vs  4 slots / 4 subjects   8.68 dB
+#   3 slots, third subject swapped                  12.51 dB
+#
+# The second case's 4th slot is a DUPLICATE of an image already present -- no new
+# subject, no extra crowding in the fixed ~1 Mpx frame -- and it still perturbs
+# the output as much as a genuinely new subject, more than swapping a subject
+# within 3 slots does. Human review of those outputs: the 3-slot results track
+# the uploaded references; both 4-slot results visibly drift from them, with the
+# people worst affected. So it is the SLOT COUNT that leaves the training
+# distribution, whatever the slot contains.
 MAX_IMAGES_PER_REQUEST = 3
 
 

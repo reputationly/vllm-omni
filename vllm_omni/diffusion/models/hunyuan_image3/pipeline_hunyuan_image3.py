@@ -3,6 +3,8 @@
 
 import copy
 import logging
+import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -33,6 +35,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
+from vllm_omni.platforms import current_omni_platform
 
 from . import request_layout as request_layout_utils
 from .hunyuan_image3_tokenizer import TokenizerEncodeOutput, TokenizerWrapper
@@ -73,6 +76,14 @@ _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
+
+# Park the DiT in host RAM for the duration of the VAE decode. Same lever as
+# MiniMax-H3's VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE and LTX-2's equivalent, but
+# NOT the same precondition: those two only undo an offload group that
+# model-level CPU offload already owns, whereas HunyuanImage-3's NF4 weights are
+# natively resident, so this one does the move itself and must put them back.
+# Default off — see _offload_dit_before_vae for the measured trade.
+HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE"
 
 
 def _config_flag(config: Any, name: str) -> bool:
@@ -2263,6 +2274,133 @@ class HunyuanImage3Pipeline(
         )[0].to(dtype=latent_dtype)
         state.step_index += 1
 
+    def _dit_parameter_bytes(self) -> int:
+        total = 0
+        for name in self._dit_modules:
+            module = getattr(self, name, None)
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                total += parameter.data.numel() * parameter.data.element_size()
+        return total
+
+    def _offload_dit_before_vae(self) -> bool:
+        """Park the DiT in host RAM while the VAE decodes. Returns True if it moved.
+
+        Unlike MiniMax-H3 and LTX-2, whose same-named methods only release DiTs that
+        model-level CPU offload already manages, HunyuanImage-3's NF4 weights are
+        natively resident, so this performs the move itself and the caller MUST pair
+        it with :meth:`_restore_dit_after_vae`.
+
+        MEASURED on 2x A100-40G (TP2+EP2, NF4, 8-step, 3 square reference images --
+        runs S1/S2 under /nfs-output/hy3-cards-20260906). Do not quote the intuition
+        here, quote these; the intuition was wrong by two orders of magnitude:
+
+            parked per rank        20.90 GiB  (self.model only; VAE/vision stay)
+            park                    0.06 s    steady state
+            restore                 1.25 s    ~17 GB/s pinned H2D
+            run peak    39405 -> 39163 MiB    i.e. 242 MiB, NOT 20.90 GiB
+
+        The peak barely moves because the binding phase is DENOISE, not decode --
+        freeing the DiT for the decode window lowers a trough, not the summit. The
+        first park costs 15.3 s because that is when the host pages get pinned;
+        after that ``park`` is nearly free, since the weights are read-only and the
+        offloader reuses the CPU home it already stashed instead of re-copying.
+
+        The reason to enable it anyway is WALL CLOCK UNDER PRESSURE, which is the
+        opposite of what it was built for: with 20.9 GiB handed back for the decode,
+        the caching allocator stops thrashing, and the first (cold) request went
+        38.23 s -> 18.64 s, the hot ones 17.46 -> 13.77 and 10.78 -> 9.19. Net faster
+        despite the 1.3 s round trip.
+
+        What it does NOT do: buy tolerance to external memory pressure. A ballast
+        sweep (pin N GiB/card, then run the worst case) still fails at N=4 and N=6
+        with this ON, and the offload logs ZERO executions in those runs -- they die
+        in denoise before any decode is reached. If you need the peak itself down,
+        this is the wrong lever.
+
+        Off by default: on TP4 there is 2.9 GiB of headroom already and this only
+        adds the round trip.
+        """
+        raw = os.getenv(HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE_ENV)
+        enabled = raw == "1"
+        if not getattr(self, "_dit_offload_decision_logged", False):
+            # Say this out loud exactly once per worker. The switch is read inside the
+            # worker process, so "I exported it" and "the denoiser saw it" are two
+            # different claims, and a silent no-op looks identical to a green run.
+            self._dit_offload_decision_logged = True
+            logger.info(
+                "HunyuanImage-3 pre-VAE DiT offload: %s (%s=%r)",
+                "ENABLED" if enabled else "disabled",
+                HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE_ENV,
+                raw,
+            )
+        if not enabled:
+            return False
+
+        # ``PreTrainedModel.device`` reports the device of the FIRST parameter it
+        # finds, and self.model owns almost all of them -- so reading it after the
+        # move would answer "cpu" and send both the restore and post_decode's
+        # autocast to the host. Latch the accelerator device while it is still true.
+        self._dit_home_device = get_local_device()
+
+        dit_modules = [getattr(self, name) for name in self._dit_modules if hasattr(self, name)]
+        # Already parked (or never resident): skip the sync and empty_cache.
+        if not any(
+            parameter.data.device.type == self._dit_home_device.type
+            for module in dit_modules
+            for parameter in module.parameters()
+        ):
+            return False
+
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook  # noqa: PLC0415
+
+        current_omni_platform.synchronize()
+        started = time.perf_counter()
+        moved_bytes = self._dit_parameter_bytes()
+        for module in dit_modules:
+            # _move_params also chases ``submodule.quant_state``. HunyuanImage-3's
+            # NF4 loader instead hangs its QuantStates off the PARAMETER as
+            # ``bnb_quant_state`` (bnb plugin _bind_quant_states_to_params), which
+            # that sweep does not see. Leaving them on the GPU is correct here and
+            # deliberate: they total 0.022 GiB across the whole checkpoint, and no
+            # dequant runs while the packed weights are away, so the scales are back
+            # in agreement with their weights before anything reads them again.
+            SequentialOffloadHook._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=False,
+                pin_memory=bool(getattr(self.od_config, "pin_cpu_memory", True)),
+            )
+        current_omni_platform.empty_cache()
+        logger.info(
+            "HunyuanImage-3 pre-VAE DiT offload: %.3f s, %.2f GiB parked",
+            time.perf_counter() - started,
+            moved_bytes / 1024**3,
+        )
+        return True
+
+    def _restore_dit_after_vae(self) -> None:
+        """Bring the DiT back before anything can denoise again.
+
+        Paired with :meth:`_offload_dit_before_vae` inside a single ``post_decode``
+        rather than deferred to the next request's first forward: the step-execution
+        and request-level paths reach the denoiser through different entry points,
+        and a restore that one of them skips is an illegal memory access inside a
+        fused MoE kernel with no Python frame to blame.
+        """
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook  # noqa: PLC0415
+
+        started = time.perf_counter()
+        home = getattr(self, "_dit_home_device", None) or get_local_device()
+        for name in self._dit_modules:
+            module = getattr(self, name, None)
+            if module is None:
+                continue
+            SequentialOffloadHook._move_params(module, home, non_blocking=False)
+        current_omni_platform.synchronize()
+        logger.info("HunyuanImage-3 post-VAE DiT restore: %.3f s", time.perf_counter() - started)
+
     def post_decode(
         self,
         state: "StepRequestState",
@@ -2284,8 +2422,18 @@ class HunyuanImage3Pipeline(
         if hasattr(self.vae, "ffactor_temporal"):
             latents = latents.unsqueeze(2)
 
-        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
-            image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        # Read before the offload: self.device follows self.model's parameters, and
+        # parking them would flip it to "cpu" and autocast the decode onto the host.
+        autocast_device_type = self.device.type
+        dit_parked = self._offload_dit_before_vae()
+        try:
+            with torch.autocast(device_type=autocast_device_type, dtype=torch.float16, enabled=True):
+                image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        finally:
+            # Restore even if decode raised: a request that fails must not leave the
+            # engine with its weights on the host, or every later request dies too.
+            if dit_parked:
+                self._restore_dit_after_vae()
         if hasattr(self.vae, "ffactor_temporal"):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
             image = image.squeeze(2)
