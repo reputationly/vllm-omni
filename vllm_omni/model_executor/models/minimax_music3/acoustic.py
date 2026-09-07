@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .chunking import ChunkWindow, chunk_windows, crop_sample_bounds, overlap_mel_length
 from .constants import (
+    ACOUSTIC_DTYPE,
     AR_CHUNK_HOP_FRAMES,
     AR_HIDDEN_SIZE,
     DEFAULT_DIT_CFG_SCALE,
@@ -247,8 +248,8 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         self.vocoder.load_state_dict(load_component_state(root, VOCODER_DIR), strict=True)
 
         device = self.vllm_config.device_config.device
-        self.dit.to(device=device, dtype=torch.float32).eval()
-        self.vocoder.to(device=device, dtype=torch.float32).eval()
+        self.dit.to(device=device, dtype=ACOUSTIC_DTYPE).eval()
+        self.vocoder.to(device=device, dtype=ACOUSTIC_DTYPE).eval()
         folded = remove_weight_norm(self.vocoder)
         self._loaded = True
 

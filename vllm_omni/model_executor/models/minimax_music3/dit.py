@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Condition encoder and flow-matching transformer for MiniMax Music 3.
 
 Stage 1 turns the AR stage's conditioning frames into a DAC latent in two
@@ -21,8 +21,10 @@ model picks up the same backend selection, sequence-parallel plumbing and
 KV-quant policy as every other transformer in the tree. That layer resolves
 its backend from the diffusion config, which an ``LLM_GENERATION`` stage such
 as this one does not set; it tolerates that and falls through to the platform
-default. If it cannot be built at all the block runs plain SDPA instead, a
-choice made once when the blocks are built and never inside ``forward``.
+default. That default is a half-precision kernel while this stage decodes in
+``ACOUSTIC_DTYPE`` (float32), so the blocks ask the resolved backend whether it
+accepts that dtype and run plain SDPA when it does not -- a choice made once
+when the blocks are built and never inside ``forward``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from torch.nn import functional as F
 from vllm.logger import init_logger
 
 from .constants import (
+    ACOUSTIC_DTYPE,
     AR_HIDDEN_SIZE,
     BACKBONE_HIDDEN_SIZE,
     CONDITION_INPUT_HOP,
@@ -137,7 +140,7 @@ def _build_native_attention(*, num_heads: int, head_size: int, softmax_scale: fl
     try:
         from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 
-        return DiffusionAttention(
+        layer = DiffusionAttention(
             num_heads=num_heads,
             head_size=head_size,
             causal=False,
@@ -150,12 +153,29 @@ def _build_native_attention(*, num_heads: int, head_size: int, softmax_scale: fl
         _NATIVE_ATTENTION_UNAVAILABLE = repr(exc)
         logger.warning(
             "MiniMax Music 3 DiT could not build the diffusion attention layer "
-            "(%s); running torch SDPA instead. The stage decodes in float32, "
-            "for which the diffusion layer dispatches to SDPA anyway, so this "
-            "changes performance bookkeeping and not the audio.",
+            "(%s); running torch SDPA instead. The audio is unchanged.",
             exc,
         )
         return None
+
+    # This stage is LLM_GENERATION, so it sets no diffusion config and the
+    # layer falls through to the platform default -- FLASH_ATTN on CUDA, whose
+    # kernel takes fp16/bf16/fp8 only. Since the whole stage runs in
+    # ACOUSTIC_DTYPE (float32), that default cannot serve this model: it raises
+    # inside the CUDA kernel on the first request, which kills the stage's
+    # engine core and fails every request on it, not just the one that tripped
+    # it. Asking here keeps the choice where the docstring says it is -- made
+    # once when the blocks are built, never inside ``forward``.
+    if not layer.attn_backend.supports_activation_dtype(ACOUSTIC_DTYPE):
+        _NATIVE_ATTENTION_UNAVAILABLE = f"{layer.attn_backend.get_name()} does not support {ACOUSTIC_DTYPE}"
+        logger.info(
+            "MiniMax Music 3 DiT runs torch SDPA: the resolved diffusion attention "
+            "backend %s does not accept %s, which is the dtype this stage decodes in.",
+            layer.attn_backend.get_name(),
+            ACOUSTIC_DTYPE,
+        )
+        return None
+    return layer
 
 
 class Attention(nn.Module):

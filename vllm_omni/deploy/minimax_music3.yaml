@@ -110,7 +110,8 @@ stages:
     # weights plus per-window latents and activations.
     gpu_memory_utilization: 0.2
     # The flow-matching solver degrades measurably in bfloat16
-    # (SUPPORTED_ACOUSTIC_DTYPES in models/minimax_music3/constants.py).
+    # (ACOUSTIC_DTYPE in models/minimax_music3/constants.py, which is what the
+    # stage actually casts to; this key does not override it).
     dtype: float32
     enforce_eager: true
     # Async scheduling builds per-request payloads against the NEXT step's

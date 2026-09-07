@@ -112,6 +112,23 @@ class AttentionBackend(ABC):
         supported_head_sizes = cls.get_supported_head_sizes()
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
+    @staticmethod
+    def get_supported_activation_dtypes() -> tuple[torch.dtype, ...]:
+        """Q/K/V dtypes this backend accepts; empty means no restriction.
+
+        A backend that restricts this rejects other dtypes inside its kernel,
+        where the failure surfaces as a dead engine core rather than a failed
+        request: the stage is evicted and every in-flight request on it fails.
+        Declaring the constraint lets a caller pick a compatible path while
+        it is still building the model.
+        """
+        return ()
+
+    @classmethod
+    def supports_activation_dtype(cls, dtype: torch.dtype) -> bool:
+        supported = cls.get_supported_activation_dtypes()
+        return (not supported) or dtype in supported
+
     @classmethod
     def indexes_kv_by_block_stride(cls) -> bool:
         """Whether this backend reads K/V pages by the runtime block stride.

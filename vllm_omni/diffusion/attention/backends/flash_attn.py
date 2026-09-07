@@ -57,6 +57,14 @@ class FlashAttentionBackend(AttentionBackend):
         return [64, 96, 128, 192, 256]
 
     @staticmethod
+    def get_supported_activation_dtypes() -> tuple[torch.dtype, ...]:
+        # Enforced by the kernel itself: "FlashAttention only supports fp16,
+        # bf16, and fp8_e4m3 data type" (flash_api_stable.cpp). Reaching that
+        # check costs the whole stage, so callers that know their activation
+        # dtype should ask before building the layer.
+        return (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+
+    @staticmethod
     def get_name() -> str:
         return "FLASH_ATTN"
 

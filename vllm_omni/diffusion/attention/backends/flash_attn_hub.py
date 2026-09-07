@@ -96,6 +96,11 @@ class FlashAttentionHubBackend(AttentionBackend):
         return [64, 96, 128, 192, 256]
 
     @staticmethod
+    def get_supported_activation_dtypes() -> tuple[torch.dtype, ...]:
+        # Same kernel-level constraint as the in-tree FLASH_ATTN backend.
+        return (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+
+    @staticmethod
     def get_name() -> str:
         return "FLASH_ATTN_HUB"
 
@@ -262,6 +267,11 @@ class FlashAttention3HubBackend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 96, 128, 192, 256]
+
+    @staticmethod
+    def get_supported_activation_dtypes() -> tuple[torch.dtype, ...]:
+        # Same kernel-level constraint as the in-tree FLASH_ATTN backend.
+        return (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
 
     @staticmethod
     def get_name() -> str:

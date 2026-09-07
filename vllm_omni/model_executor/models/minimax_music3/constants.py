@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Inference-contract constants for MiniMax Music 3.
 
 These values are fixed by the checkpoint, not tuning knobs. Changing any of
 them changes the audio, so they are declared once here and imported
 everywhere rather than re-derived per call site.
 """
+
+import torch
 
 # --- Generation limits -----------------------------------------------------
 
@@ -73,13 +75,20 @@ HOP_MEL_FRAMES = 344
 BLEND_MEL_FRAMES = HOP_MEL_FRAMES // 4
 DAV_HOP_SAMPLES = 512
 
-# Only these two dtypes are supported for the acoustic stage. float32 is the
-# default: TF32 keeps it affordable, and bfloat16 measurably degrades the
-# solver.
-SUPPORTED_ACOUSTIC_DTYPES = frozenset({"float32", "bfloat16"})
+# The dtype the whole acoustic stage runs in: the condition encoder, the DiT
+# and the vocoder are all cast to it, and it is what reaches the attention
+# backend. float32 because TF32 keeps it affordable while bfloat16 measurably
+# degrades the flow-matching solver.
+#
+# This is the single source of truth. It used to be a set of dtype *names*
+# that nothing read, while acoustic.py hardcoded float32 and dit.py assumed
+# the attention layer would notice -- so the stage loaded with a half-precision
+# attention backend and died on its first request.
+ACOUSTIC_DTYPE = torch.float32
 
 
 __all__ = [
+    "ACOUSTIC_DTYPE",
     "AR_CFG_SCALE",
     "AR_CFG_TOP_K",
     "AR_CHUNK_FRAMES",
@@ -107,5 +116,4 @@ __all__ = [
     "NUM_CODEBOOKS",
     "OUTPUT_CHANNELS",
     "OUTPUT_SAMPLE_RATE",
-    "SUPPORTED_ACOUSTIC_DTYPES",
 ]
