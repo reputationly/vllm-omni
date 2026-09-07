@@ -68,6 +68,7 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     TRTLLM_ATTN = "vllm_omni.diffusion.attention.backends.trtllm_attn.TrtllmAttentionBackend"
     RAINFUSION_ATTN = "vllm_omni.diffusion.attention.backends.rainfusion_attn.RainFusionAttentionBackend"
     SLA_ATTN = "vllm_omni.diffusion.attention.backends.sla_attn.SLAAttentionBackend"
+    VDN_WINDOW_ATTN = "vllm_omni.diffusion.attention.backends.vdn_window_attn.VDNWindowAttentionBackend"
     SLA_SAGE2_ATTN = "vllm_omni.diffusion.attention.backends.sla_sage2_attn.SLASage2AttentionBackend"
 
     def get_path(self, include_classname: bool = True) -> str:

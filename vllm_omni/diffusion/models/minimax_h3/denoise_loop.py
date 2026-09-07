@@ -33,7 +33,41 @@ from .scheduling_minimax_h3_euler_ancestral import (
 
 logger = init_logger(__name__)
 
+
+def _prompt_row_span(token_tags: torch.Tensor) -> tuple[int, int] | None:
+    """The first contiguous run of prompt rows, as host ints, or None if there is none.
+
+    Consumed by the VDN linear branch, whose two directional scans start from a state
+    written by the prompt. It deliberately wants the PROMPT rows rather than the
+    attention's "globals" (text and audio): the branch is being given a condition, and
+    the soundtrack is not one.
+
+    fl2va and ref2va override part of the text region with reference-image rows, so the
+    prompt is the leading run rather than the whole region. VDN only ever trained on
+    t2va, where the two are the same thing; the shorter run is flagged because it is the
+    layout going off the distribution the branch was trained on, not a bug here.
+    """
+    tags = token_tags.view(-1)
+    is_text = tags == MINIMAX_H3_TEXT_TAG
+    text_rows = int(is_text.sum())
+    if not text_rows:
+        return None
+    start = int(torch.argmax(is_text.to(torch.uint8)))
+    run = int((~is_text[start:]).to(torch.uint8).argmax()) if not bool(is_text[start:].all()) else len(tags) - start
+    if run < text_rows:
+        logger.warning_once(
+            "MiniMax-H3 packed layout interleaves %d prompt rows with other modalities; the VDN "
+            "branch will seed its scans from the leading %d. VDN was trained on t2va, where the "
+            "prompt region is contiguous.",
+            text_rows,
+            run,
+        )
+    return start, start + run
+
+
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
+# Modality tag for prompt rows, as ``packed_sequence`` writes it.
+MINIMAX_H3_TEXT_TAG = 1
 # ref2va audio reference anchor timestep
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # Packed row widths: video rows are [1,2,2]-patchified 24-channel latents
@@ -198,6 +232,7 @@ class MiniMaxH3DenoiseBranch:
                 prefix_len=int(packed["video_row_start"]),
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
             )
+        self.static_kwargs["packed_seq_params"]["vdn_text_span"] = _prompt_row_span(token_tags)
 
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.

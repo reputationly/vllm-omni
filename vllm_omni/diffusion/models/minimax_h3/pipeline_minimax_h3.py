@@ -109,7 +109,7 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
-from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
+from .fasth3 import FastH3WeightFusion, _resolve_dit_attention_backend, resolve_fasth3_fusion
 from .keyframes import prepare_fl2va_keyframes
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
@@ -170,6 +170,8 @@ from .time_request import (
     minimax_h3_time_shift_sigmas,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vdn import VDNCheckpoint, resolve_vdn_checkpoint
+from .vdn_hybrid import validate_hybrid_runtime
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -1351,6 +1353,7 @@ class MiniMaxH3Pipeline(
     strategy = legacy_strategy()
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
+    _vdn: VDNCheckpoint | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -1659,6 +1662,20 @@ class MiniMaxH3Pipeline(
                 audio_shift=self.default_audio_shift,
             )
 
+        self._vdn = resolve_vdn_checkpoint(od_config, self.transformer)
+        if self._vdn is not None:
+            parallel = getattr(od_config, "parallel_config", None)
+            # Refuse before loading 72 GB: pairing the branch with a dense attention, or
+            # sharding the sequence it scans over frames, renders a plausible video that
+            # is not this model, and neither would raise on its own.
+            validate_hybrid_runtime(
+                attention_backend=_resolve_dit_attention_backend(od_config),
+                ulysses_degree=int(getattr(parallel, "ulysses_degree", 1) or 1),
+                ring_degree=int(getattr(parallel, "ring_degree", 1) or 1),
+                allgather_degree=int(getattr(parallel, "allgather_degree", 1) or 1),
+            )
+            self.transformer.enable_vdn_branches(**self._vdn.spec.branch_kwargs())
+
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
                 str(model_path),
@@ -1768,6 +1785,11 @@ class MiniMaxH3Pipeline(
                 # Fuse before the model shards anything, which is also the only
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
                 stream = self._fasth3.apply(stream)
+            if prefix == "transformer." and self._vdn is not None:
+                # Same point, same reason. VDN additionally APPENDS its branch
+                # tensors to the stream, so they reach load_weights as ordinary
+                # named parameters of the modules enable_vdn_branch built.
+                stream = self._vdn.apply(stream)
             loaded = component.load_weights(stream)
             if prefix == "transformer.":
                 transformer_loaded = set(loaded)
@@ -1789,12 +1811,14 @@ class MiniMaxH3Pipeline(
             # load_weights only warns on a parameter the model does not have, so
             # close the adapter against what the DiT actually consumed.
             self._fasth3.validate_fully_applied(transformer_loaded)
+        if self._vdn is not None:
+            self._vdn.validate_fully_applied(transformer_loaded)
         return loaded_with_prefix
 
     @property
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None
+        return self._fasth3 is not None or self._vdn is not None
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
         if task == "ref2va" and hasattr(self, "transformers_ref"):
@@ -1864,6 +1888,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         if self._fasth3 is not None:
             self._fasth3.check_task(task)
+        if self._vdn is not None:
+            self._vdn.check_task(task)
         return task
 
     def _resolve_shape(
@@ -3003,6 +3029,12 @@ class MiniMaxH3Pipeline(
             self._validate_native_sampling(sampling, task=task)
         if self._fasth3 is not None:
             self._fasth3.check_request(
+                sampling,
+                video_shift=self.default_video_shift,
+                audio_shift=self.default_audio_shift,
+            )
+        if self._vdn is not None:
+            self._vdn.check_request(
                 sampling,
                 video_shift=self.default_video_shift,
                 audio_shift=self.default_audio_shift,

@@ -18,7 +18,7 @@ import regex as re
 import torch
 import torch.nn as nn
 from cache_dit import ForwardPattern
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -50,6 +50,10 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import (
+    VDNHybridAttention,
+    combine_hybrid_output,
+)
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -543,6 +547,12 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        # VDN-H3 hybrid extras, built the same way and for the same reason: they exist
+        # only when a VDN checkpoint is being loaded, and a dense H3 must not carry
+        # parameters no checkpoint fills.
+        self.vdn: VDNHybridAttention | None = None
+        self._vdn_prefix = prefix
+        self._vdn_arch = arch
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -576,6 +586,35 @@ class MiniMaxH3Attention(nn.Module):
             prefix=self._gate_prefix,
         )
         nn.init.zeros_(self.to_gate_compress.weight)
+
+    def enable_vdn_branch(self, **window_config: Any) -> None:
+        """Build the VDN hybrid extras this attention would otherwise lack.
+
+        Called before ``load_weights`` so the checkpoint's branch tensors have
+        parameters to land on, exactly like ``enable_vsa_gate``. It also flips
+        ``out_proj`` off its own all-reduce: from here the two row-parallel projections
+        share one collective, which is worth about a third of a block at the 15 s shape
+        (see ``vdn_hybrid``).
+        """
+        if self.vdn is not None:
+            return
+        arch = self._vdn_arch
+        self.vdn = VDNHybridAttention(
+            hidden_size=arch.hidden_size,
+            total_heads=self.total_num_heads,
+            head_dim=self.head_dim,
+            params_dtype=_BF16_DTYPE,
+            quant_config=self._gate_quant_config,
+            prefix=self._vdn_prefix,
+            # The branch reads THIS attention's raw q/k/v, so it must use THIS
+            # attention's head shard. Letting it derive one independently means two
+            # views of the same split that can disagree: the branch's fallback asks the
+            # diffusion parallel state, which can be uninitialised while vLLM's TP group
+            # (the one qkv_proj actually sharded on) is live.
+            head_shard=(get_tensor_model_parallel_rank() * self.num_heads, self.num_heads),
+            **window_config,
+        )
+        self.out_proj.reduce_results = False
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -714,6 +753,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        vdn_text_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -725,6 +765,11 @@ class MiniMaxH3Attention(nn.Module):
         Each rank attends the full sequence with heads/world_size local heads,
         so cu_seqlens retains global packed-document semantics. The inverse
         all-to-all restores the row shard before the output projection.
+
+        On a VDN checkpoint the attention is hybrid: the packed call runs the
+        chunk-aligned window, a per-head gate scales it back toward the softmax mass it
+        actually captured, and the linear branch adds what the window dropped. See
+        ``vdn_hybrid``.
         """
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
@@ -734,6 +779,11 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
+        # The linear branch consumes the RAW projections -- pre-QK-norm, pre-RoPE -- so
+        # it adds no projection cost and, under a merged LoRA, sees the adapted weights
+        # for free. Holding the references is safe because the fused kernel declares
+        # ``mutates_args=[]`` and the unfused path is out-of-place too.
+        qkv_raw = (q, k, v) if self.vdn is not None else None
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -774,9 +824,22 @@ class MiniMaxH3Attention(nn.Module):
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
         )
-        out = out.reshape(total, self.num_heads * self.head_dim)
-        out, _ = self.out_proj(out)
-        return out
+        if self.vdn is None:
+            out = out.reshape(total, self.num_heads * self.head_dim)
+            out, _ = self.out_proj(out)
+            return out
+
+        # `used_len` the same way _run_packed_attention and the window backend derive
+        # it, so all three agree on where the packing's alignment padding starts.
+        used_len = min(max_seqlen, packed_total if packed_total is not None else total)
+        geometry = self.vdn.plan_geometry(video_layout, used_len)
+        # out_proj no longer reduces (enable_vdn_branch), so this is a partial sum.
+        out, _ = self.out_proj(self.vdn.gate_softmax(out, x))
+        branch_partial = video_span = None
+        if geometry is not None:
+            branch_partial, start, stop = self.vdn.readout(x, qkv_raw, geometry=geometry, text_span=vdn_text_span)
+            video_span = (start, stop)
+        return combine_hybrid_output(out, branch_partial, video_span)
 
 
 class MiniMaxH3MLP(nn.Module):
@@ -1006,6 +1069,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        vdn_text_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1042,6 +1106,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            vdn_text_span=vdn_text_span,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1350,6 +1415,18 @@ class MiniMaxH3DiTModel(nn.Module):
         for block in self.blocks:
             block.attn.enable_vsa_gate()
         self.vsa_gates_enabled = True
+
+    def enable_vdn_branches(self, **window_config: Any) -> None:
+        """Give every DiT block's attention its VDN hybrid extras.
+
+        The branch tensors name parameters the base transformer does not have, so the
+        modules must exist before the weight stream reaches them; ``load_weights`` only
+        logs a skip for a name it cannot place, and the layer would then run an
+        unpopulated branch. The token refiner is left alone -- it attends over text
+        only, where there is no frame axis to window, and VDN never converts it.
+        """
+        for block in self.blocks:
+            block.attn.enable_vdn_branch(**window_config)
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1671,6 +1748,13 @@ class MiniMaxH3DiTModel(nn.Module):
         # that omits it is packing a single request.
         num_requests = int(self._psp_optional(psp, "num_requests", 1))
         vsa_prefix_segments = tuple(int(length) for length in self._psp_optional(psp, "vsa_prefix_segments", ()))
+        # Where the PROMPT rows sit. Distinct from the attention's global rows on
+        # purpose: those are text AND audio, while the VDN branch's text state must see
+        # the prompt and not the soundtrack. Resolved on the host by the producer, so no
+        # attention layer reads token_tags off the device.
+        vdn_text_span = self._psp_optional(psp, "vdn_text_span", None)
+        if vdn_text_span is not None:
+            vdn_text_span = (int(vdn_text_span[0]), int(vdn_text_span[1]))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1753,6 +1837,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                vdn_text_span=vdn_text_span,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
