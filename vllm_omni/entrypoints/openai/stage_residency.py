@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Mutually-exclusive GPU residency for engines that cannot be awake together.
 
 Some models are too large for every stage to hold GPU weights simultaneously,
@@ -362,6 +362,33 @@ class ExclusiveResidency:
             # untracked and the next wake would overshoot the budget.
             self._resident.add(group.label)
             raise ResidencyError(f"[{request_id}] wake_up({group.label}) failed: {'; '.join(failures)}")
+        # An AR engine is NOT admitting requests yet at this point. AsyncOmni.sleep()
+        # sets ``_hold_admission_until_resume`` for AR/mixed stages, and wake_up()
+        # deliberately leaves ``_paused`` set in that case — the trainer flow it was
+        # built for is pause -> abort -> sleep -> train -> wake -> resume, so the
+        # caller decides when to re-admit (async_omni.py, wake_up docstring).
+        #
+        # Residency is an inference flow with no such step, so without this the AR
+        # engine wakes, reports success, and then every generate() blocks forever on
+        # ``_pause_cond``: no error, no GPU work, the task sits in "processing" and —
+        # because the session still holds the residency mutex — every later request
+        # queues behind it. Reproduced end to end before this fix (all four workers
+        # idle on "Poller timed out", GPU utilisation flat 0%).
+        #
+        # Diffusion-only groups never set the flag, so resume is a no-op for them;
+        # call it unconditionally rather than branching on role, so a group that
+        # gains an AR stage later cannot silently regress.
+        resume = getattr(group.engine, "resume_generation", None)
+        if callable(resume):
+            try:
+                await resume(stage_ids=group.stage_ids_arg)
+            except Exception as exc:
+                # Same treatment as a failed wake: it IS resident now, so let the
+                # session's safety sweep put it back to sleep instead of leaving a
+                # warm-but-unusable engine holding the cards.
+                self._resident.add(group.label)
+                raise ResidencyError(f"[{request_id}] resume_generation({group.label}) raised: {exc}") from exc
+
         self._resident.add(group.label)
         logger.info("Residency: %r awake (request %s)", group.label, request_id)
 

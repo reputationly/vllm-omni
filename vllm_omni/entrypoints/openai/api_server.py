@@ -5676,6 +5676,21 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     if not hasattr(engine_client, "wake_up"):
         raise HTTPException(status_code=501, detail="Engine does not support wake_up")
     acks = await engine_client.wake_up(stage_ids=request.stage_ids)
+    # Waking an AR stage is not enough to make it serve again: AsyncOmni.sleep()
+    # sets ``_hold_admission_until_resume`` for AR/mixed stages and wake_up()
+    # deliberately keeps ``_paused`` in that case, because it was built for the
+    # trainer order pause -> abort -> sleep -> train -> wake -> resume.
+    #
+    # This endpoint pair is plain serving, not training: there is no /v1/omni/pause
+    # and no /v1/omni/resume, so a caller who slept and woke an AR stage would get
+    # SUCCESS here and then have every generate() block forever on ``_pause_cond``
+    # with no endpoint left to recover it. Resume on the way out.
+    #
+    # No-op for diffusion-only engines (they never set the flag), so this is not
+    # gated on stage role — a deployment that gains an AR stage must not regress.
+    resume = getattr(engine_client, "resume_generation", None)
+    if callable(resume):
+        await resume(stage_ids=request.stage_ids)
     for sid in request.stage_ids:
         if sid in sleeping_set:
             sleeping_set.remove(sid)
