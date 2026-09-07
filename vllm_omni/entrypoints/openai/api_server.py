@@ -2242,7 +2242,31 @@ async def generate_images(
         prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
-        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
+        # Seed from the DEPLOY YAML's default_sampling_params, exactly as
+        # /v1/tasks/image/ does. Starting blank here drops the shipped defaults and
+        # lands on the pipeline's own fallback -- measured on
+        # HunyuanImage-3.0-Instruct-Distil, whose deploy config asks for
+        # num_inference_steps: 8: a request that simply omitted the field ran 50
+        # steps in 36.0 s, against 5.5 s with steps=8. Same 6x blowup the tasks
+        # route documents, on the route a gateway is most likely to call.
+        #
+        # It has to be this source, not apply_stage_default_sampling_params below:
+        # that one reads the CLI --default-sampling-params JSON, which is a
+        # DIFFERENT and usually empty channel. Seeding from it alone leaves the
+        # deploy YAML just as ignored (verified: patched-vs-stock A/B both still
+        # ran 50 steps until this was switched to the engine-client defaults).
+        stage_defaults = get_default_sampling_params_list(engine_client)
+        if stage_defaults:
+            gen_params = clone_sampling_params(stage_defaults[0])
+        else:
+            gen_params = OmniDiffusionSamplingParams()
+        # Legacy CLI-level defaults still apply on top of the YAML.
+        apply_stage_default_sampling_params(
+            getattr(getattr(raw_request.app.state, "args", None), "default_sampling_params", None),
+            gen_params,
+            "0",
+        )
+        _update_if_not_none(gen_params, "num_outputs_per_prompt", request.n)
         extra_args = dict(request.extra_params or {})
         if request.use_system_prompt is not None:
             extra_args["use_system_prompt"] = request.use_system_prompt
