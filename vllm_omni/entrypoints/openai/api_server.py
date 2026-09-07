@@ -2488,7 +2488,16 @@ async def edit_images(
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
-        gen_params = OmniDiffusionSamplingParams()
+        # 3.0a Seed from the DEPLOY YAML's default_sampling_params. The CLI-level
+        # apply_stage_default_sampling_params() below is a DIFFERENT and usually
+        # empty channel, so on its own it leaves the YAML unread and the pipeline's
+        # built-in default wins -- measured on HunyuanImage-3.0-Instruct-Distil
+        # (YAML asks for num_inference_steps: 8): an edit request that omitted the
+        # field ran 50 steps in 29.7 s, while the same route with an explicit
+        # steps=8 and THREE reference images took 10.3 s. i2i is the editing route,
+        # so this is the one production image-edit traffic actually lands on.
+        stage_defaults = get_default_sampling_params_list(engine_client)
+        gen_params = clone_sampling_params(stage_defaults[0]) if stage_defaults else OmniDiffusionSamplingParams()
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
