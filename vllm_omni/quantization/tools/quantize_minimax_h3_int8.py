@@ -108,6 +108,10 @@ def link_or_copy(src: str, dst: str) -> None:
     os.symlink(os.path.realpath(src), dst)
 
 
+# Both spellings an H3 transformer/ directory is published under.
+INDEX_NAMES = ("model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", required=True, help="FL2VA/Ref2VA partition root (contains transformer/)")
@@ -129,9 +133,19 @@ def main() -> int:
     args = ap.parse_args()
 
     src_tf = os.path.join(args.src, "transformer")
-    index_path = os.path.join(src_tf, "model.safetensors.index.json")
-    if not os.path.isfile(index_path):
-        sys.exit(f"no safetensors index at {index_path}")
+    # H3 partitions ship under either spelling: our own native artifacts use
+    # `model.safetensors.index.json`, while the diffusers-named ones (the curve-pruned
+    # FL2VA base among them) use `diffusion_pytorch_model.safetensors.index.json`. The
+    # output keeps whichever name the source used, because that is the name the loader
+    # for that partition looks for -- normalising it here would produce a checkpoint
+    # whose shards nothing can find.
+    index_name = next(
+        (name for name in INDEX_NAMES if os.path.isfile(os.path.join(src_tf, name))),
+        None,
+    )
+    if index_name is None:
+        sys.exit(f"no safetensors index at {src_tf} (looked for {', '.join(INDEX_NAMES)})")
+    index_path = os.path.join(src_tf, index_name)
 
     with open(index_path, encoding="utf-8") as fh:
         index = json.load(fh)
@@ -220,11 +234,11 @@ def main() -> int:
     # byte count of every tensor written above.
     index_metadata = dict(index.get("metadata", {}))
     index_metadata["total_size"] = total_dst
-    with open(os.path.join(dst_tf, "model.safetensors.index.json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(dst_tf, index_name), "w", encoding="utf-8") as fh:
         json.dump({"metadata": index_metadata, "weight_map": new_weight_map}, fh, indent=2)
 
     for extra in os.listdir(src_tf):
-        if extra.endswith(".safetensors") or extra in ("config.json", "model.safetensors.index.json"):
+        if extra.endswith(".safetensors") or extra == "config.json" or extra in INDEX_NAMES:
             continue
         shutil.copy2(os.path.join(src_tf, extra), os.path.join(dst_tf, extra))
 

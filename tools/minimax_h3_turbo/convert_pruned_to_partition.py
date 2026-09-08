@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Rewrite an AdaLN-pruned Diffusers transformer into the vLLM partition layout.
 
 vLLM-Omni loads the pruned Diffusers shards directly — ``load_weights`` fuses
@@ -50,6 +53,11 @@ try:
     from safetensors.torch import save_file
 except ImportError as exc:  # pragma: no cover - environment problem, not logic
     sys.exit(f"missing dependency: {exc}. Run inside the vllm-omni image or a venv with torch+safetensors.")
+
+try:
+    from vllm_omni.diffusion.models.minimax_h3.vdn import VDN_BAKED_STAMP_KEY
+except ImportError:  # this tool only needs torch+safetensors; keep it runnable without the package
+    VDN_BAKED_STAMP_KEY = "vdn_baked_adapters"
 
 DIFFUSERS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 PARTITION_INDEX = "model.safetensors.index.json"
@@ -262,6 +270,14 @@ def convert_config(source: dict) -> dict:
     if missing:
         raise ValueError(f"pruned config is missing fields: {missing}")
     config.update({field: normalized[field] for field in CONFIG_FIELDS})
+    # The VDN bake stamp is a fact about the WEIGHTS, and this rewrite is pure layout,
+    # so it has to survive. Dropping it makes a baked partition claim it is raw, and
+    # ``check_bake_agreement`` then refuses to serve it with the branch-only artifact it
+    # belongs to -- or, worse, accepts the full artifact and fuses every adapter a second
+    # time on top of itself. Everything else Diffusers-specific is deliberately not
+    # carried over; this one is not Diffusers plumbing.
+    if VDN_BAKED_STAMP_KEY in source:
+        config[VDN_BAKED_STAMP_KEY] = source[VDN_BAKED_STAMP_KEY]
     # ``auto_map`` points at modeling_minimax_h3_pruned.py, whose module expects
     # the Diffusers names this tool just rewrote.  Leaving it would advertise a
     # class that cannot load these shards.
