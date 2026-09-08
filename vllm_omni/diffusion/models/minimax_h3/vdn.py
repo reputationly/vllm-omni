@@ -266,6 +266,26 @@ class VDNCheckpoint:
         value = self.metadata.get("metadata", {}).get("turbo_num_steps")
         return None if value is None else int(value)
 
+    @property
+    def schedule_shifts(self) -> tuple[float, float] | None:
+        """``(video, audio)`` sigma shifts this artifact was distilled at, if declared.
+
+        The shift belongs to the ARTIFACT, not to the partition. ``model_index.json``
+        states the shifts the base partition was released at -- ref2va's is 6.0 -- but a
+        VDN checkpoint carrying a DMD ``turbo`` adapter was distilled at its own, and
+        sampling it on the partition's schedule samples where the adapter was never
+        trained. That produces a plausible video, so nothing downstream reports it.
+
+        Read from the same ``metadata.json`` block ``turbo_num_steps`` already comes
+        from, which the step guard has always depended on, including for baked artifacts
+        where ``adapters`` is empty.
+        """
+        block = self.metadata.get("metadata", {})
+        video, audio = block.get("video_shift"), block.get("audio_shift")
+        if video is None or audio is None:
+            return None
+        return float(video), float(audio)
+
     # ---- discovery -----------------------------------------------------------------
 
     @classmethod

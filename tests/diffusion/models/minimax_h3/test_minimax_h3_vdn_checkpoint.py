@@ -434,6 +434,33 @@ def test_raw_base_plus_a_branch_only_artifact_is_refused(artifact, tmp_path):
         check_bake_agreement(checkpoint, raw_base)
 
 
+def test_schedule_shifts_come_from_the_artifact(artifact):
+    """The shifts belong to the ARTIFACT, and the pipeline has to prefer them.
+
+    ``model_index.json`` states what the base partition was released at -- ref2va's is
+    6.0, not t2va/fl2va's 12.0 -- while a VDN checkpoint carrying a DMD turbo adapter was
+    distilled at its own. Sampling the adapter on the partition's schedule renders a
+    plausible video from a schedule it never saw, and the same default is what
+    ``check_request`` measures a request against, so the partition's value would ALSO
+    reject the only correct request.
+    """
+    checkpoint = _load(artifact)
+    assert checkpoint.schedule_shifts == (12.0, 3.0)
+    assert checkpoint.turbo_num_steps == 8
+
+
+def test_an_artifact_without_declared_shifts_does_not_claim_any(artifact):
+    """No metadata means no override -- the partition's own schedule must stand.
+
+    Returning a default here instead would silently impose 12.0 on a stage that was
+    trained at something else, which is the failure this property exists to prevent.
+    """
+    (artifact / "metadata.json").write_text(json.dumps({"metadata": {"stage": "b", "step": 2000}}))
+    checkpoint = _load(artifact)
+    assert checkpoint.schedule_shifts is None
+    assert checkpoint.turbo_num_steps is None
+
+
 def test_the_stamp_is_read_off_the_partition_that_was_passed(artifact, tmp_path):
     """``resolve_vdn_checkpoint`` must check the stamp of THIS transformer's partition.
 

@@ -1665,6 +1665,25 @@ class MiniMaxH3Pipeline(
 
         self._vdn = resolve_vdn_checkpoint(od_config, self.transformer)
         if self._vdn is not None:
+            # The artifact's schedule overrides the partition's. `model_index.json` states
+            # what the BASE was released at (ref2va: 6.0), while a VDN checkpoint carrying
+            # a DMD turbo adapter was distilled at its own -- and these defaults are both
+            # what a request without `flow_shift` samples at AND what `check_request`
+            # measures a request against, so leaving the partition's in place either
+            # samples the adapter off its schedule or rejects the only correct request.
+            shifts = self._vdn.schedule_shifts
+            if shifts is not None and (self.default_video_shift, self.default_audio_shift) != shifts:
+                logger.info(
+                    "VDN artifact %s was distilled at flow_shift=%g (audio %g); overriding the "
+                    "%s partition's declared %g/%g for every request on this server.",
+                    self._vdn.source,
+                    shifts[0],
+                    shifts[1],
+                    self.partition,
+                    self.default_video_shift,
+                    self.default_audio_shift,
+                )
+                self.default_video_shift, self.default_audio_shift = shifts
             parallel = getattr(od_config, "parallel_config", None)
             # Refuse before loading 72 GB: pairing the branch with a dense attention, or
             # sharding the sequence it scans over frames, renders a plausible video that

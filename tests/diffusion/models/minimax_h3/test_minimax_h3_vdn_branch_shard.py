@@ -47,8 +47,17 @@ def exact_fp32_matmul():
     torch.backends.cuda.matmul.allow_tf32 = saved_tf32
 
 
-def _branch(monkeypatch, *, tp_size, rank):
-    """A branch built as rank ``rank`` of a ``tp_size``-way tensor-parallel group."""
+def _branch(monkeypatch, *, tp_size, rank, seed=None):
+    """A branch built as rank ``rank`` of a ``tp_size``-way tensor-parallel group.
+
+    ``seed`` fills every parameter deterministically. vLLM's parallel linears allocate
+    with ``torch.empty``, so a branch that is never loaded carries whatever was in those
+    pages: fresh CUDA/host pages read as zeros and the comparison passes while comparing
+    two all-zero models, and pages dirtied by an earlier test produce NaN, which compares
+    unequal to itself and fails. This file's reference branch is used WITHOUT a
+    ``load_state_dict`` -- it is the source of ``full_state`` -- so it has to be filled
+    here or the test is alternately vacuous and flaky depending on what ran before it.
+    """
     from vllm_omni.diffusion.models.minimax_h3 import vdn_branch
 
     monkeypatch.setattr(vdn_branch, "model_parallel_is_initialized", lambda: True)
@@ -56,7 +65,16 @@ def _branch(monkeypatch, *, tp_size, rank):
     monkeypatch.setattr(vdn_branch, "get_tensor_model_parallel_rank", lambda: rank)
     # fp32 so the shard comparison measures the sharding and not bf16 rounding: the
     # whole assertion is that a shard is EXACTLY a slice of the full run.
-    return vdn_branch.VDNLinearBranch(HIDDEN, HEADS, HEAD_DIM, params_dtype=torch.float32)
+    branch = vdn_branch.VDNLinearBranch(HIDDEN, HEADS, HEAD_DIM, params_dtype=torch.float32)
+    if seed is not None:
+        generator = torch.Generator().manual_seed(seed)
+        with torch.no_grad():
+            for parameter in branch.parameters():
+                # Small values: A_log and dt_bias feed exponentials, and N(0,1) there
+                # saturates the forget gate to 0 or 1 for every head, which would make
+                # the comparison pass on a degenerate model.
+                parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.1)
+    return branch
 
 
 def _shard_state(full_state, *, tp_size, rank):
@@ -130,7 +148,7 @@ def test_head_shards_concatenate_to_the_full_run(monkeypatch, tp_size):
     )
 
     with monkeypatch.context() as patch:
-        full = _branch(patch, tp_size=1, rank=0).eval()
+        full = _branch(patch, tp_size=1, rank=0, seed=23).eval()
         with torch.no_grad():
             expected = full(video_x, qkv, **call)
     full_state = full.state_dict()
@@ -139,7 +157,7 @@ def test_head_shards_concatenate_to_the_full_run(monkeypatch, tp_size):
     shards = []
     for rank in range(tp_size):
         with monkeypatch.context() as patch:
-            branch = _branch(patch, tp_size=tp_size, rank=rank).eval()
+            branch = _branch(patch, tp_size=tp_size, rank=rank, seed=100 + rank).eval()
         branch.load_state_dict(_shard_state(full_state, tp_size=tp_size, rank=rank))
         head_slice = slice(rank * local_heads, (rank + 1) * local_heads)
         with torch.no_grad():
