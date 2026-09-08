@@ -1,0 +1,197 @@
+# VDN-MiniMax-H3
+
+> Hybrid window-softmax / linear attention over MiniMax H3, for long clips
+
+## Summary
+
+- Vendor: OpenVDN (derivative of MiniMaxAI/MiniMax-H3)
+- Model: [`OpenVDN/vdn-minimax-h3`](https://huggingface.co/OpenVDN/vdn-minimax-h3)
+- Task: T2VA only
+- Mode: OpenAI-compatible `/v1/videos` HTTP serving
+- Hardware validated: 4x A100-PCIE-40G (TP4)
+- Maintainer: Community
+
+VDN-H3 replaces H3's dense video attention with two branches that partition the
+sequence. A chunk-aligned window keeps each latent frame's attention exact over 15
+frames — three whole VAE chunks, since H3's video VAE codes `17n + 5` pixel frames as
+`5n + 2` latent frames — and a bidirectional linear-attention branch summarises
+everything the window drops. Text, audio and the two anchor frames stay dense in both
+directions.
+
+It ships as a ~5 GB increment over the 72 GB base H3 transformer, not as a release.
+
+## What it is and is not for
+
+**The win scales with clip length, and only with clip length.** The window is a fixed 15
+latent frames while dense attention grows with F². Per DiT block on one A100-PCIE-40G:
+
+| Clip | Latent frames | Window covers | Dense attention | Windowed |
+| --- | --- | --- | --- | --- |
+| 5.2 s | 37 | 40.5% | 220 ms | 115 ms (1.91x) |
+| 6.6 s | 47 | 31.9% | 355 ms | 153 ms (2.33x) |
+| 15.1 s | 107 | 14.0% | 1825 ms | 393 ms (**4.65x**) |
+
+Reproduce with `python benchmarks/diffusion/vdn_h3/bench_window_backend.py --frames 37,47,107`.
+
+At 5-6 s the linear branch costs more than the window saves. Use the dense profiles
+there. This recipe is for 15 s.
+
+**It is orthogonal to few-step distillation.** VDN reduces the cost of each step;
+LightX2V's Turbo LoRA reduces the number of steps. The released `stage-dmd-step-250`
+already carries its own 8-step DMD adapter, so do **not** stack the Turbo LoRA on top —
+that is a different distillation line with a different rank, alpha and target set.
+
+## Measured end to end
+
+15 s / 768p / t2va, VDN at 8 steps against the production quality bar (dense at 20
+steps), on 4x A100-PCIE-40G with TP4. Same prompt, seed, shape and box per row; the
+three `ex*` rows are OpenVDN's own released example prompts (4, 7 and 8 shots, heavy
+camera and subject motion), the `lighthouse` row is a deliberately static scene.
+
+| prompt | VDN 8-step | dense 20-step | speedup | sharpness VDN/dense | frame-to-frame VDN/dense |
+| --- | ---: | ---: | ---: | --- | --- |
+| ex0 ronin (4 shots) | 349 s | 895 s | **2.56x** | 102.3 / 51.2 | 28.84 / 23.86 |
+| ex1 elf (7 shots) | 344 s | 929 s | **2.70x** | 148.7 / 76.2 | 29.90 / 26.18 |
+| ex2 Rhine square (8 shots) | 347 s | 910 s | **2.62x** | 468.2 / 224.0 | 20.58 / 16.29 |
+| lighthouse (static) | 357 s | 885 s | 2.48x | 72.6 / 77.5 | 2.24 / 3.55 |
+
+Sharpness is Laplacian variance, frame-to-frame is mean absolute inter-frame difference;
+both from `benchmarks/diffusion/vdn_h3` metrics over every 6th frame.
+
+Two things to read off this rather than from a single sample:
+
+- On content that actually moves, VDN is **~2x sharper** and carries **14-26% MORE**
+  inter-frame motion than the 20-step dense bar.
+- The static `lighthouse` row disagrees on both counts, and it is the outlier: its
+  inter-frame deltas are 2-3.5 against 20-30 for the released prompts, an order of
+  magnitude less motion. An early version of this recipe generalised from that one
+  prompt and concluded VDN damped motion. It does not; the prompt did.
+
+Per-block under TP4 at the 15 s shape, for where the time goes
+(`torchrun --nproc_per_node=4 benchmarks/diffusion/vdn_h3/bench_tp4_block.py --frames 107`):
+attention 463 -> 100 ms, GEMMs 100 ms unchanged, two all-reduces 267 ms unchanged, branch
++14 ms. The single-card 4.65x lands at roughly 1.7x per block because the collectives do
+not shrink; after VDN, communication is 55% of a block and is where the next optimisation
+belongs. The end-to-end 2.6x above is against 20 steps, so it also carries the 8-step
+adapter -- the two effects are not separated by these numbers.
+
+## fl2va, and the INT8 route
+
+fl2va is served from the same DiT partition VDN adapts, so it runs -- but at 15 s / 768p
+BF16 it OOMs by ~1.5 GiB (the shape already peaks at 34-36 GiB before VDN adds anything).
+Baking the adapters into the partition and quantizing to INT8 W8A16 frees the headroom:
+
+```bash
+python tools/minimax_h3/bake_vdn_adapters.py \
+  --src /nfs-data/models/MiniMax-H3/FL2VA \
+  --vdn /nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250 \
+  --dst /nfs-data/models/MiniMax-H3-FL2VA-VDN8-BF16 --link-siblings
+python vllm_omni/quantization/tools/quantize_minimax_h3_int8.py \
+  --src /nfs-data/models/MiniMax-H3-FL2VA-VDN8-BF16 \
+  --dst /nfs-data/models/MiniMax-H3-FL2VA-VDN8-INT8-W8A16 \
+  --activation-scheme weight_only
+```
+
+62 GB -> 43.8 GB, and `--lora-path` then has to point at a VDN directory with
+`adapters/` REMOVED, or they are applied a second time on top of the baked ones.
+
+Measured at 15 s fl2va against the production Turbo8 BF16 tier: 375 s vs 399 s, peak
+39.1 vs 39.2 GiB, sharpness **32.8 vs 23.8 (+38%)**.
+
+**Switch for the picture, not the clock.** 1.06x and equal memory is not a reason to
+move; the sharpness is, and it was confirmed by eye against the production tier before
+this recipe recommended it. The speed advantage is small here because that tier is
+already an 8-step distill and W8A16 runs a Triton GEMM rather than BF16 cuBLAS -- the
+window's saving is real but it is spent, not banked.
+
+Two caveats that do not go away by liking the output. fl2va is a task VDN never trained
+on: the keyframe IS honoured (PSNR to the reference at frame 0 is 36.43 dB against the
+dense control's 36.52, i.e. the same) but the branch never saw reference media in the
+prefix. And the sharpness gap conflates the hybrid attention with VDN's DMD adapter
+being a different distillation from LightX2V's Turbo8 -- it is not attributable to the
+attention alone. Serving it needs `VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1`, which warns
+on every request for exactly this reason.
+
+## ref2va is unreachable
+
+H3 serves ref2va from `transformer_ref/`, a different DiT than the `transformer/` VDN's
+adapters were trained against: identical tensor NAMES, different weights (`blocks.0`
+`to_q` md5 `cc9c236b99a1` vs `3fa8bbc7ecb2`). A delta computed for one does not transfer
+to the other, and the mismatch is invisible to every shape and name check -- it would
+load, serve, and render. The loader refuses the task outright and no flag opens it; it
+would need VDN retrained on that partition.
+
+## Weights
+
+```bash
+# The 72 GB base, if not already present. Use the ROOT transformer/ (unfused),
+# not FL2VA/transformer/ (fused) -- VDN's model_spec.json names the former.
+# Then the ~5.1 GB increment:
+bash scripts/download_vdn_minimax_h3.sh
+```
+
+Layout under `$DEST/VDN-MiniMax-H3/stage-dmd-step-250/`:
+
+```text
+model_spec.json                  the hybrid transform and adapter specs
+metadata.json                    the training recipe (turbo_num_steps, shifts)
+linear_branch/model.safetensors  the branch, softmax gate and to_out_linear
+adapters/default/                a rank-64 LoRA on the attention projections
+adapters/turbo/                  the 8-step DMD adapter
+```
+
+`stage-b-step-2000` is the 50-step teacher: the same branch with `adapters/default`
+only, and no `adapters/turbo`.
+
+## Serving
+
+```bash
+vllm serve /nfs-data/models/MiniMax-H3 \
+  --deploy-config deploy-configs/minimax_h3_vdn8_t2va_a100_40g.yaml \
+  --lora-path /nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250 \
+  --trust-remote-code
+```
+
+The increment goes through `--lora-path` but is **not** a request-switchable LoRA. Its
+linear branch is an architecture change that its two adapters were trained jointly with,
+so it is fused and injected at load time; serving base H3 with the branch, or the branch
+without its adapters, is a different model either way.
+
+## Constraints
+
+Four settings produce a plausible video when wrong. The runtime refuses all four, but
+they are worth stating:
+
+| Constraint | Why | Refused by |
+| --- | --- | --- |
+| `diffusion_attention_backend: VDN_WINDOW_ATTN` | The branch is the window's complement; beside a dense attention it counts everything outside the window twice | `validate_hybrid_runtime` at startup |
+| `ulysses_degree: 1`, `ring_degree: 1` | The branch's scan runs over frames and needs the whole target video on each rank; shard with TP, which divides heads | `validate_hybrid_runtime` at startup |
+| `task: t2va` | Only T2VA was trained; fl2va/ref2va put reference media in a prefix the branch never saw | `_resolve_task` per request |
+| `flow_shift: 12.0` (audio 3.0) | Part of the distillation, not a request preference | `check_request` per request |
+
+Clips shorter than the window fall back to dense attention automatically and the branch
+contributes exactly zero — a window that covers every frame *is* the original attention.
+
+## Validation
+
+```bash
+# Geometry, backend, TP sharding, wiring and checkpoint loading
+pytest tests/diffusion/models/minimax_h3 -k vdn
+
+# Parity against OpenVDN's own implementation (requires their checkout)
+VDN_REFERENCE_ROOT=/path/to/vdn-minimax-h3 \
+  pytest tests/diffusion/models/minimax_h3/test_minimax_h3_vdn_branch_parity.py
+```
+
+The branch has no reference output that a rendered frame would reveal — a wrong forget
+gate or a wrongly rebased window bound just looks slightly worse — so the oracle is the
+released code itself, given the same random weights and inputs. fp32 agreement is 1.4e-5
+relative; bf16 agreement is ~0.3% mean relative, the same order as the reference's own
+eager-versus-fused gap.
+
+## License
+
+VDN-H3 is a derivative of MiniMax-H3 under the MiniMax H3 Community License Agreement,
+whose applicable territory **excludes the European Union, the United Kingdom, the
+Republic of Korea and the United States of America**. Read it before use or
+distribution.

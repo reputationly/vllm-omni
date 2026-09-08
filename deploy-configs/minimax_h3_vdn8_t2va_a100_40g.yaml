@@ -1,0 +1,92 @@
+# VDN-MiniMax-H3 T2VA 8 步（混合注意力）— DiT stage, A100 PCIE 40G x4
+#
+# 与 minimax_h3_a100_40g.yaml（原始版 / INT8 / 20 步）和
+# minimax_h3_turbo8_bf16_a100_40g.yaml（LightX2V Turbo8 / FL2VA）并列的第三档。
+# 三者解决的不是同一个问题：
+#   原始版 / Turbo8   —— 减少「步数」
+#   本档（VDN）       —— 减少「每一步的代价」
+# 所以 VDN 的收益随片长增长，而 Turbo 的收益不随片长变。两者原理正交，但本档用的
+# stage-dmd-step-250 已经自带一个 8 步 DMD 适配器（adapters/turbo），**不要再叠
+# LightX2V 的 Turbo LoRA**——那是另一条蒸馏线，rank/alpha/目标集都不同。
+#
+# --- 权重 ---
+#   底座：/nfs-data/models/MiniMax-H3            官方 BF16，root transformer/
+#         （注意是 root 的 unfused 那份，不是 FL2VA/transformer/ 的 fused 版）
+#   增量：/nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250   ~5.1 GB
+#         linear_branch/ + adapters/default/ + adapters/turbo/
+#   下载：bash scripts/download_vdn_minimax_h3.sh
+#   增量走 --lora-path，由 vdn.py 在权重流里融合并注入，不是可请求切换的 LoRA：
+#   线性分支是架构改动，和它的两个适配器是联合训练的，拆开跑就是另一个模型。
+#
+# --- 实测（A100-PCIE-40G x4，TP4，768p/15.1s = F=107 潜帧，每 DiT 块）---
+#   attention   dense 463.3 ms -> 窗口 99.9 ms      4.64x
+#   GEMM        100.2 ms（不变）
+#   all-reduce  266.6 ms（不变，VDN 一点省不掉）
+#   分支新增    +14.0 ms
+#   合计        830.1 ms -> 480.7 ms                1.73x
+#   ×50 层      41.5 s/NFE -> 24.0 s/NFE
+#   复现：torchrun --nproc_per_node=4 benchmarks/diffusion/vdn_h3/bench_tp4_block.py --frames 107
+#
+#   ⚠️ 单卡 attention 是 4.65x，落到 TP4 只剩 1.73x —— 差的那部分全在通信。
+#      VDN 做完之后通信占比从 32.1% 涨到 55.5%，下一个该优化的是通信不是算子。
+#   ⚠️ 收益随片长塌缩：F=37（5.2s）时窗口要覆盖 40% 的帧，净加速约 1.1x，
+#      不值得开。**本档只对长片有意义**，短片请走原始版或 Turbo8。
+#
+# --- 硬约束（配错不会报错，只会渲染出「看着正常但不是这个模型」的片子）---
+#   1. diffusion_attention_backend 必须是 VDN_WINDOW_ATTN。线性分支是窗口的补集，
+#      配稠密 attention 会把窗口外的帧算两遍。启动时 validate_hybrid_runtime 拦。
+#   2. ulysses_degree / ring_degree 必须是 1。分支的扫描沿帧展开，需要每张卡都有
+#      完整的目标视频行；切序列就只拿到片子的一部分。用 TP 切头。
+#   3. 只支持 t2va。官方只训了这一条；fl2va/ref2va 会把参考媒体放进 prefix，
+#      分支没见过。_resolve_task 里拦。
+#   4. flow_shift 必须是 12.0（音频 3.0）—— 是蒸馏契约的一部分，不是请求偏好。
+#
+# --- 许可 ---
+#   MiniMax H3 Community License，带地域限制（排除 EU/UK/KR/US），商用前过法务。
+#
+# --- 挪不进本文件的东西 ---
+#   六个 VLLM_OMNI_* 环境变量、--init-timeout / --stage-init-timeout、
+#   --lora-path，原因见 minimax_h3_a100_40g.yaml 的注释，此处不重复。
+pipeline: minimax_h3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    task_type: t2va
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+
+    enable_cpu_offload: true
+    vae_use_tiling: true
+
+    # 硬约束 1。换成 FLASH_ATTN 会在启动时被 validate_hybrid_runtime 拒绝，
+    # 而不是安静地跑出错误结果。
+    diffusion_attention_backend: VDN_WINDOW_ATTN
+
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+
+    enable_multithread_weight_load: false
+    enable_diffusion_pipeline_profiler: true
+
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      sequence_parallel_size: 1
+      # 硬约束 2：这两个必须留 1。
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+
+    default_sampling_params:
+      # stage-dmd-step-250 的 metadata.json 写的是 turbo_num_steps=8。
+      # 要 50 步档就换 stage-b-step-2000（它没有 adapters/turbo）。
+      num_inference_steps: 8

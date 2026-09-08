@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax-H3 deploy-only pipeline registration.
 
 Covers the three things that can silently break H3 deployment:
@@ -135,6 +135,7 @@ def test_deploy_yaml_pipeline_field_selects_h3():
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_fl2va_bf16_a100_40g.yaml", 4, 4),
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_bf16_a100_40g.yaml", 4, 4),
         (_REPO_ROOT / "deploy-configs" / "minimax_h3_ref2va_w8a8_a100_40g.yaml", 4, 4),
+        (_REPO_ROOT / "deploy-configs" / "minimax_h3_vdn8_t2va_a100_40g.yaml", 4, 4),
     ],
 )
 def test_shipped_deploy_configs_merge_to_four_cards(
@@ -163,6 +164,29 @@ def test_shipped_deploy_configs_merge_to_four_cards(
     assert parallel_config["text_encoder_tp_size"] == text_encoder_tp_size
     assert parallel_config["vae_patch_parallel_size"] == vae_patch_parallel_size
     assert parallel_config["vae_parallel_mode"] == "tile"
+
+
+def test_vdn_profile_carries_the_settings_that_cannot_be_wrong():
+    """The VDN hybrid's three hard constraints, pinned in the shipped profile.
+
+    Each of them renders a plausible video when violated: a dense attention beside the
+    linear branch double-counts everything outside the window, a sequence-parallel shard
+    gives the frame scan part of the clip, and fl2va/ref2va put reference media in a
+    prefix the branch never trained on. The runtime refuses all three, but a profile
+    that ships wrong turns a startup error into an incident.
+    """
+    deploy_path = _REPO_ROOT / "deploy-configs" / "minimax_h3_vdn8_t2va_a100_40g.yaml"
+    deploy = load_deploy_config(deploy_path)
+    (stage,) = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+    engine_args = stage.yaml_engine_args
+
+    assert engine_args["diffusion_attention_backend"] == "VDN_WINDOW_ATTN"
+    assert engine_args["parallel_config"]["ulysses_degree"] == 1
+    assert engine_args["parallel_config"]["ring_degree"] == 1
+    assert engine_args["task_type"] == "t2va"
+    # stage-dmd-step-250's own metadata says turbo_num_steps=8. Read off the deploy
+    # stage: default_sampling_params does not travel in yaml_engine_args.
+    assert deploy.stages[0].default_sampling_params["num_inference_steps"] == 8
 
 
 def test_a100_profile_carries_measured_memory_settings():
