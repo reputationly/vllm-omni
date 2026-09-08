@@ -170,7 +170,7 @@ class VDNHybridAttention(nn.Module):
         qkv_raw: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         *,
         geometry: tuple[int, int, int, tuple[int, int]],
-        text_span: tuple[int, int] | None,
+        text_span: tuple[int, int] | torch.Tensor | None,
     ) -> tuple[torch.Tensor, int, int]:
         """The branch's contribution to the residual stream, and the rows it covers.
 
@@ -182,9 +182,18 @@ class VDNHybridAttention(nn.Module):
 
         text_x = text_qkv_raw = None
         if self.linear_attention.enable_text_state and text_span is not None:
-            text_start, text_end = text_span
-            text_x = x[text_start:text_end]
-            text_qkv_raw = tuple(tensor[text_start:text_end] for tensor in qkv_raw)
+            # A slice when the prompt is contiguous (t2va), row indices when reference
+            # media splits it (fl2va, ref2va). _text_state consumes the prompt as one
+            # delta-rule chunk with no causal scan inside it, so a gather of the same
+            # rows is the same state -- what would change the result is dropping rows.
+            if isinstance(text_span, torch.Tensor):
+                rows = text_span.to(x.device)
+                text_x = x.index_select(0, rows)
+                text_qkv_raw = tuple(tensor.index_select(0, rows) for tensor in qkv_raw)
+            else:
+                text_start, text_end = text_span
+                text_x = x[text_start:text_end]
+                text_qkv_raw = tuple(tensor[text_start:text_end] for tensor in qkv_raw)
 
         readout = self.linear_attention(
             x[video_start:video_end],

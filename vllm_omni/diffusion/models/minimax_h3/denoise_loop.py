@@ -34,35 +34,33 @@ from .scheduling_minimax_h3_euler_ancestral import (
 logger = init_logger(__name__)
 
 
-def _prompt_row_span(token_tags: torch.Tensor) -> tuple[int, int] | None:
-    """The first contiguous run of prompt rows, as host ints, or None if there is none.
+def _prompt_rows(token_tags: torch.Tensor) -> tuple[int, int] | torch.Tensor | None:
+    """Every prompt row: a ``(start, stop)`` slice when contiguous, else row indices.
 
     Consumed by the VDN linear branch, whose two directional scans start from a state
     written by the prompt. It deliberately wants the PROMPT rows rather than the
     attention's "globals" (text and audio): the branch is being given a condition, and
     the soundtrack is not one.
 
-    fl2va and ref2va override part of the text region with reference-image rows, so the
-    prompt is the leading run rather than the whole region. VDN only ever trained on
-    t2va, where the two are the same thing; the shorter run is flagged because it is the
-    layout going off the distribution the branch was trained on, not a bug here.
+    On t2va the prompt is one contiguous run and the slice form is returned, which keeps
+    that path exactly the tensor it has always been. fl2va and ref2va interleave
+    reference-media rows through the text region, so there the prompt is several runs and
+    the whole set is returned as indices. Feeding scattered rows is sound rather than a
+    workaround: ``VDNLinearBranch._text_state`` writes the prompt into a zero state as a
+    single delta-rule chunk with no causal scan inside it, so the result does not depend
+    on the rows being adjacent -- only on which rows are present. Taking the leading run
+    instead would seed the scans from a fraction of the conditioning (6 of 36 rows on a
+    15 s ref2va request), which is a silent loss of prompt, not a layout note.
     """
     tags = token_tags.view(-1)
     is_text = tags == MINIMAX_H3_TEXT_TAG
-    text_rows = int(is_text.sum())
-    if not text_rows:
+    rows = torch.nonzero(is_text, as_tuple=False).view(-1)
+    if not rows.numel():
         return None
-    start = int(torch.argmax(is_text.to(torch.uint8)))
-    run = int((~is_text[start:]).to(torch.uint8).argmax()) if not bool(is_text[start:].all()) else len(tags) - start
-    if run < text_rows:
-        logger.warning_once(
-            "MiniMax-H3 packed layout interleaves %d prompt rows with other modalities; the VDN "
-            "branch will seed its scans from the leading %d. VDN was trained on t2va, where the "
-            "prompt region is contiguous.",
-            text_rows,
-            run,
-        )
-    return start, start + run
+    start, stop = int(rows[0]), int(rows[-1]) + 1
+    if stop - start == rows.numel():
+        return start, stop
+    return rows
 
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -232,7 +230,14 @@ class MiniMaxH3DenoiseBranch:
                 prefix_len=int(packed["video_row_start"]),
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
             )
-        self.static_kwargs["packed_seq_params"]["vdn_text_span"] = _prompt_row_span(token_tags)
+        # Resolved on the HOST (token_tags is the host copy, so nonzero costs no device
+        # sync) and uploaded ONCE. Leaving it on the host would make ``readout`` issue a
+        # pageable H2D copy inside every block on every step -- 50 x steps per request --
+        # which is the per-step sync the rest of this method exists to avoid.
+        prompt_rows = _prompt_rows(token_tags)
+        if isinstance(prompt_rows, torch.Tensor):
+            prompt_rows = prompt_rows.to(self.device)
+        self.static_kwargs["packed_seq_params"]["vdn_text_span"] = prompt_rows
 
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.

@@ -753,7 +753,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
-        vdn_text_span: tuple[int, int] | None = None,
+        vdn_text_span: tuple[int, int] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -1069,7 +1069,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
-        vdn_text_span: tuple[int, int] | None = None,
+        vdn_text_span: tuple[int, int] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1752,8 +1752,10 @@ class MiniMaxH3DiTModel(nn.Module):
         # purpose: those are text AND audio, while the VDN branch's text state must see
         # the prompt and not the soundtrack. Resolved on the host by the producer, so no
         # attention layer reads token_tags off the device.
+        # Contiguous on t2va, so it arrives as a (start, stop) pair; fl2va and ref2va
+        # interleave reference-media rows through the text region and send row indices.
         vdn_text_span = self._psp_optional(psp, "vdn_text_span", None)
-        if vdn_text_span is not None:
+        if vdn_text_span is not None and not isinstance(vdn_text_span, torch.Tensor):
             vdn_text_span = (int(vdn_text_span[0]), int(vdn_text_span[1]))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)

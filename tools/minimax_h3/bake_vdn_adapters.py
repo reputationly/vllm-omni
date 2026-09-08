@@ -69,6 +69,17 @@ def main() -> int:
         "--link-siblings", action="store_true", help="symlink text_encoder/VAEs instead of copying (~20 GB saved)"
     )
     parser.add_argument("--dry-run", action="store_true", help="resolve and validate, write nothing")
+    parser.add_argument(
+        "--adapters",
+        default=None,
+        help=(
+            "comma-separated subset to bake instead of all of them. Only for a base whose "
+            "shapes cannot carry an adapter: an r8-pruned partition refactorises AdaLN to "
+            "rank 8 and the `turbo` delta does not fit (99.8%% of it lies outside the pruned "
+            "basis). The result is a DIFFERENT model from the released one and the stamp "
+            "records the subset, so serving it needs its own few-step story."
+        ),
+    )
     args = parser.parse_args()
 
     from vllm_omni.diffusion.models.minimax_h3.vdn import VDNCheckpoint
@@ -78,7 +89,10 @@ def main() -> int:
     if not src_t.is_dir():
         sys.exit(f"{src_t} is not a directory")
 
-    checkpoint = VDNCheckpoint.from_path(args.vdn, head_dim=args.head_dim, num_blocks=args.num_blocks)
+    only = [name.strip() for name in args.adapters.split(",")] if args.adapters else None
+    checkpoint = VDNCheckpoint.from_path(
+        args.vdn, head_dim=args.head_dim, num_blocks=args.num_blocks, only_adapters=only
+    )
     if checkpoint is None:
         sys.exit(f"{args.vdn} is not a VDN checkpoint directory")
     print(f"adapters to bake: {', '.join(checkpoint.adapters)}")

@@ -1354,6 +1354,7 @@ class MiniMaxH3Pipeline(
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
     _vdn: VDNCheckpoint | None = None
+    _vdn_ref: VDNCheckpoint | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -1675,6 +1676,17 @@ class MiniMaxH3Pipeline(
                 allgather_degree=int(getattr(parallel, "allgather_degree", 1) or 1),
             )
             self.transformer.enable_vdn_branches(**self._vdn.spec.branch_kwargs())
+            if hasattr(self, "transformers_ref"):
+                # ref2va is served from a SECOND DiT instance. Without its own branch it
+                # would run the window against a dense model with no complement -- output,
+                # with every frame outside the window silently dropped. It needs its own
+                # VDNCheckpoint too: the artifact's fusion guard is single-use and its
+                # branch tensors are consumed once, so one object cannot feed two streams.
+                # Its OWN partition's stamp: this DiT's weights come from Ref2VA/, and
+                # a bake run stamps one transformer/ at a time.
+                self._vdn_ref = resolve_vdn_checkpoint(od_config, self.transformers_ref, model_path=ref2va_model_path)
+                if self._vdn_ref is not None:
+                    self.transformers_ref.enable_vdn_branches(**self._vdn_ref.spec.branch_kwargs())
 
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -1775,6 +1787,7 @@ class MiniMaxH3Pipeline(
         loaded_with_prefix: set[str] = set()
         loaded_prefixes: set[str] = set()
         transformer_loaded: set[str] = set()
+        ref_loaded: set[str] = set()
         for prefix, grouped_weights in groupby(weights, key=source_prefix):
             if prefix in loaded_prefixes:
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
@@ -1785,6 +1798,8 @@ class MiniMaxH3Pipeline(
                 # Fuse before the model shards anything, which is also the only
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
                 stream = self._fasth3.apply(stream)
+            if prefix == "transformers_ref." and self._vdn_ref is not None:
+                stream = self._vdn_ref.apply(stream)
             if prefix == "transformer." and self._vdn is not None:
                 # Same point, same reason. VDN additionally APPENDS its branch
                 # tensors to the stream, so they reach load_weights as ordinary
@@ -1793,6 +1808,8 @@ class MiniMaxH3Pipeline(
             loaded = component.load_weights(stream)
             if prefix == "transformer.":
                 transformer_loaded = set(loaded)
+            elif prefix == "transformers_ref.":
+                ref_loaded = set(loaded)
             if prefix != "text_encoder.":
                 component.post_load_weights()
             loaded_with_prefix.update(prefix + name for name in loaded)
@@ -1813,12 +1830,14 @@ class MiniMaxH3Pipeline(
             self._fasth3.validate_fully_applied(transformer_loaded)
         if self._vdn is not None:
             self._vdn.validate_fully_applied(transformer_loaded)
+        if self._vdn_ref is not None:
+            self._vdn_ref.validate_fully_applied(ref_loaded)
         return loaded_with_prefix
 
     @property
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None or self._vdn is not None
+        return self._fasth3 is not None or self._vdn is not None or self._vdn_ref is not None
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
         if task == "ref2va" and hasattr(self, "transformers_ref"):

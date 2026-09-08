@@ -260,25 +260,35 @@ def test_untrained_tasks_are_refused_by_default(artifact, task):
         _load(artifact).check_task(task)
 
 
-def test_the_evaluation_flag_opens_fl2va_but_never_ref2va(artifact, monkeypatch):
-    """ref2va is a different DiT partition, not a distribution question.
+def test_the_evaluation_flag_opens_both_untrained_tasks(artifact, monkeypatch):
+    """fl2va and ref2va are both refused by default and both openable for evaluation.
 
-    H3 serves it from ``transformer_ref``, whose tensor names match the base VDN adapts
-    and whose weights do not, and the pipeline builds the branch on the primary
-    transformer only. Letting the evaluation flag through would run the window against a
-    dense model with no complement -- output, but with every frame outside the window
-    silently dropped.
+    ref2va used to be a hard refusal on the grounds that its DiT partition
+    (``transformer_ref``) carries different weights, so a delta computed for
+    ``transformer`` could not transfer. Measuring that in float64 showed cosine 0.99953
+    and 3.1% relative L2 -- a light fine-tune, not an independently trained model -- so
+    the transfer is unvalidated rather than impossible, which is what the flag is for.
+
+    It still needs the pipeline to build the branch on the SECOND DiT instance; without
+    that the window runs against a dense model with no complement.
     """
-    from vllm_omni.diffusion.models.minimax_h3.vdn import (
-        VDN_ALLOW_UNTRAINED_TASKS_ENV,
-    )
-    from vllm_omni.errors import OmniClientError
+    from vllm_omni.diffusion.models.minimax_h3.vdn import VDN_ALLOW_UNTRAINED_TASKS_ENV
 
     monkeypatch.setenv(VDN_ALLOW_UNTRAINED_TASKS_ENV, "1")
     checkpoint = _load(artifact)
-    checkpoint.check_task("fl2va")  # same partition: evaluable
-    with pytest.raises(OmniClientError, match="different DiT partition"):
-        checkpoint.check_task("ref2va")
+    checkpoint.check_task("fl2va")
+    checkpoint.check_task("ref2va")
+
+
+def test_both_untrained_tasks_stay_refused_without_the_flag(artifact):
+    """The default has to stay closed: neither task was trained, and on ref2va the
+    backbone the adapters were fitted to is not even the one being served."""
+    from vllm_omni.errors import OmniClientError
+
+    checkpoint = _load(artifact)
+    for task in ("fl2va", "ref2va"):
+        with pytest.raises(OmniClientError, match="t2va"):
+            checkpoint.check_task(task)
 
 
 class _Sampling:
@@ -422,6 +432,36 @@ def test_raw_base_plus_a_branch_only_artifact_is_refused(artifact, tmp_path):
     (raw_base / "transformer" / "config.json").write_text(json.dumps({"hidden_size": HIDDEN}))
     with pytest.raises(VDNCheckpointError, match="would not be applied at all"):
         check_bake_agreement(checkpoint, raw_base)
+
+
+def test_the_stamp_is_read_off_the_partition_that_was_passed(artifact, tmp_path):
+    """``resolve_vdn_checkpoint`` must check the stamp of THIS transformer's partition.
+
+    On a ``combined`` deployment the ref2va DiT loads from ``<root>/Ref2VA`` while
+    ``od_config.model`` is the root, and a bake run stamps one ``transformer/``. Reading
+    the root's stamp for the ref DiT makes the guard vacuous there: a raw Ref2VA served
+    with a branch-only artifact passes, and the ref DiT then runs the branch with none of
+    the adapters it was trained with -- which loads, serves and renders.
+    """
+    import shutil
+    import types
+
+    from vllm_omni.diffusion.models.minimax_h3.vdn import VDNCheckpointError, resolve_vdn_checkpoint
+
+    shutil.rmtree(artifact / "adapters")  # branch-only, as a baked deployment serves
+    baked_root = _base_with_stamp(tmp_path, ["default", "turbo"])
+    raw_ref = tmp_path / "combined" / "Ref2VA"
+    (raw_ref / "transformer").mkdir(parents=True)
+    (raw_ref / "transformer" / "config.json").write_text(json.dumps({"hidden_size": HIDDEN}))
+
+    od_config = types.SimpleNamespace(lora_path=str(artifact), model=str(baked_root))
+    transformer = types.SimpleNamespace(arch=types.SimpleNamespace(attention_head_dim=HEAD_DIM, num_layers=BLOCKS))
+
+    # The root is baked, so the default path is happy...
+    assert resolve_vdn_checkpoint(od_config, transformer) is not None
+    # ...and the ref partition, which is NOT baked, has to be refused.
+    with pytest.raises(VDNCheckpointError, match="would not be applied at all"):
+        resolve_vdn_checkpoint(od_config, transformer, model_path=raw_ref)
 
 
 def test_the_two_correct_pairings_pass(artifact, tmp_path):

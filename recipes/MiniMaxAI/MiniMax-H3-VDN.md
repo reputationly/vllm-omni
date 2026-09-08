@@ -112,14 +112,38 @@ being a different distillation from LightX2V's Turbo8 -- it is not attributable 
 attention alone. Serving it needs `VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1`, which warns
 on every request for exactly this reason.
 
-## ref2va is unreachable
+## ref2va runs on a different DiT, and the transfer is unvalidated
 
-H3 serves ref2va from `transformer_ref/`, a different DiT than the `transformer/` VDN's
-adapters were trained against: identical tensor NAMES, different weights (`blocks.0`
-`to_q` md5 `cc9c236b99a1` vs `3fa8bbc7ecb2`). A delta computed for one does not transfer
-to the other, and the mismatch is invisible to every shape and name check -- it would
-load, serve, and render. The loader refuses the task outright and no flag opens it; it
-would need VDN retrained on that partition.
+H3 serves ref2va from `transformer_ref/`, not the `transformer/` VDN's adapters were
+trained against: identical tensor NAMES, different weights. An earlier version of this
+document said a delta for one "does not transfer to the other" and that the loader
+refuses the task with no flag to open it. That was asserted without measuring, and both
+halves are now wrong.
+
+Measured in float64 across attention, MLP and embedder tensors spread through the depth:
+cosine **0.99953**, relative L2 **3.1%** (the consistency check `1 - rel^2/2` reproduces
+the cosine). `transformer_ref/` is a light fine-tune of `transformer/`, not an
+independently trained model, so the trained branch is a plausible initialisation there.
+
+So ref2va is treated like fl2va: refused by default, opened for evaluation by
+`VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1`, which warns on every request. What makes it a
+separate case is that it needs its own `VDNCheckpoint` built on the SECOND DiT instance
+-- the artifact's fusion guard is single-use and its branch tensors are consumed once, so
+one object cannot feed both streams.
+
+Plausible is not validated. Nothing downstream can tell you the transfer went wrong, and
+what has been measured on it is mixed: on the official examples ref2va under VDN is
+sharper than production on some prompts and not on others. Treat a ref2va rollout as
+needing its own visual acceptance, not as following from the t2va result.
+
+Two operational notes for this path, both learned the hard way:
+
+- the ref2va partition declares `sigma_shift_scales {video: 6.0, audio: 3.0}`, not
+  t2va/fl2va's 12. Production silently ignores the request's `flow_shift` and always uses
+  its own; VDN's `check_request` does not. Copying a t2va script's parameters therefore
+  compares VDN at shift 12 against production at shift 6.
+- a VDN artifact carrying its own `turbo` adapter keeps `turbo`'s distillation contract
+  (shift 12), which is a property of the ARTIFACT, not of the partition.
 
 ## Weights
 
@@ -166,7 +190,7 @@ they are worth stating:
 | --- | --- | --- |
 | `diffusion_attention_backend: VDN_WINDOW_ATTN` | The branch is the window's complement; beside a dense attention it counts everything outside the window twice | `validate_hybrid_runtime` at startup |
 | `ulysses_degree: 1`, `ring_degree: 1` | The branch's scan runs over frames and needs the whole target video on each rank; shard with TP, which divides heads | `validate_hybrid_runtime` at startup |
-| `task: t2va` | Only T2VA was trained; fl2va/ref2va put reference media in a prefix the branch never saw | `_resolve_task` per request |
+| `task: t2va` | Only T2VA was trained; fl2va/ref2va put reference media in a prefix the branch never saw, and ref2va additionally runs a different DiT (cosine 0.99953). Both are refused unless `VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1` | `check_task` per request |
 | `flow_shift: 12.0` (audio 3.0) | Part of the distillation, not a request preference | `check_request` per request |
 
 Clips shorter than the window fall back to dense attention automatically and the branch

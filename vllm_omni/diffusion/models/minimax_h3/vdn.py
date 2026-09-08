@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -61,6 +61,9 @@ MODEL_SPEC_FILE = "model_spec.json"
 METADATA_FILE = "metadata.json"
 BRANCH_DIR = "linear_branch"
 ADAPTERS_DIR = "adapters"
+# Written by the curve projection: the affine intercept, already multiplied through
+# lora_B, as one fp32 vector per AdaLN module.
+_DIFF_B_SUFFIX = ".diff_b"
 
 # The transform this loader understands, as ``model_spec.json`` names it.
 VDN_TRANSFORM_TYPE = "hybrid_attention"
@@ -73,12 +76,22 @@ VDN_SUPPORTED_TASKS = frozenset({"t2va"})
 # Opt-in, per process, to render an untrained task anyway. For evaluation only; see
 # check_task.
 VDN_ALLOW_UNTRAINED_TASKS_ENV = "VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS"
-# Tasks the flag does NOT open, because they are served from a DIFFERENT DiT partition
-# than the one VDN's adapters were trained against. Verified 2026-09-07: MiniMax-H3's
-# ``transformer/`` and ``transformer_ref/`` carry identical tensor NAMES and different
-# weights (blocks.0 to_q md5 cc9c236b99a1 vs 3fa8bbc7ecb2), so nothing about the delta
-# transfers and the mismatch is invisible to every shape and name check.
-VDN_UNREACHABLE_TASKS = frozenset({"ref2va"})
+# ref2va runs a DIFFERENT DiT partition (``transformer_ref/``) than the one VDN's
+# adapters were trained against (``transformer/``): identical tensor NAMES, different
+# weights. An earlier version refused it outright on the grounds that a delta computed
+# for one matrix is meaningless on another.
+#
+# That was too strong, and it was asserted without measuring. Measured 2026-09-08 in
+# float64 over attention, MLP and embedder tensors spread across the depth: cosine
+# 0.99953, relative L2 3.1% (consistency check 1 - rel^2/2 matches the cosine exactly).
+# Ref2VA is a LIGHT FINE-TUNE of FL2VA, not an independently trained model, so the
+# trained branch is a plausible -- though unvalidated -- initialisation there.
+#
+# So ref2va is treated like fl2va: refused by default, openable for evaluation. What
+# makes it a separate constant is that it additionally needs the branch built on the
+# SECOND DiT instance, which the pipeline must arrange.
+VDN_TRANSFERRED_TASKS = frozenset({"ref2va"})
+VDN_PARTITION_COSINE = 0.99953  # transformer/ vs transformer_ref/, measured
 # Stamp that ``bake_vdn_adapters.py`` writes into the baked partition's transformer
 # config.json, naming the adapters it folded in. It is what lets the loader tell a baked
 # base from a raw one; the offline quantizer copies config.json through, so it survives
@@ -203,6 +216,10 @@ class _Patch:
 
     layout: str
     pairs: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
+    # Curve-projected AdaLN adapters additionally carry an fp32 intercept, which lands on
+    # the pruned parameter's ``folded_bias`` rather than on a weight (see
+    # ``tools/minimax_h3/vdn_curve_projection.py``). Several adapters may stack here too.
+    biases: list[torch.Tensor] = field(default_factory=list)
 
 
 def _strip_hybrid_level(module: str) -> str:
@@ -252,11 +269,27 @@ class VDNCheckpoint:
     # ---- discovery -----------------------------------------------------------------
 
     @classmethod
-    def from_path(cls, path: str | Path, *, head_dim: int, num_blocks: int) -> VDNCheckpoint | None:
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        head_dim: int,
+        num_blocks: int,
+        only_adapters: Sequence[str] | None = None,
+    ) -> VDNCheckpoint | None:
         """Read the artifact at ``path``, or return None if it is not a VDN checkpoint.
 
         None rather than an error: an unrelated ``--lora-path`` must stay on the dynamic
         LoRA route. Once the directory does look like VDN, every later problem raises.
+
+        ``only_adapters`` restricts which adapters are read. SERVING must never pass it:
+        the released inference path merges every adapter, and applying a subset is a
+        different model. It exists for the bake tool, whose one legitimate use is a base
+        whose shapes cannot carry a particular adapter -- an r8-pruned partition
+        refactorises AdaLN to rank 8, and the ``turbo`` adapter's AdaLN delta does not
+        fit it (measured: 99.8% of the delta lies outside the pruned basis, so there is
+        no honest projection either). Naming the subset is then a deliberate statement
+        about what the artifact is, and the stamp records it.
         """
         root = Path(path)
         spec_file = root / MODEL_SPEC_FILE
@@ -280,7 +313,7 @@ class VDNCheckpoint:
         metadata = json.loads(metadata_file.read_text()) if metadata_file.is_file() else {}
 
         injections = _read_branch(branch_file, num_blocks=num_blocks)
-        patches, adapters = _read_adapters(root / ADAPTERS_DIR)
+        patches, adapters = _read_adapters(root / ADAPTERS_DIR, only=only_adapters)
         logger.info(
             "VDN checkpoint %s: %d branch tensors, %d adapters (%s) editing %d parameters; "
             "window chunk=%d radius=%d anchors=%s",
@@ -331,6 +364,25 @@ class VDNCheckpoint:
         if patch is None:
             return weight
         device = weight.device if weight.is_cuda else torch.device("cpu")
+
+        if patch.layout == _BIAS_LAYOUT:
+            # A curve-projected AdaLN intercept. fp32 throughout and added there: the
+            # pruned forward adds folded_bias in fp32 for the same reason -- it carries
+            # most of the modulation, and rounding it to bf16 before the sum loses more
+            # than the projection itself does.
+            # Checked BEFORE the accumulation, or a mismatched residual raises a bare
+            # RuntimeError out of add_ and this message never runs.
+            for residual in patch.biases:
+                if residual.shape != weight.shape:
+                    raise VDNCheckpointError(
+                        f"VDN bias residual for {native_name} has shape {tuple(residual.shape)}, "
+                        f"parameter is {tuple(weight.shape)}"
+                    )
+            delta = torch.zeros_like(weight, dtype=torch.float32, device=device)
+            for residual in patch.biases:
+                delta.add_(residual.to(device, torch.float32))
+            self._applied.add(f"{native_name}:{_PLAIN_SLOT}")
+            return delta.add_(weight.to(device, torch.float32)).to(weight.dtype)
 
         if patch.layout == _QKV_LAYOUT:
             if slot is not None:
@@ -438,21 +490,19 @@ class VDNCheckpoint:
     def check_task(self, task: str) -> None:
         if task in VDN_SUPPORTED_TASKS:
             return
-        if task in VDN_UNREACHABLE_TASKS:
-            # Not merely untrained: H3 serves ref2va from a SECOND DiT
-            # (``transformer_ref``) whose tensor names match the base VDN adapts but
-            # whose weights do not -- adding a delta computed for one matrix to a
-            # different matrix is meaningless. The pipeline also builds the branch on
-            # the primary transformer only, so this task would run the window against a
-            # dense model with no complement and silently drop every frame outside it.
-            # No environment variable opens this; it would need VDN retrained on that
-            # partition.
-            raise OmniClientError(
-                f"VDN-H3 cannot serve task={task!r}: H3 runs it from a different DiT partition "
-                "(transformer_ref) than the one VDN's adapters were trained against "
-                "(transformer). This is not a distribution question and no flag overrides it."
-            )
         if os.environ.get(VDN_ALLOW_UNTRAINED_TASKS_ENV) == "1":
+            if task in VDN_TRANSFERRED_TASKS:
+                logger.warning_once(
+                    "%s=1: serving task=%r on a VDN checkpoint whose adapters were trained "
+                    "against a different DiT partition. transformer_ref is a light fine-tune "
+                    "of transformer (cosine %.5f, relative L2 3.1%%), so the transfer is "
+                    "plausible -- but it is UNVALIDATED, and nothing downstream can tell you "
+                    "it went wrong.",
+                    VDN_ALLOW_UNTRAINED_TASKS_ENV,
+                    task,
+                    VDN_PARTITION_COSINE,
+                )
+                return
             # The escape hatch exists so the fl2va/ref2va question can be ANSWERED --
             # structurally they run (reference media sits in the prefix, which the window
             # keeps dense), so the only way to know is to render and look. It is opt-in
@@ -518,6 +568,7 @@ class VDNCheckpoint:
                 raise OmniClientError(f"VDN-H3 requires {key}={expected:g}, got {requested:g}")
 
 
+_BIAS_LAYOUT = "bias"
 _PLAIN_SLOT = "plain"
 _QKV_SLOTS = ("q", "k", "v")
 _QKV_LAYOUT = "qkv"
@@ -549,11 +600,14 @@ def _read_branch(path: Path, *, num_blocks: int) -> dict[str, torch.Tensor]:
     return out
 
 
-def _read_adapters(root: Path) -> tuple[dict[str, _Patch], tuple[str, ...]]:
+def _read_adapters(root: Path, *, only: Sequence[str] | None = None) -> tuple[dict[str, _Patch], tuple[str, ...]]:
     """Every adapter under ``adapters/``, resolved onto native parameter names.
 
-    All of them, unconditionally: a stage-dmd artifact carries ``default`` and ``turbo``
-    and the released inference path merges both. Applying one is a different model.
+    All of them by default: a stage-dmd artifact carries ``default`` and ``turbo`` and
+    the released inference path merges both, so applying one is a different model.
+    ``only`` narrows that to a named subset for the bake tool -- see
+    ``VDNCheckpoint.from_path`` for the one case that justifies it. A name that is not
+    present raises rather than silently producing a smaller artifact than asked for.
     """
     from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
         _PLAIN,
@@ -566,7 +620,19 @@ def _read_adapters(root: Path) -> tuple[dict[str, _Patch], tuple[str, ...]]:
     if not root.is_dir():
         return patches, ()
 
-    for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+    directories = sorted(p for p in root.iterdir() if p.is_dir())
+    if only is not None:
+        wanted = tuple(only)
+        present = {p.name for p in directories}
+        unknown = [name for name in wanted if name not in present]
+        if unknown:
+            raise VDNCheckpointError(
+                f"{root} has no adapter(s) {unknown}; it carries {sorted(present)}. Baking a "
+                "subset that does not exist would produce an artifact silently missing an edit."
+            )
+        directories = [p for p in directories if p.name in set(wanted)]
+
+    for directory in directories:
         tensor_file = directory / "adapter_model.safetensors"
         if not tensor_file.is_file():
             raise VDNCheckpointError(f"adapter {directory.name} has no adapter_model.safetensors")
@@ -577,7 +643,9 @@ def _read_adapters(root: Path) -> tuple[dict[str, _Patch], tuple[str, ...]]:
             # in a way this loader does not reproduce -- FastH3, for instance, ships
             # full-rank ``.diff`` tensors. Silently skipping them would serve a
             # partially-applied adapter.
-            unconsumed = sorted(k for k in keys if not (_LORA_A.search(k) or _LORA_B.search(k)))
+            unconsumed = sorted(
+                k for k in keys if not (_LORA_A.search(k) or _LORA_B.search(k) or k.endswith(_DIFF_B_SUFFIX))
+            )
             if unconsumed:
                 raise VDNCheckpointError(
                     f"{tensor_file} carries {len(unconsumed)} non-LoRA tensors this loader does "
@@ -608,6 +676,29 @@ def _read_adapters(root: Path) -> tuple[dict[str, _Patch], tuple[str, ...]]:
                 if patch.layout != param_layout:
                     raise VDNCheckpointError(f"{native} is claimed with two layouts: {patch.layout} and {param_layout}")
                 patch.pairs.setdefault(slot, []).append((adapter.get_tensor(key), adapter.get_tensor(b_key)))
+
+            for key in keys:
+                if not key.endswith(_DIFF_B_SUFFIX):
+                    continue
+                module = _strip_hybrid_level(key[: -len(_DIFF_B_SUFFIX)])
+                resolved = _resolve_native_target(module)
+                if resolved is None:
+                    raise VDNCheckpointError(f"{tensor_file}: adapter target {module!r} has no parameter in this model")
+                native_suffix, layout, _ = resolved
+                if layout in _QKV_SLOTS or layout == _SWAP_HALVES:
+                    raise VDNCheckpointError(
+                        f"{tensor_file}: {key} is a bias residual on {module!r}, which this model packs "
+                        f"as {layout!r}; only the curve-pruned AdaLN projections carry one"
+                    )
+                # The residual belongs to the pruned parameter's folded_bias, not to the
+                # weight it was fitted alongside. A base without one is an UNPRUNED
+                # checkpoint, and this adapter has already been narrowed to a rank-8
+                # curve it cannot undo -- so that is refused at fuse time, by name.
+                native = f"{native_suffix.rsplit('.linear', 1)[0]}.folded_bias"
+                patch = patches.setdefault(native, _Patch(layout=_BIAS_LAYOUT))
+                if patch.layout != _BIAS_LAYOUT:
+                    raise VDNCheckpointError(f"{native} is claimed with two layouts: {patch.layout} and {_BIAS_LAYOUT}")
+                patch.biases.append(adapter.get_tensor(key))
     return patches, tuple(names)
 
 
@@ -652,8 +743,22 @@ def check_bake_agreement(checkpoint: VDNCheckpoint, model_path: str | Path | Non
         )
 
 
-def resolve_vdn_checkpoint(od_config: Any, transformer: MiniMaxH3DiTModel) -> VDNCheckpoint | None:
-    """Claim ``--lora-path`` when it points at a VDN-H3 checkpoint directory."""
+def resolve_vdn_checkpoint(
+    od_config: Any,
+    transformer: MiniMaxH3DiTModel,
+    *,
+    model_path: str | Path | None = None,
+) -> VDNCheckpoint | None:
+    """Claim ``--lora-path`` when it points at a VDN-H3 checkpoint directory.
+
+    ``model_path`` is the partition THIS transformer's weights come from, and it is what
+    the bake stamp is read off. It defaults to the served model, which is right for the
+    primary DiT and wrong for the second one: on a ``combined`` partition the ref2va DiT
+    loads from ``<root>/Ref2VA`` while ``od_config.model`` is the root, and
+    ``bake_vdn_adapters.py`` stamps one ``transformer/`` per run. Reading the root's
+    stamp for the ref DiT lets exactly the two disagreements ``check_bake_agreement``
+    exists to catch through -- a double fuse, or a branch with no adapters at all.
+    """
     lora_path = getattr(od_config, "lora_path", None)
     if isinstance(lora_path, list | tuple):
         if len(lora_path) != 1:
@@ -668,7 +773,7 @@ def resolve_vdn_checkpoint(od_config: Any, transformer: MiniMaxH3DiTModel) -> VD
         num_blocks=arch.num_layers,
     )
     if checkpoint is not None:
-        check_bake_agreement(checkpoint, getattr(od_config, "model", None))
+        check_bake_agreement(checkpoint, model_path if model_path is not None else getattr(od_config, "model", None))
     return checkpoint
 
 
@@ -677,7 +782,8 @@ __all__ = [
     "VDN_BAKED_STAMP_KEY",
     "baked_adapters_of",
     "check_bake_agreement",
-    "VDN_UNREACHABLE_TASKS",
+    "VDN_PARTITION_COSINE",
+    "VDN_TRANSFERRED_TASKS",
     "VDN_AUDIO_SHIFT",
     "VDN_SUPPORTED_TASKS",
     "VDN_VIDEO_SHIFT",
