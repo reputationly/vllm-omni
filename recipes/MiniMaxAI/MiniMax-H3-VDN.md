@@ -112,6 +112,92 @@ being a different distillation from LightX2V's Turbo8 -- it is not attributable 
 attention alone. Serving it needs `VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1`, which warns
 on every request for exactly this reason.
 
+## The curve-pruned tier: 19.5 GB, and how the turbo adapter gets in
+
+The tier above (43.8 GB, peaking 39.1 of 40 GiB) leaves 0.4 GiB of headroom, which is
+not enough to ship. Curve pruning is what closes that, and for a while it looked
+impossible to combine with VDN.
+
+AdaLN is ~40% of H3's weights: 50 blocks x 96768 x 2688 x 2 B = 24.2 GiB. Pruning
+replaces the 2688-wide time embedding those 51 projections consume with an 8-wide sampled
+basis (`adaln_proj.linear` becomes `[out, 8]` behind `adaln_basis`, plus an fp32
+`folded_bias`), which is where 62 -> 37.5 GB comes from. It is not a compromise: AdaLN's
+input is never an arbitrary vector, it is `silu(time_embedder(t))`, so over a whole
+render it only ever takes the 1025 values the pruned table samples. Reconstructing the
+base AdaLN output both ways agrees to **1.05e-04**.
+
+The problem is that VDN's `turbo` adapter edits exactly those 51 tensors with an
+`[out, 2688]` delta. `turbo` was distilled by DMD against the frozen Stage-B VDN as its
+real score, so it and the branch are a matched pair -- substituting production's Turbo8
+splits that pair, and the result measurably regresses.
+
+An earlier version of this document reported that the delta could not be projected onto
+the pruned basis: relative residual **0.9978**, i.e. 93% discarded. That measurement was
+of a *linear* projection over all of R^2688, and it was the wrong question. Fitting on
+the 1025 points AdaLN actually visits, **affinely**, is enough:
+
+```text
+S @ A.T  ~=  C @ A8.T + c        S = [1025, 2688] full post-SiLU curve
+                                 C = [1025, 8]    the pruned table
+design   =  [C | 1]              the intercept column is the whole trick
+A8       =  (P[:8] @ A.T).T      replaces lora_A
+diff_b   =  B @ (P[8] @ A.T)     added to folded_bias, fp32
+```
+
+Drop the intercept and curve reconstruction goes from 1.4e-05 to **9.5e-01** -- the curve
+does not pass through the origin, and the constant it is offset by carries most of the
+modulation. With it, the 51 projected modules land at 2.6e-06 .. 2.2e-05.
+
+The method is Apache-2.0 prior art (`adaln_curve_affine_lstsq_pinv1025_with_diff_b` in
+`T8mars/comfyui-minimax-h3-audio-T8`); `tools/minimax_h3/vdn_curve_projection.py` is an
+independent implementation against our tensor names, agreeing with its published
+per-module errors to 3%.
+
+```bash
+# 1. project turbo onto the pruned partition's curve
+python tools/minimax_h3/project_vdn_turbo_to_pruned_curve.py \
+  --vdn    /nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250 \
+  --pruned /nfs-data/models/MiniMax-H3-Ref2VA-Pruned-r8-BF16-partition \
+  --full   /nfs-data/models/MiniMax-H3/Ref2VA \
+  --dst    /nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250-curve-ref2va
+# 2. bake both adapters in
+python tools/minimax_h3/bake_vdn_adapters.py \
+  --src /nfs-data/models/MiniMax-H3-Ref2VA-Pruned-r8-BF16-partition \
+  --vdn /nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250-curve-ref2va \
+  --dst /nfs-data/models/MiniMax-H3-Ref2VA-Pruned-VDNfull-BF16 --link-siblings
+# 3. quantize
+python vllm_omni/quantization/tools/quantize_minimax_h3_int8.py \
+  --src /nfs-data/models/MiniMax-H3-Ref2VA-Pruned-VDNfull-BF16 \
+  --dst /nfs-data/models/MiniMax-H3-Ref2VA-Pruned-VDNfull-INT8 \
+  --activation-scheme weight_only
+```
+
+`--pruned` and `--full` must be the SAME partition's pruned and unpruned forms: the fit
+is per-partition (each has its own `time_embedder`), and a projection made against
+another partition's curve loads without complaint while sampling `turbo` on the wrong
+modulation. The same applies to `--lora-path` at serve time -- `curve-fl2va-baked` and
+`curve-ref2va-baked` are not interchangeable.
+
+**FL2VA needs one extra step.** Its pruned base is diffusers-named, and the quantizer
+matches tensors by *partition* names (`blocks.N.attn.qkv_proj.weight`), so it reports
+"matched no tensors". Insert `tools/minimax_h3_turbo/convert_pruned_to_partition.py`
+between steps 2 and 3. (This is why the pruned FL2VA tier had never been quantized:
+production was serving pruned **BF16**.)
+
+Measured at 15 s / 768p, four official multi-shot prompts plus re-seeds:
+
+| | ref2va | fl2va |
+| --- | --- | --- |
+| artifact | 19.5 GB | 19.5 GB |
+| time | 370-478 s | 361-394 s |
+| pairs kept | 37.4% | 22.8% |
+| OOM | none | none |
+
+Pruned and unpruned agree at the same seed (sharpness 59.4/59.2 and 127.3/131.0), so the
+19.5 GB is bought without a picture cost. fl2va keeps fewer pairs because it has fewer
+global rows -- one reference image against ref2va's image plus reference audio, and
+global rows are dense in both directions.
+
 ## ref2va runs on a different DiT, and the transfer is unvalidated
 
 H3 serves ref2va from `transformer_ref/`, not the `transformer/` VDN's adapters were
@@ -176,6 +262,20 @@ vllm serve /nfs-data/models/MiniMax-H3 \
   --trust-remote-code
 ```
 
+The two production tiers serve a baked artifact instead, with the branch-only directory
+on `--lora-path`:
+
+```bash
+vllm serve /nfs-data/models/MiniMax-H3-Ref2VA-Pruned-VDNfull-INT8-vLLM \
+  --deploy-config deploy-configs/minimax_h3_vdn8_ref2va_pruned_a100_40g.yaml \
+  --lora-path /nfs-data/models/VDN-MiniMax-H3/stage-dmd-step-250-curve-ref2va-baked \
+  --trust-remote-code
+```
+
+`0 adapters (none)` in the startup line is then CORRECT -- they are in the weights. Two
+means `--lora-path` still points at a directory with `adapters/`, and every LoRA is being
+applied a second time on top of itself.
+
 The increment goes through `--lora-path` but is **not** a request-switchable LoRA. Its
 linear branch is an architecture change that its two adapters were trained jointly with,
 so it is fused and injected at load time; serving base H3 with the branch, or the branch
@@ -191,7 +291,7 @@ they are worth stating:
 | `diffusion_attention_backend: VDN_WINDOW_ATTN` | The branch is the window's complement; beside a dense attention it counts everything outside the window twice | `validate_hybrid_runtime` at startup |
 | `ulysses_degree: 1`, `ring_degree: 1` | The branch's scan runs over frames and needs the whole target video on each rank; shard with TP, which divides heads | `validate_hybrid_runtime` at startup |
 | `task: t2va` | Only T2VA was trained; fl2va/ref2va put reference media in a prefix the branch never saw, and ref2va additionally runs a different DiT (cosine 0.99953). Both are refused unless `VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1` | `check_task` per request |
-| `flow_shift: 12.0` (audio 3.0) | Part of the distillation, not a request preference | `check_request` per request |
+| `flow_shift: 12.0` (audio 3.0) | Part of the distillation, not a request preference. It belongs to the ARTIFACT, read from its `metadata.json`, and the pipeline OVERRIDES the partition's declared value with it at startup -- ref2va's partition says 6.0, and production's non-VDN engine silently ignores the request's value while VDN does not. Do not copy a t2va script's parameters to compare the two | `check_request` per request |
 
 Clips shorter than the window fall back to dense attention automatically and the branch
 contributes exactly zero — a window that covers every frame *is* the original attention.
@@ -199,12 +299,16 @@ contributes exactly zero — a window that covers every frame *is* the original 
 ## Validation
 
 ```bash
-# Geometry, backend, TP sharding, wiring and checkpoint loading
+# Geometry, backend, TP sharding, wiring, checkpoint loading and curve projection
 pytest tests/diffusion/models/minimax_h3 -k vdn
 
-# Parity against OpenVDN's own implementation (requires their checkout)
-VDN_REFERENCE_ROOT=/path/to/vdn-minimax-h3 \
-  pytest tests/diffusion/models/minimax_h3/test_minimax_h3_vdn_branch_parity.py
+# Parity against OpenVDN's own implementation (requires their checkout): the linear
+# branch AND the window softmax, which for a while was checked only against a mask this
+# repository also wrote -- if our reading of the geometry had been wrong, both sides of
+# that test would have been wrong together and it would have stayed green.
+VDN_REFERENCE_ROOT=/path/to/vdn-minimax-h3 pytest \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_vdn_branch_parity.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_vdn_window_parity.py
 ```
 
 The branch has no reference output that a rendered frame would reveal — a wrong forget
