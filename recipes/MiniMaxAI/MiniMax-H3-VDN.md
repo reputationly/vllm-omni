@@ -104,6 +104,16 @@ this recipe recommended it. The speed advantage is small here because that tier 
 already an 8-step distill and W8A16 runs a Triton GEMM rather than BF16 cuBLAS -- the
 window's saving is real but it is spent, not banked.
 
+**Upstream has since added keyframe conditioning.** As of `4250fbc` (2026-09-09) the
+released harness renders i2va, l2va and fl2va, and `encode_keyframes.py` documents a
+detail worth knowing on our side too: MiniMax-H3 expects the prompt to OPEN with a
+mode-specific instruction line naming how each reference picture aligns with the target
+video (from the official `VIDEO_PROMPT_WRITING_GUIDE`). Our engine does not add it -- the
+facade does, and the three lines are already there verbatim -- so a request that reaches
+the engine directly, bypassing the facade, is conditioned off-spec even though the
+keyframe still lands. Whether upstream also TRAINED those modes is a separate question
+this note does not answer; the paragraph below still holds until it is.
+
 Two caveats that do not go away by liking the output. fl2va is a task VDN never trained
 on: the keyframe IS honoured (PSNR to the reference at frame 0 is 36.43 dB against the
 dense control's 36.52, i.e. the same) but the branch never saw reference media in the
