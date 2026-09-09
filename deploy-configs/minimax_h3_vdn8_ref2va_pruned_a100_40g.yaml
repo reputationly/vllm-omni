@@ -10,6 +10,12 @@
 #   分区**做的（每个分区有自己的 time_embedder），拿错分区的投影结果加载不会报错，
 #   只会把 turbo 采样到错误的调制上。
 #
+#   注意这一条**只对本文件这份自研制品成立**。社区微调 Singularity 的 ref2va 走
+#   minimax_h3_singularity_vdn8_ref2va_a100_40g.yaml，那边反过来必须用 curve-fl2va
+#   （它血统是 FL2VA，曲线表与 FL2VA 分区逐位相同）。判据是曲线表逐位比对，不是
+#   文件名 —— Singularity 的文件名也写着 ref2va。两份 YAML 正文逐字段相同，区别
+#   全在配套的权重与 lora，别互相照抄注释。
+#
 # --- 为什么能同时剪枝和上 VDN ---
 #   剪枝把 51 个 AdaLN 投影的输入从 2688 维时间嵌入换成 8 维采样表，而 VDN 的 turbo
 #   适配器带的是 [out, 2688] 的 delta，形状对不上。turbo 是 DMD 阶段以冻结的 Stage-B

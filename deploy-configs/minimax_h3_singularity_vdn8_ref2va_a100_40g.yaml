@@ -1,0 +1,96 @@
+# Minimax-h3_Singularity + VDN 8 步（社区微调 + 混合注意力 + 曲线剪枝 + INT8）
+#   — DiT stage, A100 PCIE 40G x4，ref2va
+#
+# 与 minimax_h3_singularity_vdn8_fl2va_a100_40g.yaml 是同一份底座的两个任务，
+# 差别只在 task_type 和参考图封顶那一个环境变量。
+#
+# --- 权重 ---
+#   /nfs-models/wuhanjisuan894/models/MiniMax-H3-Singularity-VDN-INT8-ref2va   19.5 GB
+#   --lora-path /nfs-models/wuhanjisuan894/models/VDN-MiniMax-H3/stage-dmd-step-250-curve-fl2va-baked2
+#
+#   **lora 用 curve-fl2va，不是 curve-ref2va。** 这一条和自研的
+#   minimax_h3_vdn8_ref2va_pruned_a100_40g.yaml 恰好相反，容易照着改错：
+#
+#     自研 ref2va 制品  -> 曲线表是 Ref2VA 分区自己拟合的 -> 必须 curve-ref2va
+#     Singularity      -> 血统是 FL2VA（一维张量与 FL2VA 逐位相同，与 Ref2VA 差
+#                         0.005），adaln_t_table 与我们 FL2VA 剪枝分区**逐位相同**
+#                         （相对差 0.0e+00）           -> 必须 curve-fl2va
+#
+#   曲线拟合是按分区做的，拿错分区的投影加载不会报错，只会把 turbo 采样到错误的
+#   调制上。判据不是文件名（Singularity 的文件名写着 ref2va），是曲线表逐位比对。
+#
+# --- 为什么在 ref2va 上换这份底座 ---
+#   它同时赢了两根轴：锐度 108.6 对 60.1，**对参考图首帧保真 0.709 对 0.214**。
+#   后者是自研 ref2va VDN 制品一直落后的那根轴，曾以为是"跨分区未验证迁移的必然
+#   代价"，换底座后两样一起拿到了，说明那个代价不是必然的。
+#
+# --- 硬约束（与自研 ref2va 那份完全相同，配错不报错只出错片）---
+#   1. diffusion_attention_backend 必须是 VDN_WINDOW_ATTN，启动时 validate_hybrid_runtime 拦。
+#   2. ulysses_degree / ring_degree 必须是 1，分支的扫描沿帧展开，用 TP 切头。
+#   3. 必须显式开 VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1：VDN 适配器没有在 ref2va 的
+#      那份 DiT 上训练过。
+#   4. flow_shift 不在这里设，从制品 metadata.json 读（12.0 / 音频 3.0），启动时会
+#      覆盖 ref2va 分区声明的 6.0 并打日志。别照抄现网 ref2va 的请求参数去测——
+#      现网静默忽略请求里的 flow_shift，VDN 不会。
+#
+# --- 显存：三个环境变量都是必需的，不是调优 ---
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#     VLLM_OMNI_VDN_KV_GATHER_BUDGET_MB=192            （默认 512）
+#     VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS=1032192        （fl2va 不需要）
+#
+#   第三个的理由见 minimax_h3_vdn8_ref2va_pruned_a100_40g.yaml，不重复。要点是参考图
+#   是唯一没有面积封顶的一条路，不设时 9 图的行为是"第一条能用、第二条 OOM"，
+#   空闲实例过、忙过的实例崩，验收测一发发现不了。
+#
+# --- 现网实测（0039，开封顶后）---
+#   9 图                481 s / 399 s   连发两条都过
+#   9 图 + 3 视频        396 s          契约上限（<=9图 <=3视频 <=3音频 且总数 <=12）
+#
+# --- 许可 ---
+#   README 声明 apache-2.0，但底座 MiniMax-H3 是 MiniMax H3 Community License，
+#   带地域限制（排除 EU/UK/KR/US）。派生物单方声明不解除底座许可。
+#
+# --- 挪不进本文件的东西 ---
+#   VLLM_OMNI_* 环境变量、--init-timeout / --stage-init-timeout、--lora-path，
+#   原因见 minimax_h3_a100_40g.yaml 的注释。
+pipeline: minimax_h3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    task_type: ref2va
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+
+    enable_cpu_offload: true
+    vae_use_tiling: true
+
+    # 硬约束 1。
+    diffusion_attention_backend: VDN_WINDOW_ATTN
+
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+
+    enable_multithread_weight_load: false
+    enable_diffusion_pipeline_profiler: true
+
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      sequence_parallel_size: 1
+      # 硬约束 2：这两个必须留 1。
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+
+    default_sampling_params:
+      # VDN 的 turbo 是 8 步；flow_shift 同样从制品的 metadata.json 读，见硬约束 4。
+      num_inference_steps: 8
