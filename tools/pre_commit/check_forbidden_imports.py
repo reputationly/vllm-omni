@@ -55,6 +55,12 @@ CHECK_IMPORTS = {
             # pickle/cloudpickle are unsafe when deserializing untrusted data.
             "tests/diffusion/attention/test_attention_sp.py",
             "tests/helpers/process.py",
+            # An offline debug tool, run by hand on a snapshot that
+            # torch.cuda.memory._dump_snapshot wrote in the same investigation. The format
+            # is pickle and torch offers no other reader, so the choice is this or
+            # torch.load(weights_only=False), which unpickles just the same while hiding it
+            # from this check. It never sees data from anywhere but the operator's own run.
+            "tools/minimax_h3/analyze_memory_snapshot.py",
             "vllm_omni/diffusion/distributed/group_coordinator.py",
         },
     ),

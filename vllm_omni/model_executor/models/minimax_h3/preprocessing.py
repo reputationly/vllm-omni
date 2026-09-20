@@ -36,6 +36,37 @@ _VIDEO_TAG = 0
 
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
+
+# EXPERIMENTAL. 768 is not a policy choice: the released weights are distilled at it, so
+# anything else leaves that distribution. 2026-08-30 rejected native 1080p on ``corr_all``,
+# a metric later shown to reward blur -- and the 2026-09-19 re-run found it visibly
+# sharper, so the lock is now an opt-in rather than an absolute.
+#
+# Additive on purpose: an override that REPLACED 768 would make a server configured for
+# 1080 reject every existing request, which is a deployment break, not an experiment.
+_EXPERIMENTAL_SHORT_EDGE_ENV = "VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE"
+
+
+def _allowed_output_short_edges() -> tuple[int, ...]:
+    raw = os.getenv(_EXPERIMENTAL_SHORT_EDGE_ENV)
+    if not raw:
+        return (MINIMAX_H3_OUTPUT_SHORT_EDGE,)
+    extra = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    return tuple(dict.fromkeys((MINIMAX_H3_OUTPUT_SHORT_EDGE, *extra)))
+
+
+def _output_max_pixels(short_edge: int | None = None) -> int:
+    """Area cap for one canvas, scaled with its own short edge.
+
+    Keyed on the requested edge rather than a global, so 768 keeps exactly its old cap on
+    a server that also offers 1080.
+    """
+    edge = int(short_edge or MINIMAX_H3_OUTPUT_SHORT_EDGE)
+    if edge == MINIMAX_H3_OUTPUT_SHORT_EDGE:
+        return MINIMAX_H3_OUTPUT_MAX_PIXELS
+    return int(MINIMAX_H3_OUTPUT_MAX_PIXELS * (edge / MINIMAX_H3_OUTPUT_SHORT_EDGE) ** 2)
+
+
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
@@ -155,8 +186,10 @@ def resolve_minimax_h3_output_canvas(aspect_ratio: float, short_edge: int) -> tu
     """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
     if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
         raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be positive, got {aspect_ratio!r}")
-    if short_edge != MINIMAX_H3_OUTPUT_SHORT_EDGE:
-        raise OmniClientError(f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge}")
+    if short_edge not in _allowed_output_short_edges():
+        raise OmniClientError(
+            f"MiniMax H3 target.short_edge must be one of {_allowed_output_short_edges()}, got {short_edge}"
+        )
     if aspect_ratio >= 1.0:
         width = float(short_edge) * aspect_ratio
         height = float(short_edge)
@@ -164,8 +197,8 @@ def resolve_minimax_h3_output_canvas(aspect_ratio: float, short_edge: int) -> tu
         width = float(short_edge)
         height = float(short_edge) / aspect_ratio
     area = width * height
-    if area > MINIMAX_H3_OUTPUT_MAX_PIXELS:
-        scale = (MINIMAX_H3_OUTPUT_MAX_PIXELS / area) ** 0.5
+    if area > _output_max_pixels(short_edge):
+        scale = (_output_max_pixels(short_edge) / area) ** 0.5
         width *= scale
         height *= scale
     return _align_multiple(height, 32), _align_multiple(width, 32)

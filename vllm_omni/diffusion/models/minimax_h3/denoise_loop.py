@@ -74,6 +74,34 @@ MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
 
 _LOG_STEP_MEMORY = os.getenv("VLLM_OMNI_H3_LOG_STEP_MEMORY", "0") == "1"
+# Diagnostic only: record the allocator's history across the step where the peak forms,
+# then dump it with call stacks. Guessing at the peak's owner from aggregate numbers has
+# a poor track record -- the snapshot names the allocating frame instead.
+_SNAPSHOT_DIR = os.getenv("VLLM_OMNI_H3_MEMORY_SNAPSHOT_DIR")
+_SNAPSHOT_STEP = int(os.getenv("VLLM_OMNI_H3_MEMORY_SNAPSHOT_STEP", "1"))
+
+
+def _snapshot_begin(step: int) -> None:
+    if not _SNAPSHOT_DIR or step != 0 or not torch.cuda.is_available():
+        return
+    # stacks="python": the default C++ unwind frames come back unsymbolized, which names
+    # the allocator rather than the caller and defeats the whole point.
+    torch.cuda.memory._record_memory_history(enabled="all", context="all", stacks="python", max_entries=400_000)
+    logger.info("H3 memory snapshot: recording started")
+
+
+def _snapshot_end(step: int, num_steps: int) -> None:
+    # Clamped to the last step, not just compared with the requested one. Recording keeps
+    # a Python stack per allocation, so a _STEP at or past the schedule's length -- easy to
+    # hit, the distilled schedules are 8 and 4 steps -- would otherwise leave it running for
+    # the life of the process and accumulating across every later request.
+    if not _SNAPSHOT_DIR or step != min(_SNAPSHOT_STEP, num_steps - 1) or not torch.cuda.is_available():
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    path = f"{_SNAPSHOT_DIR}/h3_mem_rank{rank}.pickle"
+    torch.cuda.memory._dump_snapshot(path)
+    torch.cuda.memory._record_memory_history(enabled=None)
+    logger.info("H3 memory snapshot: wrote %s and stopped recording", path)
 
 
 def _log_step_memory(step: int, video_rows: torch.Tensor, audio_rows: torch.Tensor) -> None:
@@ -391,6 +419,7 @@ def minimax_h3_denoise_loop(
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
+            _snapshot_begin(step)
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
             s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
             # Publish where we are so step-gated attention features (the dense
@@ -449,6 +478,7 @@ def minimax_h3_denoise_loop(
                 on_step(step, video_rows, audio_rows)
             # Status only -- throttled and a no-op outside a served request.
             report_phase(PHASE_DENOISE, step + 1, num_steps)
+            _snapshot_end(step, num_steps)
 
     minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows

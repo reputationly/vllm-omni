@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import regex as re
@@ -50,6 +50,10 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.low_vram import (
+    attention_head_chunks,
+    ffn_row_chunks,
+)
 from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import (
     VDNHybridAttention,
     combine_hybrid_output,
@@ -734,12 +738,43 @@ class MiniMaxH3Attention(nn.Module):
             },
             video_layout=video_layout,
         )
-        return self.attention(
-            q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
-            metadata,
-        ).squeeze(0)
+        heads = int(q.shape[1])
+        groups = attention_head_chunks(heads)
+        # Grouping splits the head axis, so it is only defined when Q and K/V have the
+        # same head count. Under GQA a KV head is shared by several Q heads and an even
+        # split would pair the wrong ones; H3 is MHA today, and this keeps the knob from
+        # silently doing that if it ever is not.
+        if groups == 1 or heads != int(k.shape[1]):
+            return self.attention(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                metadata,
+            ).squeeze(0)
+
+        step = (heads + groups - 1) // groups
+        gate = metadata.extra.get("gate_compress")
+        out = None
+        for start in range(0, heads, step):
+            stop = min(start + step, heads)
+            group_metadata = metadata
+            if gate is not None:
+                # The VSA gate is per-head; a group must see its own slice, and the
+                # metadata is copied rather than mutated so a backend that retains it
+                # cannot observe another group's gate.
+                group_metadata = replace(metadata, extra={**metadata.extra, "gate_compress": gate[:, :, start:stop]})
+            part = self.attention(
+                q[:, start:stop].unsqueeze(0),
+                k[:, start:stop].unsqueeze(0),
+                v[:, start:stop].unsqueeze(0),
+                group_metadata,
+            ).squeeze(0)
+            if out is None:
+                out = torch.empty((part.shape[0], heads, part.shape[-1]), dtype=part.dtype, device=part.device)
+            out[:, start:stop] = part
+            del part
+        assert out is not None
+        return out
 
     def forward(
         self,
@@ -754,6 +789,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_text_span: tuple[int, int] | torch.Tensor | None = None,
+        sp_row_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -837,8 +873,31 @@ class MiniMaxH3Attention(nn.Module):
         out, _ = self.out_proj(self.vdn.gate_softmax(out, x))
         branch_partial = video_span = None
         if geometry is not None:
-            branch_partial, start, stop = self.vdn.readout(x, qkv_raw, geometry=geometry, text_span=vdn_text_span)
-            video_span = (start, stop)
+            # The branch reads x by row, so being told "not sharded" while holding a shard
+            # is unrecoverable and silent: it would summarise the wrong frames and render.
+            # sp_row_span is threaded from the one place that knows both lengths, and this
+            # catches any future path that splits the rows without threading it -- a
+            # non-strict ulysses_mode, or a sequence the even split cannot divide.
+            if sp_row_span is None and packed_total is not None and total != packed_total:
+                raise RuntimeError(
+                    f"the VDN branch holds {total} of {packed_total} packed rows but was given no "
+                    "sequence-parallel span. Some sharding path did not thread sp_row_span through; "
+                    "running on would slice this shard by global video offsets."
+                )
+            # sp_row_span is set only when x really is a row shard -- the caller decides,
+            # because only it sees both the local and the global length. The branch then
+            # cannot slice the video by its global span; the sharded path returns LOCAL row
+            # bounds, which is what combine_hybrid_output needs to place the partial anyway.
+            result = (
+                self.vdn.readout_row_shard(
+                    x, qkv_raw, geometry=geometry, text_span=vdn_text_span, local_span=sp_row_span
+                )
+                if sp_row_span is not None
+                else self.vdn.readout(x, qkv_raw, geometry=geometry, text_span=vdn_text_span)
+            )
+            if result is not None:
+                branch_partial, start, stop = result
+                video_span = (start, stop)
         return combine_hybrid_output(out, branch_partial, video_span)
 
 
@@ -874,9 +933,36 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
-        out, _ = self.fc2(hidden)
+        chunks = ffn_row_chunks(int(x.shape[0]))
+        if chunks == 1:
+            hidden, _ = self.fc1(x)
+            hidden = self.act_fn(hidden)
+            out, _ = self.fc2(hidden)
+            return out
+
+        # Chunk fc1 and the activation; run fc2 ONCE on the whole tensor.
+        #
+        # fc1 is column-parallel with gather_output=False, so it performs no collective
+        # and a row slice of it is exact. fc2 is a RowParallelLinear that all-reduces
+        # internally: calling it per chunk would turn one collective into N, and NCCL
+        # selects its reduction algorithm by message size -- so the cross-rank summation
+        # order, and its rounding, would change with the chunk count. Measured on 5s/1088p
+        # with TP4: chunking through fc2 left the video bit-identical but moved the audio
+        # by 3.7% of full scale. Keeping fc2 whole costs the activation buffer and makes
+        # the result byte-for-byte the unchunked one.
+        rows = int(x.shape[0])
+        step = (rows + chunks - 1) // chunks
+        activated = None
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            part, _ = self.fc1(x[start:stop])
+            part = self.act_fn(part)
+            if activated is None:
+                activated = torch.empty((rows, part.shape[-1]), dtype=part.dtype, device=part.device)
+            activated[start:stop] = part
+            del part
+        assert activated is not None
+        out, _ = self.fc2(activated)
         return out
 
 
@@ -1070,6 +1156,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_text_span: tuple[int, int] | torch.Tensor | None = None,
+        sp_row_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1107,6 +1194,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             vdn_text_span=vdn_text_span,
+            sp_row_span=sp_row_span,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1840,6 +1928,9 @@ class MiniMaxH3DiTModel(nn.Module):
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
                 vdn_text_span=vdn_text_span,
+                # None unless the rows really are split: the branch's sharded path costs
+                # collectives, and on the unsharded path local_span is the whole sequence.
+                sp_row_span=None if local_len == seq_len else local_span,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)

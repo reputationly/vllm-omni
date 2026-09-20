@@ -38,6 +38,10 @@ merged LoRA it sees the adapted projections for free.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -321,13 +325,17 @@ def _activate(tokens: torch.Tensor, l2norm: bool) -> torch.Tensor:
 
 
 def frame_statistics(
-    key_f: torch.Tensor, value_f: torch.Tensor, beta: torch.Tensor
+    key_f: torch.Tensor, value_f: torch.Tensor, beta: torch.Tensor, *, symmetrise: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-frame delta-rule statistics. key_f/value_f: [F, H, S, d]; beta: [F, H, S].
 
     A is accumulated in fp32 and explicitly symmetrised (see the module docstring); B is
     a plain readout that is never inverted and its error enters the state linearly, so
     it stays on the tensor cores in bf16 and is widened afterwards.
+
+    ``symmetrise=False`` leaves A raw for a caller that will sum partials across ranks
+    first: symmetrising commutes with the sum, so doing it once at the end is both
+    cheaper and the same number.
 
     The ``.contiguous()`` calls are load-bearing rather than defensive: the callers hand
     in ``.permute(0, 2, 1, 3)`` views, so the contraction axis S carries stride H*d and
@@ -340,9 +348,320 @@ def frame_statistics(
         value_beta = (value_f * beta.unsqueeze(-1).to(value_f.dtype)).contiguous()
 
         a_stat = torch.matmul(scaled32.transpose(-1, -2), key32)
-        a_stat = 0.5 * (a_stat + a_stat.transpose(-1, -2))
+        if symmetrise:
+            a_stat = 0.5 * (a_stat + a_stat.transpose(-1, -2))
         b_stat = torch.matmul(value_beta.transpose(-1, -2), key16).float()
         return a_stat, b_stat
+
+
+HALO_FRAMES = SHORT_CONV_KERNEL // 2
+
+
+def halo_frame_span(
+    row_start: int,
+    num_rows: int,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    halo: int = HALO_FRAMES,
+) -> tuple[int, int]:
+    """``(first_frame, last_frame)`` of the WHOLE-frame span a row shard must hold.
+
+    Whole frames, not whole rows: ``_features`` runs a ``(t, h, w)`` stencil, so a partial
+    frame has no grid to convolve and zero-padding one would make the boundary see zeros
+    instead of the neighbours the halo exists to supply. The span therefore covers every
+    frame the shard touches plus ``halo`` frames either side, clamped to the clip.
+
+    Only ``k`` and ``v`` actually need the extra rows: ``q`` passes through an elementwise
+    activation whose halo outputs are trimmed away, and ``video_x`` is read on owned rows
+    alone. Exchanging all four would triple the payload for nothing.
+    """
+    if num_rows <= 0:
+        raise ValueError(f"a shard must own at least one row, got {num_rows}")
+    first = max(0, row_start // tokens_per_frame - halo)
+    last = min(num_frames - 1, (row_start + num_rows - 1) // tokens_per_frame + halo)
+    return first, last
+
+
+def halo_row_counts(
+    row_start: int,
+    num_rows: int,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    halo: int = HALO_FRAMES,
+) -> tuple[int, int]:
+    """Rows this shard is missing before and after its own, to fill the haloed span."""
+    first, last = halo_frame_span(
+        row_start, num_rows, num_frames=num_frames, tokens_per_frame=tokens_per_frame, halo=halo
+    )
+    before = row_start - first * tokens_per_frame
+    after = (last + 1) * tokens_per_frame - (row_start + num_rows)
+    return before, after
+
+
+@dataclass(frozen=True, slots=True)
+class HaloTransfer:
+    """One contiguous row range to move between two ranks."""
+
+    peer: int
+    start: int  # global video row of the first row moved
+    count: int
+
+
+def plan_halo_exchange(
+    shards: Sequence[tuple[int, int]],
+    rank: int,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    halo: int = HALO_FRAMES,
+) -> tuple[list[HaloTransfer], list[HaloTransfer]]:
+    """``(recv, send)`` for one rank, given every rank's ``(row_start, num_rows)``.
+
+    Sequence parallelism splits the whole packed sequence -- prompt, audio and reference
+    rows included -- so ranks do NOT own equal numbers of VIDEO rows and a symmetric
+    "send my first k rows to the left" rule would mismatch. The geometry of every shard is
+    therefore taken as input (two integers per rank, all-gathered once) and each rank
+    derives exactly which ranges it must pull, and from whom.
+
+    A missing range can straddle more than one peer when a shard is small, so this returns
+    lists rather than one transfer per side. ``send`` is the mirror image: what this rank
+    owns that some peer's halo needs. Both are ordered by global row so a caller can
+    concatenate the pieces without sorting.
+    """
+    mine_start, mine_count = shards[rank]
+    owned = [(start, count) for start, count in shards]
+
+    def missing(start: int, count: int) -> list[tuple[int, int]]:
+        first, last = halo_frame_span(start, count, num_frames=num_frames, tokens_per_frame=tokens_per_frame, halo=halo)
+        span_lo, span_hi = first * tokens_per_frame, (last + 1) * tokens_per_frame
+        return [(span_lo, start - span_lo), (start + count, span_hi - start - count)]
+
+    def overlaps(lo: int, length: int) -> list[HaloTransfer]:
+        out: list[HaloTransfer] = []
+        if length <= 0:
+            return out
+        hi = lo + length
+        for peer, (peer_start, peer_count) in enumerate(owned):
+            if peer == rank or peer_count <= 0:
+                continue
+            cut_lo = max(lo, peer_start)
+            cut_hi = min(hi, peer_start + peer_count)
+            if cut_hi > cut_lo:
+                out.append(HaloTransfer(peer=peer, start=cut_lo, count=cut_hi - cut_lo))
+        return out
+
+    recv: list[HaloTransfer] = []
+    if mine_count > 0:
+        for lo, length in missing(mine_start, mine_count):
+            recv.extend(overlaps(lo, length))
+
+    send: list[HaloTransfer] = []
+    for peer, (peer_start, peer_count) in enumerate(owned):
+        if peer == rank or peer_count <= 0:
+            continue
+        for lo, length in missing(peer_start, peer_count):
+            if length <= 0:
+                continue
+            cut_lo = max(lo, mine_start)
+            cut_hi = min(lo + length, mine_start + mine_count)
+            if cut_hi > cut_lo:
+                send.append(HaloTransfer(peer=peer, start=cut_lo, count=cut_hi - cut_lo))
+
+    recv.sort(key=lambda transfer: transfer.start)
+    send.sort(key=lambda transfer: (transfer.peer, transfer.start))
+    return recv, send
+
+
+def exchange_halo_rows(
+    tensors: Sequence[torch.Tensor],
+    *,
+    shards: Sequence[tuple[int, int]],
+    rank: int,
+    num_frames: int,
+    tokens_per_frame: int,
+    group: Any = None,
+    halo: int = HALO_FRAMES,
+) -> list[torch.Tensor]:
+    """Fill each tensor's haloed span from its peers; returns buffers, not views.
+
+    ``tensors`` hold this rank's OWNED video rows -- the raw q/k/v, all three of which
+    ``_features`` convolves. The returned buffers cover ``halo_frame_span`` in full, with
+    the owned rows already in place, which is exactly what ``readout_row_shard`` expects.
+
+    Every transfer is posted in one ``batch_isend_irecv``: issuing sends and receives in
+    separate loops deadlocks as soon as two ranks need rows from each other, which the
+    interior ranks always do. Within that batch torch only guarantees matching for
+    same-direction ops between the same pair if both sides enqueue them in the same order,
+    so both plans are walked by ``(peer, start)`` -- a key both ranks compute identically.
+    """
+    import torch.distributed as dist
+
+    # An empty PEER is ordinary and the planner handles it (it simply supplies nothing).
+    # An empty SELF is a caller error, and saying so here beats the bare "a shard must own
+    # at least one row" that halo_frame_span would raise two lines down: there is no buffer
+    # to return, since the haloed span of no rows is not defined.
+    if shards[rank][1] <= 0:
+        raise ValueError(
+            f"rank {rank} owns no rows, so it has no haloed span to fill. Callers must settle "
+            "an idle rank before the first collective, not here."
+        )
+    recv_plan, send_plan = plan_halo_exchange(
+        shards, rank, num_frames=num_frames, tokens_per_frame=tokens_per_frame, halo=halo
+    )
+    order = lambda transfer: (transfer.peer, transfer.start)  # noqa: E731
+    recv_plan = sorted(recv_plan, key=order)
+    send_plan = sorted(send_plan, key=order)
+    row_start, num_rows = shards[rank]
+    first, last = halo_frame_span(
+        row_start, num_rows, num_frames=num_frames, tokens_per_frame=tokens_per_frame, halo=halo
+    )
+    span_lo = first * tokens_per_frame
+    span_rows = (last + 1) * tokens_per_frame - span_lo
+
+    buffers = []
+    for tensor in tensors:
+        buffer = tensor.new_empty((span_rows, *tensor.shape[1:]))
+        buffer[row_start - span_lo : row_start - span_lo + num_rows] = tensor
+        buffers.append(buffer)
+
+    if not recv_plan and not send_plan:
+        return buffers
+
+    # ``shards`` is indexed by rank WITHIN the group, so the peer must be given as
+    # ``group_peer``; ``peer`` is the global rank and the two differ for any group that is
+    # not the world -- which the sequence-parallel group is whenever it coexists with TP.
+    def p2p(op, tensor, peer: int):
+        if group is None:
+            return dist.P2POp(op, tensor, peer)
+        return dist.P2POp(op, tensor, group=group, group_peer=peer)
+
+    ops = []
+    for transfer in recv_plan:
+        offset = transfer.start - span_lo
+        for buffer in buffers:
+            ops.append(p2p(dist.irecv, buffer[offset : offset + transfer.count], transfer.peer))
+    for transfer in send_plan:
+        offset = transfer.start - row_start
+        for tensor in tensors:
+            # ``.contiguous()`` because the send must own a buffer that outlives the loop
+            # iteration; a dim-0 slice would alias rows the caller may still mutate.
+            ops.append(p2p(dist.isend, tensor[offset : offset + transfer.count].contiguous(), transfer.peer))
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+    return buffers
+
+
+def frame_statistics_row_shard(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    row_start: int,
+    num_frames: int,
+    tokens_per_frame: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partial per-frame statistics from a contiguous span of GLOBAL video rows.
+
+    Sequence parallelism splits the packed rows evenly, so a rank can hold part of a
+    frame; ``frame_statistics`` cannot be used directly because its ``view(F, S, ...)``
+    assumes whole frames. This returns the same ``[F, H, d, d]`` tensors with **zero** for
+    every frame the rank does not touch and a partial sum for one it partially covers, so
+    summing across ranks reconstructs the full statistics exactly.
+
+    ``key``/``value`` are ``[N, H, d]`` and ``beta`` is ``[N, H]`` for the rows
+    ``[row_start, row_start + N)``.
+
+    The span is padded out to frame boundaries with zeros rather than looped over frame by
+    frame. Both statistics are sums of outer products along S, so a zero row contributes
+    exactly zero -- the padding is exact, not an approximation -- and the batched matmul
+    that makes ``frame_statistics`` fast is preserved. A per-frame Python loop would issue
+    F/world launches per block per step instead, on a path that runs 400 times a request.
+    """
+    rows = int(key.shape[0])
+    if rows == 0:
+        shape = (num_frames, int(key.shape[1]), int(key.shape[2]), int(key.shape[2]))
+        zeros = torch.zeros(shape, device=key.device, dtype=torch.float32)
+        return zeros, zeros.clone()
+    if beta.shape[0] != rows or value.shape[0] != rows:
+        raise ValueError(f"row counts disagree: key={rows} value={value.shape[0]} beta={beta.shape[0]}")
+
+    first_frame = row_start // tokens_per_frame
+    last_frame = (row_start + rows - 1) // tokens_per_frame
+    if last_frame >= num_frames:
+        raise ValueError(f"rows [{row_start}, {row_start + rows}) exceed {num_frames} frames")
+    local_frames = last_frame - first_frame + 1
+    pad_before = row_start - first_frame * tokens_per_frame
+    pad_after = (last_frame + 1) * tokens_per_frame - (row_start + rows)
+
+    def _pad(tensor: torch.Tensor) -> torch.Tensor:
+        if not pad_before and not pad_after:
+            return tensor
+        before = tensor.new_zeros((pad_before, *tensor.shape[1:]))
+        after = tensor.new_zeros((pad_after, *tensor.shape[1:]))
+        return torch.cat((before, tensor, after), dim=0)
+
+    shape = (local_frames, tokens_per_frame, int(key.shape[1]), int(key.shape[2]))
+    key_f = _pad(key).view(shape).permute(0, 2, 1, 3)
+    value_f = _pad(value).view(shape).permute(0, 2, 1, 3)
+    beta_f = _pad(beta).view(local_frames, tokens_per_frame, -1).permute(0, 2, 1)
+
+    a_local, b_local = frame_statistics(key_f, value_f, beta_f)
+    a_stat = a_local.new_zeros((num_frames, *a_local.shape[1:]))
+    b_stat = b_local.new_zeros((num_frames, *b_local.shape[1:]))
+    a_stat[first_frame : last_frame + 1] = a_local
+    b_stat[first_frame : last_frame + 1] = b_local
+    return a_stat, b_stat
+
+
+def frame_sum_row_shard(
+    tokens: torch.Tensor,
+    *,
+    row_start: int,
+    num_frames: int,
+    tokens_per_frame: int,
+) -> torch.Tensor:
+    """Partial per-frame SUM of ``[N, C]`` rows, laid out as ``[F, C]``.
+
+    The branch's ``alpha`` reads a per-frame MEAN of ``video_x``. A mean cannot be summed
+    across ranks, so the shard contributes the sum and the caller divides by the full
+    ``tokens_per_frame`` after the reduction -- dividing locally would weight each rank by
+    the arbitrary number of rows the even split happened to give it.
+
+    Accumulated in fp32 for the same reason ``alpha`` already casts there: ``video_x`` is
+    bf16 and a bf16 running sum over a frame has thrown away what the later fp32 island
+    cannot recover.
+
+    Zero-padded to frame boundaries and reduced with ``view().sum(1)``, exactly as
+    ``frame_statistics_row_shard`` does, rather than the ``index_add_`` this would otherwise
+    be a one-liner with. ``index_add_`` accumulates with atomics on CUDA, so its summation
+    order varies between otherwise identical runs -- and ``alpha`` is multiplied across
+    every frame by ``run_scans``, which is the one place the module docstring says error
+    must not be allowed to compound. It would also cost the bit-exact reproducibility that
+    the warm-run A/B comparisons rely on to tell a code change from noise.
+    """
+    rows = int(tokens.shape[0])
+    channels = int(tokens.shape[-1])
+    out = tokens.new_zeros((num_frames, channels), dtype=torch.float32)
+    if rows == 0:
+        return out
+    first_frame = row_start // tokens_per_frame
+    last_frame = (row_start + rows - 1) // tokens_per_frame
+    if last_frame >= num_frames:
+        raise ValueError(f"rows [{row_start}, {row_start + rows}) exceed {num_frames} frames")
+    local_frames = last_frame - first_frame + 1
+    pad_before = row_start - first_frame * tokens_per_frame
+    pad_after = (last_frame + 1) * tokens_per_frame - (row_start + rows)
+
+    padded = tokens.float()
+    if pad_before or pad_after:
+        padded = torch.cat(
+            (padded.new_zeros((pad_before, channels)), padded, padded.new_zeros((pad_after, channels))),
+            dim=0,
+        )
+    out[first_frame : last_frame + 1] = padded.view(local_frames, tokens_per_frame, channels).sum(dim=1)
+    return out
 
 
 def delta_rule_factors(
@@ -540,6 +859,37 @@ class VDNLinearBranch(nn.Module):
             out.append(_activate(tokens, l2norm=projection != "v"))
         return tuple(out)
 
+    def _text_statistics(
+        self,
+        text_x: torch.Tensor,
+        text_qkv_raw: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The prompt's delta-rule statistics as ONE chunk; ``[1, H, d, d]`` each.
+
+        Split out of ``_text_state`` so sequence parallelism can reduce them: they are
+        sums along the row axis, so a rank holding some of the prompt contributes a
+        partial and the sum over ranks is exact. ``a_stat`` comes back **un-symmetrised**
+        for the same reason -- symmetrising commutes with the sum, so the caller does it
+        once after reducing rather than once per rank.
+
+        An empty ``text_x`` is legal and yields zeros: that is a rank that owns none of
+        the prompt, not a request without one.
+        """
+        length = text_qkv_raw[1].shape[0]
+        _, key, value = self._features(text_qkv_raw, None, None, use_conv=False)
+        key = key.view(1, length, self.local_heads, self.head_dim).permute(0, 2, 1, 3)
+        value = value.view(1, length, self.local_heads, self.head_dim).permute(0, 2, 1, 3)
+        beta = torch.sigmoid(self.beta_proj(text_x))
+        beta = beta.view(1, length, self.local_heads).permute(0, 2, 1)
+        return frame_statistics(key, value, beta, symmetrise=False)
+
+    def _text_state_from_statistics(self, a_stat: torch.Tensor, b_stat: torch.Tensor) -> torch.Tensor:
+        """Finish the text state from symmetrised ``[1, H, d, d]`` statistics."""
+        with torch.autocast(device_type=a_stat.device.type, enabled=False):
+            ones = torch.ones(1, self.local_heads, self.head_dim, device=a_stat.device, dtype=a_stat.dtype)
+            _, injection = delta_rule_factors(ones, a_stat, b_stat)
+        return TEXT_STATE_SCALE * injection[0]
+
     def _text_state(
         self,
         text_x: torch.Tensor,
@@ -552,18 +902,8 @@ class VDNLinearBranch(nn.Module):
         already written word order into every text hidden state. alpha plays no part --
         the old state is zero, so the transition multiplies nothing.
         """
-        length = text_qkv_raw[1].shape[0]
-        _, key, value = self._features(text_qkv_raw, None, None, use_conv=False)
-        key = key.view(1, length, self.local_heads, self.head_dim).permute(0, 2, 1, 3)
-        value = value.view(1, length, self.local_heads, self.head_dim).permute(0, 2, 1, 3)
-        beta = torch.sigmoid(self.beta_proj(text_x))
-        beta = beta.view(1, length, self.local_heads).permute(0, 2, 1)
-
-        a_stat, b_stat = frame_statistics(key, value, beta)
-        with torch.autocast(device_type=a_stat.device.type, enabled=False):
-            ones = torch.ones(1, self.local_heads, self.head_dim, device=a_stat.device, dtype=a_stat.dtype)
-            _, injection = delta_rule_factors(ones, a_stat, b_stat)
-        return TEXT_STATE_SCALE * injection[0]
+        a_stat, b_stat = self._text_statistics(text_x, text_qkv_raw)
+        return self._text_state_from_statistics(0.5 * (a_stat + a_stat.transpose(-1, -2)), b_stat)
 
     def forward(
         self,
@@ -620,6 +960,152 @@ class VDNLinearBranch(nn.Module):
         out[inner] = readout
         return out
 
+    def readout_row_shard(
+        self,
+        video_x: torch.Tensor,
+        qkv_raw: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        halo_first_frame: int,
+        row_start: int,
+        num_rows: int,
+        num_frames: int,
+        tokens_per_frame: int,
+        frame_size: tuple[int, int],
+        bounds: list[tuple[int, int]],
+        text_x: torch.Tensor | None,
+        text_qkv_raw: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        all_reduce: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """The branch over one sequence-parallel row shard; returns that shard's rows only.
+
+        Sequence parallelism splits the packed rows evenly, so a rank owns
+        ``[row_start, row_start + num_rows)`` of the GLOBAL video rows and usually starts
+        and ends mid-frame. Three things follow, and they are the whole design:
+
+        * **``qkv_raw`` arrives haloed, by whole frames; ``video_x`` does not.** All three
+          projections go through ``_features``, whose ``(t, h, w)`` stencil makes an owned
+          row near a shard boundary read its neighbours -- q included, even though q's own
+          halo OUTPUT rows are discarded. Whole frames rather than whole rows because a
+          partial frame has no grid to convolve, and zero-padding one would feed the
+          boundary rows zeros instead of the neighbours the halo exists to supply.
+          ``video_x`` is never convolved -- only ``beta_proj``, ``alpha`` and the output
+          gate read it, all row-wise -- so it is passed as owned rows only, which at 15 s
+          keeps ~87 MB per block off the wire.
+        * **The per-frame statistics are partial and must be reduced.** They are sums along
+          the token axis, so each rank contributes its rows and ``all_reduce`` reconstructs
+          the whole. ``alpha`` is a mean, so the shard contributes a sum and the division
+          happens after the reduction -- dividing locally would weight ranks by the
+          arbitrary row count the split handed them.
+        * **The scan runs redundantly on every rank.** It recurses over ``[F, H, d, d]``
+          state, which is sized by the state space rather than the token count (~102 MB at
+          15 s), so replicating it is cheaper than a second collective to broadcast it, and
+          ``gather_outside_window`` needs arbitrary frame indices anyway.
+
+        ``text_x``/``text_qkv_raw`` are the prompt rows THIS rank owns, which may be none
+        of them -- pass an empty tensor rather than ``None`` in that case, because ``None``
+        means the request has no prompt state at all and the two must not be confused: the
+        text slot is part of a collective, so either every rank appends it or none does.
+
+        ``all_reduce`` is injected rather than imported so this is testable without a
+        process group; ``None`` means world size one.
+        """
+        reduce = all_reduce if all_reduce is not None else (lambda tensor: tensor)
+        heads, head_dim = self.local_heads, self.head_dim
+        halo_rows = int(qkv_raw[0].shape[0])
+        halo_frames = halo_rows // tokens_per_frame
+        if halo_frames * tokens_per_frame != halo_rows:
+            raise ValueError(
+                f"the haloed span must be whole frames: {halo_rows} rows is not a multiple of {tokens_per_frame}"
+            )
+        owned_lo = row_start - halo_first_frame * tokens_per_frame
+        owned_hi = owned_lo + num_rows
+        if owned_lo < 0 or owned_hi > halo_rows:
+            raise ValueError(
+                f"owned rows [{row_start}, {row_start + num_rows}) are not inside the haloed "
+                f"span starting at frame {halo_first_frame} with {halo_rows} rows"
+            )
+        if int(video_x.shape[0]) != num_rows:
+            raise ValueError(f"video_x must be the owned rows only, got {video_x.shape[0]} for {num_rows} owned rows")
+
+        # Features over the haloed span so both convolutions see real neighbours, then
+        # keep only the owned rows: everything downstream is this shard's contribution.
+        query, key, value = self._features(qkv_raw, halo_frames, frame_size)
+        query = query[owned_lo:owned_hi]
+        key = key[owned_lo:owned_hi]
+        value = value[owned_lo:owned_hi]
+        owned_x = video_x
+
+        beta = torch.sigmoid(self.beta_proj(owned_x)).view(num_rows, heads)
+        a_stat, b_stat = frame_statistics_row_shard(
+            key,
+            value,
+            beta,
+            row_start=row_start,
+            num_frames=num_frames,
+            tokens_per_frame=tokens_per_frame,
+        )
+        # The prompt is sharded too, so its statistics ride along as one extra frame slot
+        # rather than paying a second collective: they are row sums like the video's, and
+        # appending costs 1/F of the payload.
+        with_text = self.enable_text_state and text_x is not None
+        if with_text:
+            text_a, text_b = self._text_statistics(text_x, text_qkv_raw)
+            a_stat = torch.cat((a_stat, text_a.to(a_stat.dtype)), dim=0)
+            b_stat = torch.cat((b_stat, text_b.to(b_stat.dtype)), dim=0)
+        a_stat = reduce(a_stat)
+        b_stat = reduce(b_stat)
+        a_stat = 0.5 * (a_stat + a_stat.transpose(-1, -2))
+        text_stats = None
+        if with_text:
+            text_stats = (a_stat[-1:], b_stat[-1:])
+            a_stat, b_stat = a_stat[:-1], b_stat[:-1]
+
+        frame_sum = reduce(
+            frame_sum_row_shard(
+                owned_x,
+                row_start=row_start,
+                num_frames=num_frames,
+                tokens_per_frame=tokens_per_frame,
+            )
+        )
+        alpha = self.alpha(frame_sum / float(tokens_per_frame))
+
+        text_state = None
+        if text_stats is not None:
+            text_state = self._text_state_from_statistics(*text_stats)
+
+        with torch.autocast(device_type=owned_x.device.type, enabled=False):
+            transitions, injections = delta_rule_factors(alpha, a_stat, b_stat)
+        prefix_states, suffix_states = run_scans(transitions, injections, text_state)
+        del transitions, injections
+
+        gate = self.output_gate(owned_x)
+        linear_state = gather_outside_window(prefix_states, suffix_states, alpha, bounds, text_state, gate.dtype)
+        del prefix_states, suffix_states
+
+        # Read out only the owned rows. Padding to frame boundaries keeps the batched
+        # matmul; the padded rows are dropped immediately after and never leave here.
+        first_frame = row_start // tokens_per_frame
+        last_frame = (row_start + num_rows - 1) // tokens_per_frame
+        local_frames = last_frame - first_frame + 1
+        pad_before = row_start - first_frame * tokens_per_frame
+        pad_after = (last_frame + 1) * tokens_per_frame - (row_start + num_rows)
+        padded_query = query
+        if pad_before or pad_after:
+            padded_query = torch.cat(
+                (
+                    query.new_zeros((pad_before, *query.shape[1:])),
+                    query,
+                    query.new_zeros((pad_after, *query.shape[1:])),
+                ),
+                dim=0,
+            )
+        query_by_frame = padded_query.view(local_frames, tokens_per_frame, heads, head_dim).permute(0, 2, 1, 3)
+        readout = torch.matmul(query_by_frame, linear_state[first_frame : last_frame + 1].transpose(-1, -2))
+        readout = readout.permute(0, 2, 1, 3).reshape(local_frames * tokens_per_frame, heads, head_dim)
+        readout = readout[pad_before : pad_before + num_rows]
+        return (self.norm(readout) * gate).reshape(-1, heads * head_dim)
+
     def _readout(
         self,
         video_x,
@@ -675,7 +1161,15 @@ __all__ = [
     "VDNOutputGate",
     "VDNSeparableShortConv",
     "delta_rule_factors",
+    "HALO_FRAMES",
     "frame_statistics",
+    "frame_statistics_row_shard",
+    "frame_sum_row_shard",
+    "HaloTransfer",
+    "exchange_halo_rows",
     "gather_outside_window",
+    "halo_frame_span",
+    "plan_halo_exchange",
+    "halo_row_counts",
     "run_scans",
 ]

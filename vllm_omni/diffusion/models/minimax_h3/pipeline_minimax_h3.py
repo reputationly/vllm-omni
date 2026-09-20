@@ -192,6 +192,37 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 MINIMAX_H3_DEFAULT_INFERENCE_STEPS = 20
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
+
+# EXPERIMENTAL. 768 is not a policy choice: the released weights are distilled at it, so
+# anything else leaves that distribution. 2026-08-30 rejected native 1080p on ``corr_all``,
+# a metric later shown to reward blur -- and the 2026-09-19 re-run found it visibly
+# sharper, so the lock is now an opt-in rather than an absolute.
+#
+# Additive on purpose: an override that REPLACED 768 would make a server configured for
+# 1080 reject every existing request, which is a deployment break, not an experiment.
+_EXPERIMENTAL_SHORT_EDGE_ENV = "VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE"
+
+
+def _allowed_output_short_edges() -> tuple[int, ...]:
+    raw = os.getenv(_EXPERIMENTAL_SHORT_EDGE_ENV)
+    if not raw:
+        return (MINIMAX_H3_OUTPUT_SHORT_EDGE,)
+    extra = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    return tuple(dict.fromkeys((MINIMAX_H3_OUTPUT_SHORT_EDGE, *extra)))
+
+
+def _output_max_pixels(short_edge: int | None = None) -> int:
+    """Area cap for one canvas, scaled with its own short edge.
+
+    Keyed on the requested edge rather than a global, so 768 keeps exactly its old cap on
+    a server that also offers 1080.
+    """
+    edge = int(short_edge or MINIMAX_H3_OUTPUT_SHORT_EDGE)
+    if edge == MINIMAX_H3_OUTPUT_SHORT_EDGE:
+        return MINIMAX_H3_OUTPUT_MAX_PIXELS
+    return int(MINIMAX_H3_OUTPUT_MAX_PIXELS * (edge / MINIMAX_H3_OUTPUT_SHORT_EDGE) ** 2)
+
+
 MINIMAX_H3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE"
 
 
@@ -383,6 +414,19 @@ def _resolve_minimax_h3_schedule(
         return steps, None
     steps = int(requested_steps) if requested_steps is not None else schedule.num_inference_steps
     return steps, schedule.positions_for_num_inference_steps(steps)
+
+
+# Parking the VAEs on the host between uses, WITHOUT the layerwise offload that used to be
+# the only way to ask for it. The two are unrelated jobs that happened to share a flag:
+# layerwise offload streams the DiT's blocks, while this only decides where two components
+# live while nobody is calling them. Measured on 4x A100-40G, the video VAE holds 9.700 GiB
+# on every rank from load until the process exits, and the denoise steps -- which is where
+# the peak is -- never touch it.
+_COMPONENT_OFFLOAD_ENV = "VLLM_OMNI_H3_OFFLOAD_COMPONENTS"
+
+
+def _component_offload_requested() -> bool:
+    return os.getenv(_COMPONENT_OFFLOAD_ENV, "") not in ("", "0")
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -1268,8 +1312,10 @@ def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, i
     """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
     if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
         raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be positive, got {aspect_ratio!r}")
-    if short_edge != MINIMAX_H3_OUTPUT_SHORT_EDGE:
-        raise OmniClientError(f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge}")
+    if short_edge not in _allowed_output_short_edges():
+        raise OmniClientError(
+            f"MiniMax H3 target.short_edge must be one of {_allowed_output_short_edges()}, got {short_edge}"
+        )
     if aspect_ratio >= 1.0:
         width = float(short_edge) * aspect_ratio
         height = float(short_edge)
@@ -1277,8 +1323,8 @@ def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, i
         width = float(short_edge)
         height = float(short_edge) / aspect_ratio
     area = width * height
-    if area > MINIMAX_H3_OUTPUT_MAX_PIXELS:
-        scale = (MINIMAX_H3_OUTPUT_MAX_PIXELS / area) ** 0.5
+    if area > _output_max_pixels(short_edge):
+        scale = (_output_max_pixels(short_edge) / area) ** 0.5
         width *= scale
         height *= scale
     return (
@@ -1693,6 +1739,7 @@ class MiniMaxH3Pipeline(
                 ulysses_degree=int(getattr(parallel, "ulysses_degree", 1) or 1),
                 ring_degree=int(getattr(parallel, "ring_degree", 1) or 1),
                 allgather_degree=int(getattr(parallel, "allgather_degree", 1) or 1),
+                ulysses_mode=str(getattr(parallel, "ulysses_mode", "strict") or "strict"),
             )
             self.transformer.enable_vdn_branches(**self._vdn.spec.branch_kwargs())
             if hasattr(self, "transformers_ref"):
@@ -1759,7 +1806,9 @@ class MiniMaxH3Pipeline(
             self.text_encoder = None
             self._encoder_modules = []
         stage_components = bool(
-            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            od_config.enable_layerwise_offload
+            or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            or _component_offload_requested()
         )
         component_load_device = torch.device("cpu") if stage_components else self.device
         self.video_vae = MiniMaxH3VideoVAE(
@@ -1791,6 +1840,37 @@ class MiniMaxH3Pipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
+
+    def _log_resident_components(self) -> None:
+        """Name what each component leaves on the device, once, after loading.
+
+        The peak-memory attribution could only call ~10 GiB of the steady state "allocated
+        before recording started": the snapshot begins at the first denoise step and these
+        components load long before it, so no stack exists to attribute them to. Their
+        parameters and buffers are still addressable afterwards, though, and summing them
+        per component answers the same question without a second trace.
+
+        Off by default -- this walks every parameter of a 60 GB text encoder.
+        """
+        if not os.getenv("VLLM_OMNI_H3_LOG_RESIDENT_COMPONENTS"):
+            return
+        names = ("transformer", "transformers_ref", "text_encoder", "video_vae", "audio_vae")
+        gib = float(1024**3)
+        total = 0
+        for name in names:
+            component = getattr(self, name, None)
+            if component is None or not isinstance(component, torch.nn.Module):
+                continue
+            # Buffers as well as parameters: a VAE's normalisation statistics and a
+            # rotary cache are neither trainable nor small, and they are resident too.
+            resident = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (*component.parameters(), *component.buffers())
+                if tensor.device.type == "cuda"
+            )
+            total += resident
+            logger.info("H3 resident component %-18s %7.3f GiB on device", name, resident / gib)
+        logger.info("H3 resident components total %.3f GiB", total / gib)
 
     def load_weights(
         self,
@@ -1851,6 +1931,9 @@ class MiniMaxH3Pipeline(
             self._vdn.validate_fully_applied(transformer_loaded)
         if self._vdn_ref is not None:
             self._vdn_ref.validate_fully_applied(ref_loaded)
+        # Here rather than in __init__: the DiT's weights arrive through this call, so
+        # a report written at construction time would show it as empty.
+        self._log_resident_components()
         return loaded_with_prefix
 
     @property
@@ -2337,6 +2420,7 @@ class MiniMaxH3Pipeline(
         return bool(
             getattr(od_config, "enable_layerwise_offload", False)
             or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            or _component_offload_requested()
         )
 
     @contextmanager
@@ -2439,24 +2523,30 @@ class MiniMaxH3Pipeline(
     ) -> tuple[torch.Tensor | None, list[int]]:
         if not audios:
             return None, []
-        _, rank, _ = _dit_rank_world()
-        rows = None
-        lengths = torch.zeros(len(audios), dtype=torch.long, device=self.device)
-        if rank == 0:
-            encoded = [self.audio_vae.encode_waveform(*audio) for audio in audios]
-            rows = torch.cat([item[0] for item in encoded])
-            lengths = torch.tensor(
-                [int(item[1]) for item in encoded],
-                dtype=torch.long,
-                device=self.device,
+        # Outside the rank check, like every sibling encoder: staging is entered by all
+        # ranks even though only rank 0 runs the VAE. This is the path for a SEPARATE
+        # audio input, as opposed to the soundtrack carried inside a reference video
+        # (``_encode_video_audio_conditions``) -- it was the one encoder without a guard,
+        # which cost nothing while staging was unreachable and faults the moment it is not.
+        with self._component_on_device(self.audio_vae):
+            _, rank, _ = _dit_rank_world()
+            rows = None
+            lengths = torch.zeros(len(audios), dtype=torch.long, device=self.device)
+            if rank == 0:
+                encoded = [self.audio_vae.encode_waveform(*audio) for audio in audios]
+                rows = torch.cat([item[0] for item in encoded])
+                lengths = torch.tensor(
+                    [int(item[1]) for item in encoded],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            group, _, world_size = _dit_rank_world()
+            if world_size > 1:
+                dist.broadcast(lengths, src=0, group=group)
+            return (
+                _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
+                [int(value) for value in lengths.tolist()],
             )
-        group, _, world_size = _dit_rank_world()
-        if world_size > 1:
-            dist.broadcast(lengths, src=0, group=group)
-        return (
-            _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
-            [int(value) for value in lengths.tolist()],
-        )
 
     def _encode_video_conditions(
         self,

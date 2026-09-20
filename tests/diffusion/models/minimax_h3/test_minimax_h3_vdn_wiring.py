@@ -265,11 +265,10 @@ def test_dense_h3_is_untouched(distributed):
     "kwargs, message",
     [
         ({"attention_backend": "FLASH_ATTN"}, "complement of"),
-        ({"ulysses_degree": 2}, "every row of the target video"),
-        ({"ring_degree": 2}, "every row of the target video"),
+        ({"ring_degree": 2}, "shards the sequence only through Ulysses"),
         # AllGather-KV is mutually exclusive with the other two, so a check that looked
         # only at those saw 1 and 1 and passed it through.
-        ({"allgather_degree": 2}, "every row of the target video"),
+        ({"allgather_degree": 2}, "shards the sequence only through Ulysses"),
     ],
 )
 def test_runtime_combinations_that_would_render_the_wrong_video_are_refused(kwargs, message):
@@ -296,3 +295,43 @@ def test_the_supported_runtime_passes():
     from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import validate_hybrid_runtime
 
     validate_hybrid_runtime(attention_backend="VDN_WINDOW_ATTN", ulysses_degree=1, ring_degree=1, allgather_degree=1)
+
+
+def test_ulysses_is_allowed():
+    """The branch shards under Ulysses now; the guard must not still refuse it.
+
+    Ulysses hands each rank a contiguous row span, which ``readout_row_shard`` can halo
+    and reduce. Ring and AllGather-KV cannot be sharded the same way and stay refused --
+    see the parametrised test above.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import validate_hybrid_runtime
+
+    validate_hybrid_runtime(attention_backend="VDN_WINDOW_ATTN", ulysses_degree=4, ring_degree=1, allgather_degree=1)
+
+
+def test_ulysses_outside_strict_mode_is_refused():
+    """Allowing Ulysses must not quietly allow the mode the branch cannot locate rows in.
+
+    ``_sequence_parallel_local_span`` reports the whole sequence -- "not sharded" -- for
+    any mode but ``strict``, while ``sp_prepare`` splits the rows either way. The branch
+    would then read a shard by global video offsets and render a plausible clip built from
+    the wrong frames, which is the failure the blanket refusal used to cover.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import validate_hybrid_runtime
+
+    with pytest.raises(ValueError, match="ulysses_mode='strict'"):
+        validate_hybrid_runtime(
+            attention_backend="VDN_WINDOW_ATTN",
+            ulysses_degree=2,
+            ring_degree=1,
+            allgather_degree=1,
+            ulysses_mode="advanced_uaa",
+        )
+    # Degree 1 is not sharded at all, so the mode cannot mislead anyone.
+    validate_hybrid_runtime(
+        attention_backend="VDN_WINDOW_ATTN",
+        ulysses_degree=1,
+        ring_degree=1,
+        allgather_degree=1,
+        ulysses_mode="advanced_uaa",
+    )

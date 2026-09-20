@@ -39,6 +39,8 @@ from vllm_omni.diffusion.models.minimax_h3.vdn_branch import (
     VDNLinearBranch,
     VDNOutputGate,
     attach_head_shard_loaders,
+    exchange_halo_rows,
+    halo_frame_span,
 )
 from vllm_omni.diffusion.models.minimax_h3.vdn_window import (
     VDN_ANCHOR_FRAMES,
@@ -211,6 +213,134 @@ class VDNHybridAttention(nn.Module):
         projected, _ = self.to_out_linear(readout.type_as(x))
         return projected, video_start, video_end
 
+    def _scanned_span(self, geometry: tuple[int, int, int, tuple[int, int]]):
+        """The rows the branch actually scans, after ``skip_ends`` drops the anchors.
+
+        With ``anchor_frames="both"`` the branch never sees frames 0 and F-1: they are
+        dropped from its INPUT, not scanned and masked, so they take no part in the
+        statistics either. Sharding has to shard that same inner range, or a rank would
+        compute statistics over frames the whole-sequence path excluded.
+        """
+        video_start, frames, tokens_per_frame, _ = geometry
+        bounds = window_bounds(frames, radius=self.radius, chunk=self.chunk)
+        if self.anchor_frames != "both":
+            return video_start, frames, bounds
+        if frames <= 2:
+            return video_start, 0, []
+        # With the two frames gone the bounds rebase by one, exactly as ``forward`` does.
+        return video_start + tokens_per_frame, frames - 2, [(lo - 1, hi - 1) for lo, hi in bounds[1 : frames - 1]]
+
+    def _local_text_rows(
+        self,
+        x: torch.Tensor,
+        qkv_raw: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        text_span: tuple[int, int] | torch.Tensor | None,
+        local_start: int,
+        local_len: int,
+    ):
+        """This rank's share of the prompt rows -- possibly none, never ``None``.
+
+        A rank owning no prompt rows still joins the collective that builds the text
+        state, so it contributes empty tensors rather than opting out. Returning ``None``
+        there would make it skip the reduce and hang the ranks that did not.
+        """
+        if not self.linear_attention.enable_text_state or text_span is None:
+            return None, None
+        if isinstance(text_span, torch.Tensor):
+            rows = text_span.to(x.device)
+            rows = rows[(rows >= local_start) & (rows < local_start + local_len)] - local_start
+        else:
+            start, stop = text_span
+            lo, hi = max(start, local_start), min(stop, local_start + local_len)
+            rows = torch.arange(max(0, hi - lo), device=x.device, dtype=torch.long) + (lo - local_start)
+        return x.index_select(0, rows), tuple(tensor.index_select(0, rows) for tensor in qkv_raw)
+
+    def readout_row_shard(
+        self,
+        x: torch.Tensor,
+        qkv_raw: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        geometry: tuple[int, int, int, tuple[int, int]],
+        text_span: tuple[int, int] | torch.Tensor | None,
+        local_span: tuple[int, int],
+    ) -> tuple[torch.Tensor, int, int] | None:
+        """``readout`` when each rank holds only its slice of the packed rows.
+
+        ``x`` and ``qkv_raw`` are this rank's rows; ``geometry`` and ``text_span`` are
+        global, as the producer resolved them. Returns the branch's partial together with
+        the span of THIS rank's rows it covers, or ``None`` when the rank owns none of the
+        scanned video -- the caller then adds nothing, which is what a zero partial means.
+
+        No collective is needed to learn the other ranks' geometry: the split is an even
+        division of the packed sequence, so every rank derives every shard from its own
+        length and the world size, and they agree by construction.
+        """
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        _, _, tokens_per_frame, frame_size = geometry
+        scan_start, scan_frames, bounds = self._scanned_span(geometry)
+        if scan_frames <= 0:
+            return None
+        scan_end = scan_start + scan_frames * tokens_per_frame
+
+        group = get_sp_group()
+        world, rank = group.world_size, group.rank_in_group
+        local_start, local_len = local_span
+
+        # Rank r owns packed rows [r*local_len, (r+1)*local_len); intersect each with the
+        # scanned video to get the per-rank video geometry the halo plan needs.
+        shards = []
+        for peer in range(world):
+            lo = max(peer * local_len, scan_start)
+            hi = min((peer + 1) * local_len, scan_end)
+            shards.append((max(0, lo - scan_start), max(0, hi - lo)))
+        # Refuse on EVERY rank, not just the idle one. `shards` is derived locally and is
+        # identical everywhere, so this predicate is too -- which is what makes the refusal
+        # safe. Raising only where num_rows == 0 would leave the other ranks posting a
+        # halo transfer and three all-reduces to a peer that has already unwound, and they
+        # would sit there until the NCCL watchdog fired: the very hang this refuses to risk.
+        idle = [peer for peer, (_, count) in enumerate(shards) if count <= 0]
+        if idle:
+            raise ValueError(
+                f"sequence-parallel rank(s) {idle} own none of the {scan_frames} scanned video "
+                f"frames (shard size {local_len} packed rows; video rows [{scan_start}, {scan_end})). "
+                "The VDN branch has no path for an idle rank: its statistics are a sum over all "
+                "ranks, and a rank with nothing to contribute still has to enter every collective."
+            )
+        row_start, num_rows = shards[rank]
+
+        offset = scan_start - local_start
+        local_lo, local_hi = offset + row_start, offset + row_start + num_rows
+        haloed = exchange_halo_rows(
+            [tensor[local_lo:local_hi] for tensor in qkv_raw],
+            shards=shards,
+            rank=rank,
+            num_frames=scan_frames,
+            tokens_per_frame=tokens_per_frame,
+            group=group.device_group if world > 1 else None,
+        )
+        halo_first_frame, _ = halo_frame_span(
+            row_start, num_rows, num_frames=scan_frames, tokens_per_frame=tokens_per_frame
+        )
+        text_x, text_qkv_raw = self._local_text_rows(x, qkv_raw, text_span, local_start, local_len)
+
+        readout = self.linear_attention.readout_row_shard(
+            x[local_lo:local_hi],
+            tuple(haloed),
+            halo_first_frame=halo_first_frame,
+            row_start=row_start,
+            num_rows=num_rows,
+            num_frames=scan_frames,
+            tokens_per_frame=tokens_per_frame,
+            frame_size=frame_size,
+            bounds=bounds,
+            text_x=text_x,
+            text_qkv_raw=text_qkv_raw,
+            all_reduce=group.all_reduce if world > 1 else None,
+        )
+        projected, _ = self.to_out_linear(readout.type_as(x))
+        return projected, local_lo, local_hi
+
 
 def combine_hybrid_output(
     attention_partial: torch.Tensor,
@@ -235,7 +365,12 @@ def combine_hybrid_output(
 
 
 def validate_hybrid_runtime(
-    *, attention_backend: str, ulysses_degree: int, ring_degree: int, allgather_degree: int = 1
+    *,
+    attention_backend: str,
+    ulysses_degree: int,
+    ring_degree: int,
+    allgather_degree: int = 1,
+    ulysses_mode: str = "strict",
 ) -> None:
     """Refuse the combinations that would render a plausible but wrong video."""
     if attention_backend != REQUIRED_ATTENTION_BACKEND:
@@ -246,19 +381,35 @@ def validate_hybrid_runtime(
             "window without the branch drops them. Set diffusion_attention_backend: "
             f"{REQUIRED_ATTENTION_BACKEND}."
         )
-    # AllGather-KV is the THIRD sequence-sharding mode and it is mutually exclusive with
-    # the other two (omni_config: allgather_degree > 1 forbids ulysses/ring > 1), so a
-    # check that only looked at those two saw 1 and 1 and passed. Each rank would then
-    # hold a row shard while `readout` slices x and the raw q/k/v by global video spans.
-    if ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1:
+    # Ulysses is supported: `readout_row_shard` haloes the convolutions, reduces the
+    # per-frame statistics into whole-sequence ones and replays the scan on every rank.
+    #
+    # Ring and AllGather-KV are not, and they must be named separately rather than lumped
+    # in with Ulysses. AllGather-KV especially: it is the THIRD sequence-sharding mode and
+    # is mutually exclusive with the other two (omni_config: allgather_degree > 1 forbids
+    # ulysses/ring > 1), so a check that only looked at those two saw 1 and 1 and passed.
+    # Each rank would then hold a row shard while `readout` slices x and the raw q/k/v by
+    # global video spans -- a plausible clip, silently built from the wrong rows.
+    if ring_degree > 1 or allgather_degree > 1:
         raise ValueError(
-            "the VDN linear branch needs every row of the target video on each rank: its scan "
-            f"runs over frames. Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
-            f"allgather_degree={allgather_degree}; "
-            "shard with tensor parallelism instead, which divides the heads and leaves the "
-            "sequence whole. (Upstream solves this with a branch-parallel Ulysses scheme that "
-            "hands each rank the beta/gate/frame-mean its sequence owner computed; that is not "
-            "ported.)"
+            "the VDN linear branch shards the sequence only through Ulysses, which hands each "
+            "rank a contiguous row span it can halo and reduce. Got "
+            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}; both leave the rank "
+            "holding rows the branch cannot locate in the frame grid. Use ulysses_degree, or "
+            "shard with tensor parallelism, which divides the heads and leaves the sequence whole."
+        )
+    # Strict mode is not a preference here, it is the thing that tells the branch WHICH rows
+    # it holds. `_sequence_parallel_local_span` reports the whole sequence -- i.e. "not
+    # sharded" -- for any other mode, while `sp_prepare` splits the rows regardless
+    # (`_sp_plan` sets split_output=True). The branch would then slice a shard by global
+    # video offsets: a plausible video built from the wrong rows, which is the exact failure
+    # the blanket refusal on ulysses_degree used to prevent.
+    if ulysses_degree > 1 and ulysses_mode != "strict":
+        raise ValueError(
+            f"the VDN linear branch needs ulysses_mode='strict' to shard, got {ulysses_mode!r} "
+            f"with ulysses_degree={ulysses_degree}. Only strict mode reports each rank's row "
+            "span; under any other mode the rows are still split but the branch is told they "
+            "are not, and it reads the wrong ones without failing."
         )
 
 
