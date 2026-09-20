@@ -68,6 +68,15 @@ stages:
     max_num_seqs: 1
     devices: "0,1,2,3"
 
+    # The two VAEs are 10.26 GiB per rank and the denoise steps never touch them, but
+    # `_component_on_device` only stages them when this is set: the staging path used to be
+    # gated behind layerwise offload, which is a different job (streaming the DiT's blocks)
+    # that this deployment does not want. Measured at 15s@1080p: denoise peak 35.79 ->
+    # 25.53 GiB, warm 708s -> 629s. Costs 10.26 GiB per rank of HOST memory instead, so
+    # drop caches before starting if the box has been reading checkpoints all day.
+    env:
+      VLLM_OMNI_H3_OFFLOAD_COMPONENTS: "1"
+
     enable_cpu_offload: true
     vae_use_tiling: true
 

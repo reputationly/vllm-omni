@@ -14,12 +14,19 @@
 #
 # --- What CANNOT move into this file (verified in code, not assumed) ---
 #
-# 1. The six VLLM_OMNI_* environment variables must stay `export`s in the
-#    launch command. A stage-level `env:` block is parsed into
-#    StageDeployConfig.env and then dropped: stage_runtime_env /
-#    stage_runtime_setup (engine/stage_init_utils.py) have no live callers, and
-#    the production path (stage_engine_startup.py -> setup_stage_devices) only
-#    forwards `devices`.
+# 1. ~~The six VLLM_OMNI_* environment variables must stay `export`s.~~
+#    **NO LONGER TRUE (re-checked 2026-09-20).** A stage-level `env:` block now
+#    reaches the stage: stage_runtime_env has live callers (engine/stage_runtime.py
+#    applies it around the replica launch, so the worker inherits it), and
+#    omni_config.py additionally carries the mapping as `diffusion_runtime_environ`
+#    so a capability probe outside the worker can see what the stage was configured
+#    with. minimax_h3_fl2va_bf16_a100_40g.yaml has been relying on this for
+#    VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE, and the two Singularity VDN files now set
+#    VLLM_OMNI_H3_OFFLOAD_COMPONENTS the same way.
+#
+#    Left in place rather than deleted because the claim was "verified in code" when
+#    written and it was: the mechanism grew callers afterwards. A note that was once
+#    true is exactly the kind that gets trusted without re-checking.
 #
 # 2. --init-timeout / --stage-init-timeout 2400 stay on the CLI. Neither is a
 #    StageDeployConfig field nor a pipeline-wide engine field, so a YAML key
