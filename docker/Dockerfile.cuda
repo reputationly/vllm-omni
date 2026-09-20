@@ -1,4 +1,7 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.28.0
+# 本分支(Qwen-Image-2.1)的代码基线含 #7230『Rebase to vLLM 0.29.0』,
+# 上游只 bump 了 docker/Dockerfile.ci 的 VLLM_BASE_TAG,这份运行时 Dockerfile
+# 漏了 —— 用 0.28 基座配 0.29 代码会在启动时才炸,所以这里跟上。
+ARG BASE_IMAGE=vllm/vllm-openai:v0.29.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
