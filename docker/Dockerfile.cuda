@@ -8,13 +8,6 @@ ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
 
-# TorchAO —— weight-only 量化（W8A16）用。best-effort：torchao 与 torch 的版本
-# 绑定很紧，装不上时不该让整个镜像构建失败，需要它的量化档会在启动时报清楚的
-# ImportError，而不是把别的模型一起拖下水。
-RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
-    uv pip install --python "$PY" --no-cache-dir --no-deps torchao \
-      || echo "WARN: torchao 未装上，torchao_* 量化档不可用"
-
 # Step 1: Setup - Install system dependencies
 RUN apt-get update && \
     apt-get install -y git jq && \
@@ -26,6 +19,15 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+
+# TorchAO —— weight-only 量化（W8A16，torchao_int8_weight_only 档）用。
+# 必须放在 `uv pip install .` **之后**：装在它前面会让 uv 构建 vllm-omni 的 wheel 时
+# 报 packaging.version.InvalidVersion: Invalid version: 'dev'。
+# best-effort：torchao 与 torch 版本绑定很紧，装不上不该让整个镜像构建失败 ——
+# 缺它时只有 torchao_* 量化档在启动时报 ImportError，别的模型不受影响。
+RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
+    uv pip install --python "$PY" --no-cache-dir --no-deps torchao \
+      || echo "WARN: torchao 未装上，torchao_* 量化档不可用"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
