@@ -8,6 +8,13 @@ ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
 
+# TorchAO —— weight-only 量化（W8A16）用。best-effort：torchao 与 torch 的版本
+# 绑定很紧，装不上时不该让整个镜像构建失败，需要它的量化档会在启动时报清楚的
+# ImportError，而不是把别的模型一起拖下水。
+RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
+    uv pip install --python "$PY" --no-cache-dir --no-deps torchao \
+      || echo "WARN: torchao 未装上，torchao_* 量化档不可用"
+
 # Step 1: Setup - Install system dependencies
 RUN apt-get update && \
     apt-get install -y git jq && \
