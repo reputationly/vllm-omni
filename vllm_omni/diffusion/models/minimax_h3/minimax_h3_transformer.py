@@ -34,19 +34,23 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
-    indexed_gate,
-    indexed_gate_rms_norm_scale_shift,
-    indexed_scale_shift_,
-    rms_norm_indexed_scale_shift,
-)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.indexed_modulation import (
+    indexed_gate,
+    indexed_gate_rms_norm_scale_shift,
+    indexed_scale_shift_,
+    rms_norm_indexed_scale_shift,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
@@ -59,6 +63,8 @@ from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import (
     combine_hybrid_output,
 )
 from vllm_omni.platforms import current_omni_platform
+
+from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -84,6 +90,15 @@ MINIMAX_H3_FINAL_ADALN_EXPAND_RATIO = 2
 # packing, and ``_run_packed_attention`` re-checks it per forward; a name-only
 # gate would let FLASH_ATTN's NPU/XPU code paths through even though those
 # variants would silently attend across request boundaries.
+def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
+    """Match :meth:`Attention._get_active_parallel_strategy` for Ring."""
+    if not getattr(attention_layer, "use_ring", False) or getattr(attention_layer, "skip_sequence_parallel", False):
+        return False
+    if is_forward_context_available() and not get_forward_context().sp_active:
+        return False
+    return True
+
+
 def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     """True if this attention layer keeps N-document packed boundaries.
 
@@ -95,7 +110,7 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     backend = getattr(attention_layer, "attn_backend", None)
     if backend is None or not backend.supports_multi_doc_packed_varlen():
         return False
-    return not getattr(attention_layer, "use_ring", False)
+    return not _ring_sequence_parallel_is_active(attention_layer)
 
 
 @dataclass
@@ -232,9 +247,6 @@ _DIFFUSERS_NAME_RENAMES = (
 _DIFFUSERS_QKV_NAME = re.compile(r"^(.*)\.attn\.to_([qkv])\.(weight|bias)$")
 # Diffusers' SwiGLU input projection. Its packed half order is the mirror of the
 # released checkpoint's, so the loader keys the swap off this name directly.
-_DIFFUSERS_SWIGLU_NAME = re.compile(r"\.ff\.net\.0\.proj\.weight$")
-
-
 def _diffusers_to_partition_name(name: str) -> str:
     for pattern, replacement in _DIFFUSERS_NAME_RENAMES:
         name = re.sub(pattern, replacement, name)
@@ -503,6 +515,9 @@ def _sdpa_varlen_attention(
 
 
 class MiniMaxH3Attention(nn.Module):
+    # Full sparse checkpoints pin a ratio; legacy adapters use backend top-k.
+    vsa_sparsity: float | None = None
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -551,6 +566,8 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
+
         # VDN-H3 hybrid extras, built the same way and for the same reason: they exist
         # only when a VDN checkpoint is being loaded, and a dense H3 must not carry
         # parameters no checkpoint fills.
@@ -569,6 +586,7 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
+            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
 
     def enable_vsa_gate(self) -> None:
@@ -665,6 +683,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         attn_mask = None
         mask_free_packed_padding = False
+        use_ring = _ring_sequence_parallel_is_active(self.attention)
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
@@ -691,12 +710,15 @@ class MiniMaxH3Attention(nn.Module):
             # supports_packed_mask_free: backend consumes the packed metadata
             # without ever reading attn_mask (CUDA packed varlen, NPU
             # npu_attn_varlen opt-in with its own fallback rebuild).
-            use_ring = getattr(self.attention, "use_ring", False)
             mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
-            if used < packed_total and not no_mask:
+            # Hybrid Ulysses reshards Q to one ring partition before the ring
+            # kernel runs, so a global [packed_total] mask cannot pass its
+            # query-length check. Ring consumes valid_kv_length directly and
+            # trims the circulated K/V blocks instead.
+            if used < packed_total and not no_mask and not use_ring:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -720,11 +742,12 @@ class MiniMaxH3Attention(nn.Module):
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
                 # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                "npu_attn_varlen": not use_ring,
                 # fp16-range protection for the ascend_laser_attention kernel
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
                 "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+                **({"vsa_h3_sparsity": self.vsa_sparsity} if self.vsa_sparsity is not None else {}),
                 # Present only for a VSA artifact; the VSA backend reads it as
                 # the learned compression gate and every other backend ignores it.
                 **({"gate_compress": gate_compress.unsqueeze(0)} if gate_compress is not None else {}),
@@ -1388,10 +1411,23 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig,
         quant_config: QuantizationConfig | None = None,
+        *,
+        diffusers_weights: bool | None = None,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
+        # The native MiniMax-H3 Hub snapshot advertises the Diffusers
+        # transformer class in its root config, while its FL2VA/Ref2VA
+        # components still contain native weights.  The pipeline has already
+        # resolved the actual source format, so let it override the
+        # class-name heuristic.  Keep the heuristic for standalone callers.
+        self._diffusers_weights = (
+            config_mapping.get("_class_name") == "MiniMaxH3Transformer3DModel"
+            if diffusers_weights is None
+            else diffusers_weights
+        )
+        self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
         self.od_config = od_config
@@ -1490,7 +1526,7 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self._mark_missing_params_required()
 
-    def enable_vsa_gates(self) -> None:
+    def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:
         """Give every DiT block's attention a VSA compression gate.
 
         A FastH3 VSA artifact assigns these projections rather than adding to
@@ -1502,6 +1538,9 @@ class MiniMaxH3DiTModel(nn.Module):
             return
         for block in self.blocks:
             block.attn.enable_vsa_gate()
+            block.attn.vsa_sparsity = sparsity
+            if sparsity is not None:
+                block.attn.to_gate_compress.weight.missing_param_init = "error"
         self.vsa_gates_enabled = True
 
     def enable_vdn_branches(self, **window_config: Any) -> None:
@@ -1606,34 +1645,41 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load exact H3 checkpoint names with logical TP-aware loaders."""
+        """Load native or Diffusers H3 weights with the existing TP-aware loaders."""
         params = dict(self.named_parameters())
         params.update(dict(self.named_buffers()))
         loaded: set[str] = set()
         loaded_pruned_buffers: set[str] = set()
-        for source_name, loaded_weight in weights:
-            qkv_target = _diffusers_qkv_target(source_name)
-            if qkv_target is not None:
-                name, shard_id = qkv_target
-                param = params.get(name)
-                if param is None:
-                    logger.warning("Skipping MiniMax H3 weight not present in model: %s", source_name)
-                    continue
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                # Split Diffusers q/k/v tensors are already in logical head
-                # order.  Let QKVParallelLinear place and TP-shard each part;
-                # only the released fused checkpoint needs grouped reordering.
-                weight_loader(param, loaded_weight, shard_id)
-                loaded.add(name)
-                continue
-
-            name = _diffusers_to_partition_name(source_name)
+        diffusers_weights = getattr(self, "_diffusers_weights", False)
+        qkv_parts: dict[str, set[str]] = {}
+        source_names: set[str] = set()
+        for name, loaded_weight in weights:
+            layout = "plain"
+            if diffusers_weights:
+                if name in source_names:
+                    raise ValueError(f"duplicate Diffusers H3 weight: {name}")
+                source_names.add(name)
+                module, _, kind = name.rpartition(".")
+                target = _resolve_native_target(module)
+                if target is None or kind not in {"weight", "bias"}:
+                    # Raising rather than name-matching: a wrong gate/up order
+                    # loads and runs, and only shows up as bad output, so an
+                    # incomplete rename table has to fail loudly here.
+                    raise ValueError(f"unsupported Diffusers H3 weight: {name}")
+                name, layout = f"{target[0]}.{kind}", target[1]
             param = params.get(name)
             if param is None:
-                logger.warning("Skipping MiniMax H3 weight not present in model: %s", source_name)
+                if diffusers_weights:
+                    raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
+                logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")) and source_name == name:
+            if layout in {"q", "k", "v"}:
+                # vLLM can load each projection directly into its packed QKV
+                # parameter, including TP slicing and online quantization.
+                weight_loader(param, loaded_weight, layout)
+                qkv_parts.setdefault(name, set()).add(layout)
+            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost. A
                 # serialized per-channel INT8 scale has the same row layout as
@@ -1652,16 +1698,9 @@ class MiniMaxH3DiTModel(nn.Module):
                         f"gate/up matrices, got {tuple(loaded_weight.shape)}"
                     )
                 first, second = loaded_weight.chunk(2, dim=0)
-                if _DIFFUSERS_SWIGLU_NAME.search(source_name):
-                    # Diffusers stores [up, gate]; the released partition and
-                    # vLLM MergedColumnParallelLinear use [gate, up]. Decide on
-                    # the source name itself rather than on "a rename happened":
-                    # a wrong order loads and runs, and only shows up as bad
-                    # output, so this must not depend on the rename table
-                    # staying exhaustive.
-                    gate, up = second, first
-                else:
-                    gate, up = first, second
+                # Diffusers stores [up, gate]; the released partition and vLLM
+                # MergedColumnParallelLinear use [gate, up].
+                gate, up = (second, first) if layout == "swap_halves" else (first, second)
                 weight_loader(param, gate, 0)
                 weight_loader(param, up, 1)
             else:
@@ -1669,12 +1708,24 @@ class MiniMaxH3DiTModel(nn.Module):
             loaded.add(name)
             if name in MINIMAX_H3_FP32_BUFFER_NAMES or name.endswith(".adaln_proj.folded_bias"):
                 loaded_pruned_buffers.add(name)
+        if diffusers_weights:
+            for name, parts in qkv_parts.items():
+                if parts != {"q", "k", "v"}:
+                    raise ValueError(f"incomplete Diffusers H3 QKV group {name}: {sorted(parts)}")
+            # Diffusers reconstructs RoPE from config instead of storing this
+            # native checkpoint buffer. Compute on CPU for identical values.
+            freq_dim = self.arch.rope_inv_freq_len
+            rope = 1.0 / (
+                self._rope_theta
+                ** (torch.arange(0, 2 * freq_dim, 2, dtype=torch.float32, device="cpu") / (2 * freq_dim))
+            )
+            default_weight_loader(params["rope.inv_freq"], rope)
+            loaded.add("rope.inv_freq")
         # Record the set unconditionally: it marks "load_weights ran here", which
         # is what ``post_load_weights`` needs to tell an incomplete checkpoint
         # apart from a path that never loaded through this method.
         self._loaded_pruned_buffers = loaded_pruned_buffers
         return loaded
-
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:
         if isinstance(pos_info, dict):

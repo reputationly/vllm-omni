@@ -13,19 +13,19 @@ For the internal architecture and backend extension points, see the
 | Mode | Guide | Description | Methods |
 | ------ | ------- | ------------- | --------- |
 | Online quantization | [Online Quantization](online.md) | vLLM-Omni computes quantized weights and scales while loading the model. | FP8 W8A8, Int8 W8A8, BitsAndBytes W4, MXFP8 W8A8, MXFP4 W4A4 |
-| Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion Flash Attention tensors during inference. | FP8 FA |
-| Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, msModelSlim, serialized Int8, offline MXFP8, offline MXFP4 DualScale |
+| Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion attention tensors during inference. | FP8, MXFP8, MXFP4 |
+| Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, TorchAO, msModelSlim, serialized Int8, offline MXFP8, offline MXFP4 DualScale |
 
 ## Hardware Support
 
-| Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim |
-| -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- |
-| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
-| NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
-| AMD ROCm | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ |
-| Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
-| Ascend NPU | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
+| Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim | TorchAO FP8 weight-only |
+| -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- | --------- |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
+| NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ✅ |
+| NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
+| AMD ROCm | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ | ⭕ |
+| Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
+| Ascend NPU | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ⭕ |
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available.
@@ -49,6 +49,7 @@ otherwise.
 | MXFP4 W4A4 | [MXFP4](mxfp4.md) | `mxfp4`: online single-scale only; `mxfp4_dualscale`: online or offline dual-scale (offline recommended) | Wan2.2-T2V-A14B, I2V-A14B | Ascend NPU only; validated for Wan2.2 A14B cascade models; TI2V-5B not supported; offline `mxfp4_dualscale` uses calibrated `mul_scale` for best accuracy |
 | AutoRound | [AutoRound](autoround.md) | Pre-quantized W4A16 checkpoints | FLUX.1-dev; Qwen-Image/Wan2.2 not validated | Checkpoint-driven |
 | msModelSlim | [msModelSlim](msmodelslim.md) | Pre-quantized Ascend checkpoints | Wan2.2 recipe; HunyuanImage-3.0 inference target | Ascend/NPU path |
+| TorchAO | [TorchAO](torchao.md) | Pre-quantized FP8 weight-only (W8A16) | Boogu-Image Base/Edit `-fp8` | Validated for the Boogu-Image diffusion transformer |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -65,6 +66,7 @@ in BF16 unless the model guide explicitly adds support.
 | MXFP8 | [MXFP8](mxfp8.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
 | MXFP4 | [MXFP4](mxfp4.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
 | AutoRound | [AutoRound](autoround.md) | Thinker or language-model checkpoint config | Qwen2.5-Omni, Qwen3-Omni | Supported through AutoRound checkpoints |
+| TorchAO | [TorchAO](torchao.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
 | msModelSlim | [msModelSlim](msmodelslim.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
@@ -81,6 +83,7 @@ attached to the intended stage rather than applied globally.
 | MXFP8 | [MXFP8](mxfp8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Not validated |
 | MXFP4 | [MXFP4](mxfp4.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Not validated |
 | AutoRound | [AutoRound](autoround.md) | Checkpoint-defined stage | BAGEL, GLM-Image | No validated checkpoint listed |
+| TorchAO | [TorchAO](torchao.md) | Stage-specific serialized checkpoint | BAGEL, GLM-Image | Not validated |
 | msModelSlim | [msModelSlim](msmodelslim.md) | Ascend-generated stage weights | GLM-Image | Requires model-specific adaptation |
 
 !!! note
@@ -106,7 +109,7 @@ config = build_quant_config({
 
 | Component | Default quantized? | Notes |
 | ----------- | -------------------- | ------- |
-| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, and msModelSlim |
+| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, TorchAO, and msModelSlim |
 | Text encoder | No | Keep BF16 unless a method-specific guide documents support |
 | VAE | No | Keep BF16; storage-only paths are method-specific |
 | Scheduler/tokenizer | No | Loaded from the base model repository |

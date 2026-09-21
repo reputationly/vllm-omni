@@ -16,15 +16,13 @@ a single ``to_qkv`` so each block runs one GEMM instead of three.
 :func:`remap_transformer_state` performs that fusion, and is the only place
 the checkpoint's layout is reinterpreted.
 
-Attention runs through the project's own diffusion attention layer, so this
-model picks up the same backend selection, sequence-parallel plumbing and
-KV-quant policy as every other transformer in the tree. That layer resolves
-its backend from the diffusion config, which an ``LLM_GENERATION`` stage such
-as this one does not set; it tolerates that and falls through to the platform
-default. That default is a half-precision kernel while this stage decodes in
-``ACOUSTIC_DTYPE`` (float32), so the blocks ask the resolved backend whether it
-accepts that dtype and run plain SDPA when it does not -- a choice made once
-when the blocks are built and never inside ``forward``.
+Attention uses the project's diffusion attention layer when its selected
+backend supports the runtime dtype. This ``LLM_GENERATION`` stage does not set
+a diffusion backend and therefore gets the platform default. CUDA commonly
+resolves that default to FlashAttention, cuDNN, or FlashInfer, so the model
+routes its native float32 decode through SDPA while retaining the selected
+backend for supported lower-precision inputs. An explicitly selected backend
+remains authoritative.
 """
 
 from __future__ import annotations
@@ -77,6 +75,19 @@ _TRANSFORMER_IN_DIM = DIT_LATENT_CHANNELS * 2 + _CONDITION_DIM
 # The prompt interpolation floor from the reference sampler. Sigma never
 # reaches exactly zero, so the noise term never fully vanishes.
 _SIGMA_FLOOR = 1e-6
+
+# These backends reject float32 Q/K/V. MiniMax Music 3 decodes in float32, so
+# automatically selected incompatible backends must not receive its attention
+# tensors. This includes cuDNN and FlashInfer selected on Blackwell. Explicit
+# backend choices retain the shared layer's fail-fast contract instead of
+# being silently replaced here.
+_FLOAT32_UNSUPPORTED_BACKENDS = {
+    "FLASH_ATTN",
+    "FLASH_ATTN_HUB",
+    "FLASH_ATTN_3_HUB",
+    "CUDNN_ATTN",
+    "FLASHINFER_ATTN",
+}
 
 
 class FourierFeatures(nn.Module):
@@ -152,8 +163,7 @@ def _build_native_attention(*, num_heads: int, head_size: int, softmax_scale: fl
     except Exception as exc:  # noqa: BLE001 - any failure means: use SDPA
         _NATIVE_ATTENTION_UNAVAILABLE = repr(exc)
         logger.warning(
-            "MiniMax Music 3 DiT could not build the diffusion attention layer "
-            "(%s); running torch SDPA instead. The audio is unchanged.",
+            "MiniMax Music 3 DiT could not build the diffusion attention layer (%s); running torch SDPA instead.",
             exc,
         )
         return None
@@ -200,10 +210,19 @@ class Attention(nn.Module):
             softmax_scale=self.softmax_scale,
             prefix=prefix,
         )
-        self.backend_name = self.backend.attn_backend.get_name() if self.backend is not None else "TORCH_SDPA"
+        native_backend_name = self.backend.attn_backend.get_name() if self.backend is not None else None
+        self._auto_float32_sdpa = (
+            self.backend is not None
+            and not getattr(self.backend, "backend_explicit", False)
+            and native_backend_name in _FLOAT32_UNSUPPORTED_BACKENDS
+        )
+        if self._auto_float32_sdpa:
+            self.backend_name = f"TORCH_SDPA(float32)/{native_backend_name}(lower precision)"
+        else:
+            self.backend_name = native_backend_name or "TORCH_SDPA"
 
     def _attend(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        if self.backend is not None:
+        if self.backend is not None and not (q.dtype == torch.float32 and self._auto_float32_sdpa):
             return self.backend(q, k, v)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=self.softmax_scale)
