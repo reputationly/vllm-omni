@@ -196,12 +196,16 @@ def _prepare_decode_timestep_conditioning(
 
 logger = init_logger(__name__)
 
-# 解码前把 DiT 搬回主机内存的开关。与 MiniMax-H3 的
-# VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE 同语义、同默认值(关)。
+# 解码前把 DiT 搬回主机内存的开关。H3 曾有同语义的
+# VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE,2026-09-21 同步上游后已删 —— 恢复了上游的
+# enable_omni_model_cpu_offload 之后,进 VAE 会由 SequentialOffloadHook.pre_forward
+# 自动踢掉 DiT(dit 与 stage 互斥),不需要这个开关。LTX-2 的这一步在 diffusers 里、
+# 不走那套钩子,所以仍然需要。默认关。
 LTX2_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE"
 
-# postprocess 的分帧粒度。与 H3 的 VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK 同性质:
-# 只调"一次转多少帧",不是开关 —— 分块本身无条件生效(逐帧运算,数值等价)。
+# postprocess 的分帧粒度:只调"一次转多少帧",不是开关 —— 分块本身无条件生效
+# (逐帧运算,数值等价)。H3 曾有同性质的 VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK,
+# 2026-09-21 同步上游后被 _revert_decoded_inplace 取代(原地改写、整片零拷贝)。
 LTX2_POSTPROCESS_FRAME_CHUNK = 32
 LTX2_POSTPROCESS_FRAME_CHUNK_ENV = "VLLM_OMNI_LTX2_POSTPROCESS_FRAME_CHUNK"
 

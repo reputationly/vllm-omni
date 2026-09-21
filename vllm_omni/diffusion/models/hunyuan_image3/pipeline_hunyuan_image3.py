@@ -78,10 +78,13 @@ _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
 
 # Park the DiT in host RAM for the duration of the VAE decode. Same lever as
-# MiniMax-H3's VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE and LTX-2's equivalent, but
-# NOT the same precondition: those two only undo an offload group that
-# model-level CPU offload already owns, whereas HunyuanImage-3's NF4 weights are
-# natively resident, so this one does the move itself and must put them back.
+# LTX-2's VLLM_OMNI_LTX2_OFFLOAD_DIT_BEFORE_VAE, but NOT the same precondition:
+# that one only undoes an offload group that model-level CPU offload already
+# owns, whereas HunyuanImage-3's NF4 weights are natively resident, so this one
+# does the move itself and must put them back. (MiniMax-H3 had a third copy of
+# this lever; it was dropped on 2026-09-21 when the upstream sync restored
+# enable_omni_model_cpu_offload, whose DiT/stage mutual exclusion already
+# evicts the DiT on the way into the VAE.)
 # Default off — see _offload_dit_before_vae for the measured trade.
 HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_OFFLOAD_DIT_BEFORE_VAE"
 
