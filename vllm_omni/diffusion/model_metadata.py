@@ -20,8 +20,16 @@ class DiffusionModelMetadata:
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
-# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
-QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 image-conditioned generation accepts up to 10 reference images,
+# matching the official model card. Each condition image adds its own latent block to
+# the joint sequence, so the prefix KV cache grows linearly with the count. Measured on
+# 4xA100-40G with Ulysses SP4 at the default 1024-px condition resolution: ~10.7 GiB of
+# peak memory per extra image, summed over the four ranks (93.7 / 115.3 / 136.3 / 157.8
+# GiB at N=2/4/6/8). That matches the arithmetic -- 32 layers x 4096 latent tokens x
+# 32 heads x 128 dim x 2 (K+V) x 2 bytes = 2.0 GiB per rank, and Ulysses replicates the
+# prefix on every rank instead of sharding it -- plus activations. Callers that hit the
+# ceiling should lower `condition_resolution`; the engine no longer caps them at 4.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 10
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.

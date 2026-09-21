@@ -27,6 +27,12 @@ import io
 import PIL.Image
 
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
+
+# Bounds for the per-request condition-image pixel budget (Qwen-Image 2.1's
+# `condition_resolution`). Below 256 the reference is too coarse for the VLM to read it;
+# above 2048 one condition image already costs more prefix KV than the target image.
+MIN_CONDITION_RESOLUTION = 256
+MAX_CONDITION_RESOLUTION = 2048
 SUPPORTED_LAYERED_LAYERS_RANGE = range(2, 11)
 
 

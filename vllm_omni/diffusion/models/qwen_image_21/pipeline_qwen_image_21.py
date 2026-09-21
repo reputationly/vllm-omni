@@ -211,13 +211,17 @@ def get_qwen_image_21_pre_process_func(
         images = [_to_pil(im) for im in raw_image]
 
         # One resize feeds both the text encoder and the VAE.
+        # `condition_resolution` only scales the condition images; the generated size is
+        # still derived below (or taken from the request), so lowering it trades reference
+        # fidelity for prefix-KV memory without shrinking the output.
+        condition_resolution = request.sampling_params.condition_resolution or OUTPUT_RESOLUTION
         input_image_sizes = []
         prompt_images = []
         vae_images = []
         for img in images:
             image_width, image_height = img.size
             input_width, input_height = calculate_dimensions(
-                OUTPUT_RESOLUTION * OUTPUT_RESOLUTION, image_width / image_height
+                condition_resolution * condition_resolution, image_width / image_height
             )
             input_image_sizes.append((input_width, input_height))
             prompt_images.append(image_processor.resize(img, height=input_height, width=input_width))
