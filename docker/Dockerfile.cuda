@@ -16,6 +16,15 @@ RUN apt-get update && \
 
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
+# 版本号固定，不依赖构建上下文里的 git 元数据。
+# setup.py 在 get_version() 失败时会回退成 version = "dev"，再把它塞给
+# SETUPTOOLS_SCM_PRETEND_VERSION —— 而 "dev" 不是合法版本号，下一行 get_version()
+# 立刻抛 packaging.version.InvalidVersion: Invalid version: 'dev'。
+# 也就是说那条回退路径本身是坏的，一旦 CI 侧拿不到 tag 就整个构建失败
+# （run 35578026955 / 35578728245 都栽在这里）。走官方支持的 override 绕开它。
+ARG VLLM_OMNI_VERSION_OVERRIDE=0.1.dev0
+ENV VLLM_OMNI_VERSION_OVERRIDE=${VLLM_OMNI_VERSION_OVERRIDE}
+
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
