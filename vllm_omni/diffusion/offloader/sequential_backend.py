@@ -14,7 +14,6 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
-from .config import DIT_COMPONENT
 from .module_residency import PinnedModuleStager
 from .plan_resolver import resolve_offload_plan
 

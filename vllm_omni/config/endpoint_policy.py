@@ -8,7 +8,6 @@ from typing import NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from starlette.routing import Route
 from vllm.entrypoints.serve.exception_handling.error_response import create_error_response
 
 from vllm_omni.entrypoints.serve.utils.routes import remove_route_from_app
