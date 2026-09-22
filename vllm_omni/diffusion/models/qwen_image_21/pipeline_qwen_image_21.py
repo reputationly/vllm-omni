@@ -126,24 +126,28 @@ def _exclude_text_encoder_subtrees_from_quant(
 ) -> "QuantizationConfig | None":
     """Keep the vision tower and LM head in checkpoint precision.
 
-    Uses the config's standard ``ignored_layers`` mechanism, with substring
-    matching so the prefixes cover whole subtrees (same convention as the
-    DiT's ``_enable_pattern_ignored_layers``).
+    Backends spell the exclusion list differently: the vLLM FP8 family uses
+    ``ignored_layers`` (with an opt-in substring match mode, same convention as
+    the DiT's ``_enable_pattern_ignored_layers``), while ``TorchAOConfig`` uses
+    ``skip_modules``, which already matches on whole dot-separated segments and
+    so covers a subtree as written.
     """
     if quant_config is None:
         return None
-    if not hasattr(quant_config, "ignored_layers"):
-        logger.warning(
-            "Quantization config %s has no ignored_layers; the Qwen3-VL vision tower "
-            "and LM head cannot be excluded from quantization.",
-            type(quant_config).__name__,
-        )
-        return quant_config
-    config = copy.copy(quant_config)
-    config.ignored_layers = [*config.ignored_layers, *_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES]
-    if hasattr(config, "ignored_layers_match_mode"):
-        config.ignored_layers_match_mode = "substring"
-    return config
+    for attr in ("ignored_layers", "skip_modules"):
+        if not hasattr(quant_config, attr):
+            continue
+        config = copy.copy(quant_config)
+        setattr(config, attr, [*(getattr(config, attr) or []), *_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES])
+        if attr == "ignored_layers" and hasattr(config, "ignored_layers_match_mode"):
+            config.ignored_layers_match_mode = "substring"
+        return config
+    logger.warning(
+        "Quantization config %s has neither ignored_layers nor skip_modules; the Qwen3-VL "
+        "vision tower and LM head cannot be excluded from quantization.",
+        type(quant_config).__name__,
+    )
+    return quant_config
 
 
 def get_qwen_image_21_pre_process_func(
