@@ -494,7 +494,7 @@ class TestInt8WeightOnlyLinearMethod:
     def test_apply_keeps_activations_bf16(self, mocker):
         from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod
 
-        invoke = mocker.patch("vllm_omni.diffusion.layers.mot.ops.mot_gemm.invoke_mot_gemm")
+        invoke = mocker.patch("vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm.invoke_mot_gemm")
         method = Int8WeightOnlyLinearMethod(mocker.Mock())
         layer = Module()
         layer.weight = Parameter(torch.ones((8, 4), dtype=torch.int8), requires_grad=False)

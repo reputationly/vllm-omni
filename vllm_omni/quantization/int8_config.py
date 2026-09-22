@@ -564,7 +564,7 @@ class Int8WeightOnlyLinearMethod(BaseInt8LinearMethod):
         if x.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError(f"W8A16 requires BF16/FP16 activations, got {x.dtype}.")
 
-        from vllm_omni.diffusion.layers.mot.ops.mot_gemm import invoke_mot_gemm
+        from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import invoke_mot_gemm
 
         original_shape = x.shape
         x_2d = x.reshape(-1, original_shape[-1])

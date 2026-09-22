@@ -8,7 +8,7 @@
 # separate engines with a text handoff rather than one KV-reusing pipeline.
 #
 # Delta vs upstream vllm_omni/deploy/hunyuan_image3_dit.yaml:
-#   * safetensors_load_strategy: lazy
+#   * (safetensors_load_strategy: lazy 已于 2026-09-22 移除 —— 扩散 stage 上从未生效)
 #   * enable_sleep_mode: true           Level-1 residency (report §7.2).
 #   * num_inference_steps: 8            Upstream leaves this to the caller; the
 #     Distil/MeanFlow variant is an 8-step model (report §7.3).
@@ -69,7 +69,12 @@ stages:
     enforce_eager: true
     devices: "0,1,2,3"
     distributed_executor_backend: "mp"
-    safetensors_load_strategy: lazy
+    # safetensors_load_strategy 曾写在这里（意图:避免 4 个 rank 同时从 NFS 预读整份分片）,
+    # 2026-09-22 查实它在扩散 stage 上**从未生效**:diffusion_model_runner.py 是
+    # `load_config = LoadConfig()` 默认构造,deploy-config 的值到不了 DiffusersPipelineLoader
+    # 读的那个 load_config(默认值是 None,不是 lazy)。上游 #5172 加了未知字段严格校验后
+    # 它从静默忽略变成启动即报错,故移除。要真正兑现这个优化得给 OmniDiffusionConfig 加字段
+    # 并在 runner 里透传 —— 那是独立改动,不在同步合并里做。AR 档(走 vLLM LLM 引擎)保留。
     enable_sleep_mode: true
     # Left off deliberately: the measured 29339 MiB/rank peak was reached WITHOUT
     # VAE slicing/tiling, so enabling them is untested here and would change the

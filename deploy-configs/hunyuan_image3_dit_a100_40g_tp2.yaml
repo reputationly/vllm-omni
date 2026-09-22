@@ -70,7 +70,12 @@ stages:
     enforce_eager: true
     devices: "0,1"
     distributed_executor_backend: "mp"
-    safetensors_load_strategy: lazy
+    # safetensors_load_strategy 曾写在这里（意图:避免 4 个 rank 同时从 NFS 预读整份分片）,
+    # 2026-09-22 查实它在扩散 stage 上**从未生效**:diffusion_model_runner.py 是
+    # `load_config = LoadConfig()` 默认构造,deploy-config 的值到不了 DiffusersPipelineLoader
+    # 读的那个 load_config(默认值是 None,不是 lazy)。上游 #5172 加了未知字段严格校验后
+    # 它从静默忽略变成启动即报错,故移除。要真正兑现这个优化得给 OmniDiffusionConfig 加字段
+    # 并在 runner 里透传 —— 那是独立改动,不在同步合并里做。AR 档(走 vLLM LLM 引擎)保留。
     enable_sleep_mode: false
     # Tiling would also fit, and cheaper in wall clock, but it visibly changes the
     # output (PSNR 22-25 dB vs untiled). The env-var offload above is the
