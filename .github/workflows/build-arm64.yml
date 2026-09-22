@@ -1,4 +1,4 @@
-name: Build vLLM-Omni ARM64 image to ACR
+name: Build vLLM-Omni ARM64 image (GHCR + Docker Hub)
 
 # 全模型通用镜像出包流水线(照 index-tts / LightX2V 的 build-arm64 模式)。
 #
@@ -12,15 +12,22 @@ name: Build vLLM-Omni ARM64 image to ACR
 # 预检结论(IndexTTS-2 实测报告已确认):vllm/vllm-openai:v0.25.0 官方带 arm64,
 #   torch 2.11.0+cu130 与 vllm kernel .so 均含 sm_80(A100 可用)。
 #
+# 分发链路(2026-09-22 改)：GHA 只推境外的两个仓,ACR 由阿里云侧同步拉取。
+#   GHA runner --push--> ghcr.io + Docker Hub      (都在境外,不跨境,实测 16 分钟出包)
+#   阿里云 ACR --镜像同步--> 从 Docker Hub 拉进来   (在阿里云侧完成,不受跨境带宽影响)
+#   GPU 机 --pull--> ACR                           (内网)
+# 为什么不让 GHA 直接推 ACR:实测 5 次全挂在 ACR 登录(TLS handshake timeout /
+# context deadline exceeded),有一次整个 job 撞 GHA 60 分钟上限被取消。
+# 为什么机器不直接从 ghcr 拉:公开后鉴权没问题,但实测带宽只有 34 KB/s,38 GB 拉不动。
+#
 # Secrets(repo Settings -> Secrets,与 gpustack / index-tts / LightX2V fork 同名):
-#   ACR_USERNAME / ACR_PASSWORD          — 阿里云 ACR(发布 + 双推目标)
 #   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN — Docker Hub(registry build cache + 双推,提速关键)
 #
 # 提速(2026-07-20):① Dockerfile 层序把固化依赖提到 COPY 源码之前 → 改源码只重跑 app 层;
 #   ② build cache 从 GHA(10GB 上限,大镜像放不下→形同冷构建)换成 Docker Hub registry cache
 #   (无上限、跨 run 持久增量)。首次跑仍冷(建 buildcache),之后增量出包应明显变快。
 #
-# Run: GitHub -> Actions -> "Build vLLM-Omni ARM64 image to ACR" -> Run workflow
+# Run: GitHub -> Actions -> "Build vLLM-Omni ARM64 image (GHCR + Docker Hub)" -> Run workflow
 #   or: gh workflow run build-arm64.yml --ref main
 
 on:
@@ -31,7 +38,7 @@ on:
         default: 'vllm/vllm-openai:v0.29.0'
         required: true
       dest_tag:
-        description: '要发布的浮动 ACR tag'
+        description: '要发布的浮动 tag（ghcr / Docker Hub 同名；ACR 侧由镜像同步带过去）'
         default: 'arm64-a100-latest'
         required: true
 
@@ -74,28 +81,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ACR 在 cn-shanghai,从 GitHub runner 推 38 GB 要跨境:实测登录 TLS 握手
-      # 反复超时、有一次整个 job 被 GHA 的 1 小时上限取消。降级为尽力而为,
-      # 失败不阻断 —— 机器可以直接从 ghcr 拉(实测 ghcr.io 从 GPU 机 1.2s 握手通)。
-      - name: Login to Aliyun ACR
-        continue-on-error: true
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.ACR_REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
       # base 从 Docker Hub 公开镜像拉不需要登录;这步是为 registry build cache
       # 的 cache-to 推送 + 镜像双推 Docker Hub。
+      # Docker Hub 现在是分发链路的一环(ACR 从它同步),登录失败就该让构建失败。
       - name: Login to Docker Hub
-        continue-on-error: true
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 第一步只推 ghcr:跨境的那几个目标放到下一步,构建产物先落地再说。
-      - name: Build and push to GHCR (arm64)
+      # 同时推 ghcr 与 Docker Hub —— 两个都在境外,从 GHA runner 推不跨境。
+      # ACR 不在这里推(跨境,实测必挂),改由阿里云侧的镜像同步从 Docker Hub 拉。
+      - name: Build and push to GHCR + Docker Hub (arm64)
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -109,26 +106,11 @@ jobs:
           tags: |
             ${{ env.GHCR_REPO }}:${{ github.event.inputs.dest_tag }}
             ${{ env.GHCR_REPO }}:${{ steps.tags.outputs.version }}
+            ${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}
           # buildcache 也放 ghcr:缓存推送同样不该跨境(它按 mode=max 推,量不小)。
           cache-from: type=registry,ref=${{ env.GHCR_REPO }}:buildcache
           cache-to: type=registry,ref=${{ env.GHCR_REPO }}:buildcache,mode=max
-
-      # 镜像已在 ghcr 落地,下面只是把它复制到跨境的两个仓,失败不阻断。
-      # imagetools create 是 registry 间复制,不重新构建。
-      - name: Mirror to ACR / Docker Hub (best effort)
-        continue-on-error: true
-        run: |
-          set -x
-          for dst in \
-            "${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}" \
-            "${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}" \
-            "${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}" \
-            "${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}"; do
-            docker buildx imagetools create \
-              --tag "$dst" \
-              "${{ env.GHCR_REPO }}:${{ steps.tags.outputs.version }}" || \
-              echo "WARN: 复制到 $dst 失败（可直接从 ghcr 拉，不阻断）"
-          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
