@@ -1,0 +1,65 @@
+# Qwen-Image-2.1 — A100 PCIE 40G x4
+#
+# **一种部署形态，多实例横向扩**。t2i 与 i2i 是同一套权重、同一个部署，
+# 任务由请求带不带图决定；不要为编辑单独起服务。
+#
+# 定档：W8A16 + fp8_v 前缀 KV + Ulysses SP4 + VAE tiling
+#
+# 为什么是 W8A16 而不是 int8(W8A8)
+#   W8A8 会稳定把正文写错（"今天上午" → "今天上上午"，seed 42/43/44 复现，BF16 同 seed
+#   全对）。因果链是逐层排掉的：BF16 正确 → W8A8 必错 → 排除 img_mlp 无改善 →
+#   W8A16 干净，所以**根因是逐 token 的激活量化，不是权重**。W8A16 只量化权重、
+#   激活保持 bf16，构图与文字都不劣化。
+#   （int8 档的 ACTIVATION_SCHEMES 只有 "dynamic"，给不出 weight-only，所以走 TorchAO。
+#    镜像里必须有 torchao —— 见 docker/Dockerfile.cuda，它要装在 `uv pip install .` 之后。）
+#
+# 为什么不用 fp8
+#   A100 是 sm80，cutlass c2x 没有 fp8 路径，**启动直接崩**（已报 vllm#55008；
+#   根因是 CutlassFP8ScaledMMLinearKernel.can_implement() 无条件返回 True）。
+#
+# 为什么是 SP 不是 TP
+#   TP 在第 4 张卡上撞 PCIe 通信墙（TP4 1938ms/步，比 TP2 的 1868ms 还慢）。
+#   SP 切序列维、通信随卡数摊薄，是这台机器上唯一能扩的轴（SP4 1159ms，2.59×）。
+#   TP2 另有硬伤：text encoder 不可分片会 OOM。
+#
+# extras.prefix_kv_cache_dtype = fp8_v
+#   2.1 把文本 + 条件图的前缀 K/V 在第一步算完缓存、后 39 步复用。**SP 下这份前缀在
+#   每张卡各存一份完整副本（不分片）**，所以每加一张参考图的代价被乘了 4 倍 ——
+#   实测 10.7 GiB/图（四卡合计）。fp8_v 只把 V 压成 e4m3，缓存降到 75%，
+#   recipe 实测 40.9 dB（视觉无差别；全压的 "fp8" 只有 34.9 dB）。
+#   唯一代价是"量化缓存不能被 CUDA Graph 捕获、回落 eager decode" —— 而 SP 路径
+#   本来就不走 CUDA Graph，所以在这个档位上是净赚。
+#   带来的能力：W8A16 + fp8_v 下参考图能到 10 张 @ 条件图 1024²
+#   （BF16 只能 2 张 @1024² 或 6 张 @640²）。
+#
+# 实测（2026-09-22，合并 upstream 后的干净镜像，gpu48）
+#   BF16 档 2048² 冷启 47s（此前热态基线 37s）。W8A16+fp8_v 档见本轮验收记录。
+#
+# 两个请求侧的坑（都不是本文件能修的，网关要注意）
+#   · /v1/images/generations 会吞掉本文件里的 default_sampling_params，
+#     只有 get_default_sampling_params_list 那条路生效。
+#   · 步数不能省，这个模型只有 40 步档。
+#
+# 启动：
+#   vllm serve /nfs-models/wuhanjisuan894/models/Qwen-Image-2.1 --omni \
+#     --deploy-config deploy-configs/qwen_image_21_a100_40g_sp4.yaml \
+#     --host 0.0.0.0 --port 8091 --stage-init-timeout 900
+pipeline: qwen_image_21
+trust_remote_code: true
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+    vae_use_tiling: true
+    quantization_config:
+      method: torchao_int8_weight_only
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      sequence_parallel_size: 1
+      ulysses_degree: 4
+      ring_degree: 1
+      cfg_parallel_size: 1
+    extras:
+      prefix_kv_cache_dtype: "fp8_v"
