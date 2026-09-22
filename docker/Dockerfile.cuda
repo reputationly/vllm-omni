@@ -112,12 +112,12 @@ COPY vllm_omni/deploy/soulxsinger_svs.yaml vllm_omni/deploy/soulxsinger_svc.yaml
 # NFS 的 HF cache(HF_HOME),由部署侧预填(见 memory: vllm-omni-phase2-image-deps /
 # vllm-omni-gpustack-deploy-prereqs),镜像只带 pip 依赖,保持精简。
 
-# ===================================================================# 应用层——源码放最后,只让下面这层失效(改源码出包只重跑这一步,秒级)。
+# ==========================================================================
+# 应用层——源码放最后,只让下面这层失效(改源码出包只重跑这一步,秒级)。
 # 保留完整 `pip install .`(带依赖):base(vllm 官方镜像)+ 上面固化层已覆盖
 # 绝大多数依赖,uv 会跳过已满足项;不用 --no-deps,避免漏装 pyproject 里 base
 # 没带的依赖。
 # ==========================================================================
-=======
 # 版本号固定，不依赖构建上下文里的 git 元数据。
 # setup.py 在 get_version() 失败时会回退成 version = "dev"，再把它塞给
 # SETUPTOOLS_SCM_PRETEND_VERSION —— 而 "dev" 不是合法版本号，下一行 get_version()
