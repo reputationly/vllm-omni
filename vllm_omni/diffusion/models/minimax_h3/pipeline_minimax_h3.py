@@ -1185,6 +1185,22 @@ def _parity_dump_prompt_embeds(ids, hidden, tags, *, task: str, strategy) -> Non
     except Exception as exc:  # pragma: no cover - a dump must never fail a request
         logger.warning("MiniMax H3 parity dump failed (ignored): %s", exc)
 
+# 把 VAE 这类组件的"用前上卡、用后回主机"从 layerwise 开关里解耦出来。
+#
+# 2026-09-22 实测纠正:一度以为恢复上游的 enable_omni_model_cpu_offload 就能顶替它 ——
+# 不能。上游那条路只在 apply_sequential_offload(offload_initial_dits=True) 里卸 DiT,
+# 两个 VAE 按 component_load_device 加载,而该设备在 enable_cpu_offload(非 layerwise)
+# 下就是 GPU。上游自己的注释写明这是有意为之:"the compact API deliberately limits
+# explicit component selection to dit/text_encoder, so VAEs stay resident"。
+# 带诊断实测:transformer 0.000 / text_encoder 0.000 / video_vae 9.700 / audio_vae 0.564
+# GiB on device —— 10.264 GiB 原封不动留在卡上。
+_COMPONENT_OFFLOAD_ENV = "VLLM_OMNI_H3_OFFLOAD_COMPONENTS"
+
+
+def _component_offload_requested() -> bool:
+    return os.getenv(_COMPONENT_OFFLOAD_ENV, "") not in ("", "0")
+
+
 MINIMAX_H3_PARITY_DUMP_ENV = "VLLM_OMNI_H3_PARITY_DUMP_DIR"
 
 def _broadcast_frame_array(
@@ -1779,7 +1795,11 @@ class MiniMaxH3Pipeline(
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
-        component_load_device = torch.device("cpu") if legacy_manual_components else self.device
+        # 加到 CPU 才谈得上"用前上卡":上游只在 legacy 路径这么做,VAE 在新配置下直接进
+        # 显存。我们的 env 把它拉回 CPU,再由 _component_on_device 逐次搬运。
+        component_load_device = (
+            torch.device("cpu") if legacy_manual_components or _component_offload_requested() else self.device
+        )
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(vae_model_path, "video_vae"),
             device=self.device,
@@ -2240,6 +2260,9 @@ class MiniMaxH3Pipeline(
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
+        # 我们的开关对**所有**组件生效,包括上游不纳管的两个 VAE。
+        if _component_offload_requested():
+            return True
         if getattr(od_config, "diffusion_offload_config", None) is None:
             return bool(
                 getattr(od_config, "enable_layerwise_offload", False)
