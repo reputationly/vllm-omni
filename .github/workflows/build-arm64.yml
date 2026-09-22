@@ -60,7 +60,9 @@ jobs:
     # GitHub 原生 arm64 runner(与 index-tts / LightX2V 一致)。
     # base 从 Docker Hub 拉(快),app 层只拷代码 + pip install,不重编 CUDA 扩展。
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    # 120 而不是 60:ACR 那一段是跨境推 38 GB,实测只推 ghcr 用 6 分钟、加上 ACR 要 40+
+    # 分钟。2026-09-22 有一次就是卡在 60 分钟这个我们自己设的上限被取消的。
+    timeout-minutes: 120
     permissions:
       contents: write   # 建 GitHub Release
       packages: write   # 推 ghcr（用内置 GITHUB_TOKEN，无需额外 secret）
