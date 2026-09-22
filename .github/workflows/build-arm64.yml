@@ -40,6 +40,7 @@ env:
   ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni
   # Docker Hub:registry build cache(无 GHA 10GB 上限,跨 run 增量)+ 双推镜像。
   DOCKERHUB_REPO: arronlee/vllm-omni
+  GHCR_REPO: ghcr.io/${{ github.repository_owner }}/vllm-omni
 
 jobs:
   build:
@@ -49,6 +50,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write   # 建 GitHub Release
+      packages: write   # 推 ghcr（用内置 GITHUB_TOKEN，无需额外 secret）
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,7 +65,20 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ghcr 与 runner 同在 GitHub 侧,推送不跨境 —— 这是主目标。
+      # 用内置 GITHUB_TOKEN,不需要额外 secret(job 需 packages: write 权限)。
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ACR 在 cn-shanghai,从 GitHub runner 推 38 GB 要跨境:实测登录 TLS 握手
+      # 反复超时、有一次整个 job 被 GHA 的 1 小时上限取消。降级为尽力而为,
+      # 失败不阻断 —— 机器可以直接从 ghcr 拉(实测 ghcr.io 从 GPU 机 1.2s 握手通)。
       - name: Login to Aliyun ACR
+        continue-on-error: true
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
@@ -73,12 +88,14 @@ jobs:
       # base 从 Docker Hub 公开镜像拉不需要登录;这步是为 registry build cache
       # 的 cache-to 推送 + 镜像双推 Docker Hub。
       - name: Login to Docker Hub
+        continue-on-error: true
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push (arm64)
+      # 第一步只推 ghcr:跨境的那几个目标放到下一步,构建产物先落地再说。
+      - name: Build and push to GHCR (arm64)
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -90,13 +107,28 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ github.event.inputs.base_image }}
           tags: |
-            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
-            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
-            ${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}
-            ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}
-          # Docker Hub registry cache 替代 GHA(无 10GB 上限,跨 run 持久增量)。
-          cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache
-          cache-to: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache,mode=max
+            ${{ env.GHCR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.GHCR_REPO }}:${{ steps.tags.outputs.version }}
+          # buildcache 也放 ghcr:缓存推送同样不该跨境(它按 mode=max 推,量不小)。
+          cache-from: type=registry,ref=${{ env.GHCR_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.GHCR_REPO }}:buildcache,mode=max
+
+      # 镜像已在 ghcr 落地,下面只是把它复制到跨境的两个仓,失败不阻断。
+      # imagetools create 是 registry 间复制,不重新构建。
+      - name: Mirror to ACR / Docker Hub (best effort)
+        continue-on-error: true
+        run: |
+          set -x
+          for dst in \
+            "${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}" \
+            "${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}" \
+            "${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}" \
+            "${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}"; do
+            docker buildx imagetools create \
+              --tag "$dst" \
+              "${{ env.GHCR_REPO }}:${{ steps.tags.outputs.version }}" || \
+              echo "WARN: 复制到 $dst 失败（可直接从 ghcr 拉，不阻断）"
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -105,10 +137,11 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: vLLM-Omni ${{ steps.tags.outputs.version }}
           body: |
-            vLLM-Omni 全模型通用 arm64 镜像 — 推送到阿里云 ACR。
+            vLLM-Omni 全模型通用 arm64 镜像。**权威位置是 ghcr**，ACR / Docker Hub 是
+            尽力而为的副本（跨境复制，可能缺）。
 
-            - Floating tag: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}`
-            - Immutable tag: `${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}`
+            - GHCR（权威）: `${{ env.GHCR_REPO }}:${{ github.event.inputs.dest_tag }}` / `:${{ steps.tags.outputs.version }}`
+            - ACR（副本）: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}` / `:${{ steps.tags.outputs.version }}`
             - Docker Hub: `${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}` / `:${{ steps.tags.outputs.version }}`
             - Digest: `${{ steps.build.outputs.digest }}`
             - Base: `${{ github.event.inputs.base_image }}`
