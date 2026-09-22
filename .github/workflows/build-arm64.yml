@@ -1,4 +1,4 @@
-name: Build vLLM-Omni ARM64 image (GHCR + Docker Hub)
+name: Build vLLM-Omni ARM64 image to ACR (+ GHCR / Docker Hub)
 
 # 全模型通用镜像出包流水线(照 index-tts / LightX2V 的 build-arm64 模式)。
 #
@@ -12,13 +12,19 @@ name: Build vLLM-Omni ARM64 image (GHCR + Docker Hub)
 # 预检结论(IndexTTS-2 实测报告已确认):vllm/vllm-openai:v0.25.0 官方带 arm64,
 #   torch 2.11.0+cu130 与 vllm kernel .so 均含 sm_80(A100 可用)。
 #
-# 分发链路(2026-09-22 改)：GHA 只推境外的两个仓,ACR 由阿里云侧同步拉取。
-#   GHA runner --push--> ghcr.io + Docker Hub      (都在境外,不跨境,实测 16 分钟出包)
-#   阿里云 ACR --镜像同步--> 从 Docker Hub 拉进来   (在阿里云侧完成,不受跨境带宽影响)
-#   GPU 机 --pull--> ACR                           (内网)
-# 为什么不让 GHA 直接推 ACR:实测 5 次全挂在 ACR 登录(TLS handshake timeout /
-# context deadline exceeded),有一次整个 job 撞 GHA 60 分钟上限被取消。
-# 为什么机器不直接从 ghcr 拉:公开后鉴权没问题,但实测带宽只有 34 KB/s,38 GB 拉不动。
+# 推送目标(2026-09-22 起三个):ACR 是 GPU 机的拉取源(内网,必须有);
+# ghcr 与 Docker Hub 是境外副本,同一次 build-push 一起推,成本近乎为零。
+#
+# ACR 登录做了 5 次重试:这天连挂 5 次构建,其中 4 次就是挂在登录的
+# "TLS handshake timeout" / "context deadline exceeded" —— 阿里云侧偶发抽风,
+# 不是配置问题(index-tts 用同样写法一直好使,本仓当天更早一次也推成功过)。
+# docker/login-action 不带重试,所以那一步改成显式循环。
+#
+# 顺带记两个实测结论,省得以后再试:
+#   - 机器直接从 ghcr 拉:包设 public 后鉴权没问题,但带宽只有 34 KB/s,38 GB 拉不动。
+#     所以 ghcr 只是副本,不是拉取源。
+#   - 在 GPU 机上本地 docker build:卡在 uv pip install(境内到 PyPI),16 分钟只用了
+#     1 秒 CPU。也不通。
 #
 # Secrets(repo Settings -> Secrets,与 gpustack / index-tts / LightX2V fork 同名):
 #   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN — Docker Hub(registry build cache + 双推,提速关键)
@@ -83,7 +89,24 @@ jobs:
 
       # base 从 Docker Hub 公开镜像拉不需要登录;这步是为 registry build cache
       # 的 cache-to 推送 + 镜像双推 Docker Hub。
-      # Docker Hub 现在是分发链路的一环(ACR 从它同步),登录失败就该让构建失败。
+      # ACR 登录带重试:2026-09-22 这天连挂 5 次,其中 4 次就是这一步的
+      # "TLS handshake timeout" / "context deadline exceeded" —— 是阿里云侧的偶发抽风,
+      # 不是配置问题(index-tts 用同样的写法一直是好的,本仓当天更早一次也推成功过)。
+      # docker/login-action 不带重试,所以改成显式循环。
+      - name: Login to Aliyun ACR (with retry)
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          for i in 1 2 3 4 5; do
+            if echo "$ACR_PASSWORD" | docker login "${{ env.ACR_REGISTRY }}" \
+                 -u "$ACR_USERNAME" --password-stdin; then
+              echo "ACR 登录成功(第 $i 次尝试)"; exit 0
+            fi
+            echo "ACR 登录失败,第 $i 次,20s 后重试"; sleep 20
+          done
+          echo "ACR 登录 5 次仍失败"; exit 1
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -108,6 +131,8 @@ jobs:
             ${{ env.GHCR_REPO }}:${{ steps.tags.outputs.version }}
             ${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}
             ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}
+            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
           # buildcache 也放 ghcr:缓存推送同样不该跨境(它按 mode=max 推,量不小)。
           cache-from: type=registry,ref=${{ env.GHCR_REPO }}:buildcache
           cache-to: type=registry,ref=${{ env.GHCR_REPO }}:buildcache,mode=max
