@@ -592,6 +592,13 @@ class OrchestratorArgs:
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
     diffusion_offload_config: dict[str, Any] | None = None
+    # Model-specific knobs that have no dedicated flag, e.g.
+    #   --extras '{"prefix_kv_cache_dtype": "fp8_v"}'  (Qwen-Image 2.1)
+    # Until now these could only be set from a deploy YAML's stage block, and a
+    # deploy config requires the pipeline to be registered in OMNI_PIPELINES --
+    # single-stage diffusion models are not, so `vllm serve` could not reach them
+    # at all and the documented knobs were dead on that path.
+    extras: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False

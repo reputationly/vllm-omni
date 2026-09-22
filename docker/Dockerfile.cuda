@@ -112,15 +112,35 @@ COPY vllm_omni/deploy/soulxsinger_svs.yaml vllm_omni/deploy/soulxsinger_svc.yaml
 # NFS 的 HF cache(HF_HOME),由部署侧预填(见 memory: vllm-omni-phase2-image-deps /
 # vllm-omni-gpustack-deploy-prereqs),镜像只带 pip 依赖,保持精简。
 
-# ==========================================================================
-# 应用层——源码放最后,只让下面这层失效(改源码出包只重跑这一步,秒级)。
+# ===================================================================# 应用层——源码放最后,只让下面这层失效(改源码出包只重跑这一步,秒级)。
 # 保留完整 `pip install .`(带依赖):base(vllm 官方镜像)+ 上面固化层已覆盖
 # 绝大多数依赖,uv 会跳过已满足项;不用 --no-deps,避免漏装 pyproject 里 base
 # 没带的依赖。
 # ==========================================================================
+=======
+# 版本号固定，不依赖构建上下文里的 git 元数据。
+# setup.py 在 get_version() 失败时会回退成 version = "dev"，再把它塞给
+# SETUPTOOLS_SCM_PRETEND_VERSION —— 而 "dev" 不是合法版本号，下一行 get_version()
+# 立刻抛 packaging.version.InvalidVersion: Invalid version: 'dev'。
+# 也就是说那条回退路径本身是坏的，一旦 CI 侧拿不到 tag 就整个构建失败
+# （run 35578026955 / 35578728245 都栽在这里）。走官方支持的 override 绕开它。
+ARG VLLM_OMNI_VERSION_OVERRIDE=0.1.dev0
+ENV VLLM_OMNI_VERSION_OVERRIDE=${VLLM_OMNI_VERSION_OVERRIDE}
+
 # Step 2: Copy vllm-omni code and install
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+
+# TorchAO —— weight-only 量化（W8A16，torchao_int8_weight_only 档）用。
+# 必须放在 `uv pip install .` **之后**：装在它前面会让 uv 构建 vllm-omni 的 wheel 时
+# 报 packaging.version.InvalidVersion: Invalid version: 'dev'。
+# best-effort：torchao 与 torch 版本绑定很紧，装不上不该让整个镜像构建失败 ——
+# 缺它时只有 torchao_* 量化档在启动时报 ImportError，别的模型不受影响。
+RUN PY="$(python3 -c 'import sys; print(sys.executable)')"; \
+    uv pip install --python "$PY" --no-cache-dir --no-deps torchao \
+      || echo "WARN: torchao 未装上，torchao_* 量化档不可用"
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []

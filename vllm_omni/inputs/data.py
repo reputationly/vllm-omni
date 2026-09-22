@@ -238,6 +238,16 @@ class OmniDiffusionSamplingParams:
     # different bucket in (640, 1024) to determine the condition and output resolution
     resolution: int = 640
 
+    # Target pixel budget (side length; area is the square of it) each condition image is
+    # resized to before it reaches the text encoder and the VAE. None = the model's own
+    # default. Qwen-Image 2.1 exposes this because every condition image contributes a
+    # full latent block to the joint sequence, so lowering it is the only way to fit more
+    # reference images; it does NOT change the generated image size, which stays under
+    # `height`/`width`. Upstream diffusers folds both into one `output_resolution`
+    # argument -- splitting them keeps "shrink the references" from silently shrinking
+    # the output as well.
+    condition_resolution: int | None = None
+
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 

@@ -296,6 +296,31 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
     )
 
 
+def _build_torchao_int8_weight_only(**kw: Any) -> QuantizationConfig:
+    """Build a TorchAO INT8 weight-only (W8A16) runtime config.
+
+    Unlike ``int8`` (DiffusionInt8Config), this leaves activations in the model
+    dtype: ``ACTIVATION_SCHEMES`` there is ``["dynamic"]``-only, so that path is
+    always W8A8. W8A16 matters because the two damage the model differently --
+    on Qwen-Image 2.1, W8A8 reproducibly corrupts dense body text (it renders
+    "今天上午" as "今天上上午" on every seed tried, while BF16 is correct), and
+    excluding the most sensitive layers (``img_mlp``) does not fix it, which
+    points at the per-token activation quantization rather than the weights.
+
+    Runtime quantization, so it works on the stock BF16 checkpoint -- no offline
+    export needed. ``is_checkpoint_torchao_serialized=False`` is what makes it
+    quantize on load instead of expecting pre-quantized tensors.
+    """
+    from torchao.quantization import Int8WeightOnlyConfig
+
+    return _build_torchao(
+        torchao_config=Int8WeightOnlyConfig(
+            set_inductor_config=False,
+        ),
+        is_checkpoint_torchao_serialized=False,
+    )
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
     "bitsandbytes": _build_bitsandbytes,
@@ -308,6 +333,7 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "auto_round": _build_inc,
     "torchao": _build_torchao,
     "torchao_float8_weight_only": _build_torchao_float8_weight_only,
+    "torchao_int8_weight_only": _build_torchao_int8_weight_only,
 }
 
 

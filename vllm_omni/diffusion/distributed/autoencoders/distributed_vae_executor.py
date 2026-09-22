@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -46,7 +47,11 @@ class DistributedVaeExecutor:
 
     def __init__(self):
         # Use a dedicated process group spanning the complete worker WORLD.
-        self.group = get_world_group().device_group
+        world_group = get_world_group()
+        self.group = world_group.device_group
+        self._error_group = world_group.cpu_group
+        # Reporting an OOM must not require another device allocation.
+        self._error_status = torch.zeros((), dtype=torch.int32, device="cpu")
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.parallel_size = 1
@@ -55,6 +60,31 @@ class DistributedVaeExecutor:
     def set_parallel_size(self, parallel_size: int, mode: str = "tile"):
         self.parallel_size = parallel_size
         self.parallel_mode = mode
+
+    @contextmanager
+    def _sync_errors(self, stage: str):
+        """Agree on local-stage failures before entering the next collective."""
+        status = 0
+        message = ""
+        try:
+            yield
+        except torch.OutOfMemoryError as error:
+            status = 1
+            message = str(error)
+        except Exception as error:
+            # A non-retryable error takes precedence over OOM on another rank.
+            status = 2
+            message = f"{type(error).__name__}: {error}"
+
+        self._error_status.fill_(status)
+        dist.all_reduce(self._error_status, op=dist.ReduceOp.MAX, group=self._error_group)
+        global_status = self._error_status.item()
+        if global_status == 2:
+            detail = message if status == 2 else "another rank failed"
+            raise RuntimeError(f"Distributed VAE {stage} failed: {detail}")
+        if global_status == 1:
+            detail = message if status == 1 else "another rank ran out of memory"
+            raise torch.OutOfMemoryError(f"Distributed VAE {stage} failed: {detail}")
 
     def gather_tensors(self, tensor: torch.Tensor):
         """把各 rank 的分块收到 rank 0。
@@ -71,9 +101,12 @@ class DistributedVaeExecutor:
         这一份就不存在了。
 
         NCCL 支持 gather(PyTorch 用 point-to-point 实现),已在 A100×2 上实跑验证。
+        分配包在 ``_sync_errors`` 里(2.1 分支引入):一张卡分配失败时让所有 rank 一起
+        报错,而不是别的 rank 卡在集合通信上等到 NCCL 看门狗。
         """
         dst = dist.get_global_rank(self.group, 0) if self.group is not None else 0
-        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
+        with self._sync_errors("gather allocation"):
+            gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
         dist.gather(tensor, gather_list, dst=dst, group=self.group)
         return gather_list
 
@@ -82,11 +115,12 @@ class DistributedVaeExecutor:
         return tensor
 
     def _compute_global_padding_shape(self, local_results, output_ndim: int, device):
-        local_tile_max_dims = [0] * output_ndim
-        for _, tile_tensor in local_results:
-            for dim_idx, dim_size in enumerate(tile_tensor.shape):
-                local_tile_max_dims[dim_idx] = max(local_tile_max_dims[dim_idx], dim_size)
-        local_shape_stat = torch.tensor([len(local_results), *local_tile_max_dims], device=device)
+        with self._sync_errors("shape preparation"):
+            local_tile_max_dims = [0] * output_ndim
+            for _, tile_tensor in local_results:
+                for dim_idx, dim_size in enumerate(tile_tensor.shape):
+                    local_tile_max_dims[dim_idx] = max(local_tile_max_dims[dim_idx], dim_size)
+            local_shape_stat = torch.tensor([len(local_results), *local_tile_max_dims], device=device)
         dist.all_reduce(
             local_shape_stat,
             op=dist.ReduceOp.MAX,
@@ -138,49 +172,51 @@ class DistributedVaeExecutor:
     def execute(self, z: torch.Tensor, operator: DistributedOperator, broadcast_result: bool = True):
         pp_size = min(self.parallel_size, self.world_size)
 
-        # 1. Split into tiles
-        tiletask_list, grid_spec = operator.split(z)
-        tid_coord_map = {task.tile_id: task.grid_coord for task in tiletask_list}
-
-        # 2. local decode
-        assigned = self._balance_tasks(tiletask_list, pp_size)
-        local_tasks = assigned[self.rank] if self.rank < pp_size else []
-        local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
+        with self._sync_errors("tile decode"):
+            tiletask_list, grid_spec = operator.split(z)
+            tid_coord_map = {task.tile_id: task.grid_coord for task in tiletask_list}
+            assigned = self._balance_tasks(tiletask_list, pp_size)
+            local_tasks = assigned[self.rank] if self.rank < pp_size else []
+            local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank
         global_padding_shape = self._compute_global_padding_shape(local_results, z.ndim, z.device)
 
         # 5. prepare tile tensors
         output_dtype = grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
-        local_tile_tensor, local_meta_tensor = self._pack_local_tiles(
-            local_results, global_padding_shape, grid_spec, z.device, output_dtype
-        )
+        with self._sync_errors("tile packing"):
+            local_tile_tensor, local_meta_tensor = self._pack_local_tiles(
+                local_results, global_padding_shape, grid_spec, z.device, output_dtype
+            )
 
         # 6. gather tiles & meta
         meta_gather = self.gather_tensors(local_meta_tensor)
         tile_gather = self.gather_tensors(local_tile_tensor)
 
-        if self.rank != 0:
-            result = torch.empty(0, device=z.device)  # Dummy return for non-zero ranks
-        else:
-            # 7. reconstruct full tensor (rank 0)
-            coord_tensor_map = self._unpack_tiles(meta_gather, tile_gather, grid_spec, tid_coord_map)
-            result = operator.merge(coord_tensor_map, grid_spec)
+        with self._sync_errors("tile merge"):
+            if self.rank != 0:
+                result = torch.empty(0, device=z.device)  # Dummy return for non-zero ranks
+            else:
+                # 7. reconstruct full tensor (rank 0)
+                coord_tensor_map = self._unpack_tiles(meta_gather, tile_gather, grid_spec, tid_coord_map)
+                result = operator.merge(coord_tensor_map, grid_spec)
 
         if broadcast_result:
             result = self._sync_final_result(result, z.ndim, z.device, output_dtype)
         return result
 
     def _sync_final_result(self, rank0_result, output_ndim, output_device, output_dtype):
-        shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=torch.int64)
-        if self.rank == 0:
-            shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=torch.int64))
+        with self._sync_errors("output shape preparation"):
+            shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=torch.int64)
+            if self.rank == 0:
+                shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=torch.int64))
         dist.broadcast(shape_tensor, src=0, group=self.group)
 
-        if self.rank != 0:
-            sync_result = torch.empty(tuple(shape_tensor.tolist()), device=output_device, dtype=output_dtype)
-        else:
-            sync_result = rank0_result
+        with self._sync_errors("output allocation"):
+            if self.rank != 0:
+                sync_result = torch.empty(tuple(shape_tensor.tolist()), device=output_device, dtype=output_dtype)
+            else:
+                sync_result = rank0_result
         dist.broadcast(sync_result, src=0, group=self.group)
         return sync_result
 

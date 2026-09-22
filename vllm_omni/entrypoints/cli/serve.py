@@ -641,6 +641,21 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--extras",
+            dest="extras",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object of model-specific knobs that have no dedicated flag, forwarded "
+                "to the stage's `extras`. Until now these were reachable only from a deploy "
+                "YAML's stage block, and a deploy config requires the pipeline to be "
+                "registered in OMNI_PIPELINES -- single-stage diffusion models are not, so "
+                "documented knobs were dead on the `vllm serve` path. "
+                '(e.g. \'{"prefix_kv_cache_dtype": "fp8_v"}\' for Qwen-Image 2.1, which '
+                "stores the cross-step prefix V cache in FP8 E4M3)."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
             type=json.loads,

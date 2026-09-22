@@ -131,6 +131,8 @@ from vllm_omni.entrypoints.openai.errors import (
     _error_response_to_json_response,
 )
 from vllm_omni.entrypoints.openai.image_api_utils import (
+    MAX_CONDITION_RESOLUTION,
+    MIN_CONDITION_RESOLUTION,
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64_with_compression,
     parse_size,
@@ -2422,6 +2424,7 @@ async def generate_images(
 
 @router.post(
     "/v1/images/edits",
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -2429,6 +2432,7 @@ async def generate_images(
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
+@with_cancellation
 async def edit_images(
     raw_request: Request,
     image: list[UploadFile] | None = File(None),
@@ -2462,6 +2466,10 @@ async def edit_images(
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
+    # vllm-omni extension: pixel budget each condition image is resized to before the
+    # text encoder and the VAE. Independent of `size` (which sets the generated image).
+    # Only Qwen-Image 2.1 honours it today; other pipelines ignore it.
+    condition_resolution: int | None = Form(None),
     # /v1/images/edits is always IT2I; only the prompting knobs are exposed.
     bot_task: str | None = Form(None),
     sys_type: str | None = Form(None),
@@ -2572,6 +2580,18 @@ async def edit_images(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Invalid resolution {resolution}. Supported resolutions: {SUPPORTED_LAYERED_RESOLUTIONS}.",
             )
+        # Reject an out-of-range condition resolution here: too small silently degrades
+        # reference fidelity, too large only surfaces as an OOM minutes into the request.
+        if condition_resolution is not None and not (
+            MIN_CONDITION_RESOLUTION <= condition_resolution <= MAX_CONDITION_RESOLUTION
+        ):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    f"Invalid condition_resolution {condition_resolution}. Expected "
+                    f"{MIN_CONDITION_RESOLUTION}-{MAX_CONDITION_RESOLUTION}."
+                ),
+            )
         # 3.2.1 Validate layers if provided
         try:
             layers = validate_layered_layers(layers)
@@ -2633,6 +2653,7 @@ async def edit_images(
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
+        _update_if_not_none(gen_params, "condition_resolution", condition_resolution)
 
         extra_args = dict(getattr(gen_params, "extra_args", {}) or {})
         edit_extra_args = _build_hunyuan_edit_extra_args(
