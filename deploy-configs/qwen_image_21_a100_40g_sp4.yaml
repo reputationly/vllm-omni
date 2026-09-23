@@ -3,7 +3,7 @@
 # **一种部署形态，多实例横向扩**。t2i 与 i2i 是同一套权重、同一个部署，
 # 任务由请求带不带图决定；不要为编辑单独起服务。
 #
-# 定档：W8A16 + fp8_v 前缀 KV + Ulysses SP4 + VAE tiling
+# 定档：W8A16 + fp8 前缀 KV + Ulysses SP4 + VAE tiling + expandable_segments
 #
 # 为什么是 W8A16 而不是 int8(W8A8)
 #   W8A8 会稳定把正文写错（"今天上午" → "今天上上午"，seed 42/43/44 复现，BF16 同 seed
@@ -13,7 +13,7 @@
 #   （int8 档的 ACTIVATION_SCHEMES 只有 "dynamic"，给不出 weight-only，所以走 TorchAO。
 #    镜像里必须有 torchao —— 见 docker/Dockerfile.cuda，它要装在 `uv pip install .` 之后。）
 #
-# 为什么不用 fp8
+# 为什么权重不用 fp8（与下面前缀 KV 的 fp8 存储是两回事）
 #   A100 是 sm80，cutlass c2x 没有 fp8 路径，**启动直接崩**（已报 vllm#55008；
 #   根因是 CutlassFP8ScaledMMLinearKernel.can_implement() 无条件返回 True）。
 #
@@ -22,15 +22,26 @@
 #   SP 切序列维、通信随卡数摊薄，是这台机器上唯一能扩的轴（SP4 1159ms，2.59×）。
 #   TP2 另有硬伤：text encoder 不可分片会 OOM。
 #
-# extras.prefix_kv_cache_dtype = fp8_v
-#   2.1 把文本 + 条件图的前缀 K/V 在第一步算完缓存、后 39 步复用。**SP 下这份前缀在
-#   每张卡各存一份完整副本（不分片）**，所以每加一张参考图的代价被乘了 4 倍 ——
-#   实测 10.7 GiB/图（四卡合计）。fp8_v 只把 V 压成 e4m3，缓存降到 75%，
-#   recipe 实测 40.9 dB（视觉无差别；全压的 "fp8" 只有 34.9 dB）。
-#   唯一代价是"量化缓存不能被 CUDA Graph 捕获、回落 eager decode" —— 而 SP 路径
-#   本来就不走 CUDA Graph，所以在这个档位上是净赚。
-#   带来的能力：W8A16 + fp8_v 下参考图能到 10 张 @ 条件图 1024²
-#   （BF16 只能 2 张 @1024² 或 6 张 @640²）。
+# extras.prefix_kv_cache_dtype = fp8（K 与 V 都存 e4m3；2026-09-23 由 fp8_v 改来）
+#   2.1 把文本 + 条件图的前缀 K/V 在第一步算完缓存、后 39 步复用，**SP 下每张卡各存
+#   一份完整副本**。每张 1024² 条件图 = 4096 token，每卡缓存：原生 2.00 / fp8_v 1.52 /
+#   fp8 1.03 GiB。t2i 的前缀只有提示词，三档显存与时延都无差；只有多参考图才吃这份账。
+#   画质：20 组 PE 用例逐张目视，fp8_v 与 fp8 都没有可见的系统性变差（PSNR 低主要是
+#   构图平移，官方 use_kv_cache 文档里同一现象）。旧注释里 recipe 的 "fp8 只有 34.9 dB"
+#   在这个 workload 上不成立。
+#   为什么从 fp8_v 换成 fp8：10 张参考图时 fp8_v 高水位 39.45 GiB（卡 39.49），余量
+#   只有几十 MiB；fp8 是 35.86 GiB，余 3.6 GiB。代价：10 张 36.4s vs 33.2s，t2i 无差。
+#
+# env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True —— **必须设**
+#   不设时碎片让 fp8_v 的 10 张请求 6 次全 OOM；设了之后同样的请求序列全过。
+#   GPUStack 实例默认没有这个变量，要在模型的环境变量里显式加。
+#
+# 请求侧上限（OOM 只让该条请求返回 500，实例随后 /ready=200，不会砖）
+#   · i2i 参考图 ≤ 10（fp8 下冷启直打、2K 文生图后直跳、10 张 + 2752x1536 输出、
+#     5900 字提示词、3 并发、交错循环全部通过）
+#   · CFG（true_cfg_scale>1 + negative_prompt）或 n=2 会把 batch 翻倍，撑爆的是激活，
+#     fp8 帮不上：fp8 下 CFG ≤ 6 张、n=2 ≤ 4 张；n>2 的 i2i 未测，不放开
+#   · t2i 带 CFG / n≤4 @2K 都安全（高水位 18.9 / 20.8 / 24.8 GiB）
 #
 # 实测（2026-09-22，合并 upstream 后的干净镜像，gpu48）
 #   BF16 档 2048² 冷启 47s（此前热态基线 37s）。W8A16+fp8_v 档见本轮验收记录。
@@ -62,4 +73,4 @@ stages:
       ring_degree: 1
       cfg_parallel_size: 1
     extras:
-      prefix_kv_cache_dtype: "fp8_v"
+      prefix_kv_cache_dtype: "fp8"
