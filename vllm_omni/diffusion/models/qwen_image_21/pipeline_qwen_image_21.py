@@ -115,10 +115,11 @@ def _resolve_text_encoder_quant_config(
     return resolve_encoder_quant_config(resolved)
 
 
-# Subtrees of the HF Qwen3-VL text encoder that must stay in checkpoint
-# precision: the vision tower (condition-image encoding is numerically
-# sensitive) and the LM head (unused — the pipeline reads hidden states).
-_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES = ("model.visual", "lm_head")
+# Subtree of the HF Qwen3-VL text encoder that must stay in checkpoint precision:
+# the vision tower (condition-image encoding is numerically sensitive). The LM head
+# is deliberately left quantized: the pipeline reads hidden states and discards the
+# logits, so its precision never reaches the output.
+_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES = ("model.visual",)
 
 
 def _exclude_text_encoder_subtrees_from_quant(
