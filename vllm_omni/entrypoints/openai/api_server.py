@@ -5,11 +5,11 @@
 This module owns app construction, server startup, app-state initialization,
 and route bodies that have not yet moved to endpoint-owned modules."""
 
-import base64
-import io
 import asyncio
+import base64
 import copy
 import dataclasses
+import io
 import json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
@@ -97,16 +97,10 @@ from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
 from vllm_omni.diffusion.progress import PHASE_SAVE
-from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
-from vllm_omni.entrypoints.openai.audio_task_manager import (
-    AUDIO_TASK_MANAGER,
-    resolve_save_path,
-    visible_task_status,
-)
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
-from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
+from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import _warmup_duplex_realtime
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
@@ -118,6 +112,11 @@ from vllm_omni.entrypoints.openai.app_state import (
     Omnispeech,
     Omnivideo,
     _get_engine_and_model,
+)
+from vllm_omni.entrypoints.openai.audio_task_manager import (
+    AUDIO_TASK_MANAGER,
+    resolve_save_path,
+    visible_task_status,
 )
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.chat_template import _load_model_chat_template_json
@@ -168,11 +167,11 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
     ResponseFormat,
 )
-from vllm_omni.entrypoints.openai.protocol.video_tasks import VideoTaskRequest
 from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.video_tasks import VideoTaskRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
@@ -4235,12 +4234,16 @@ async def _run_video_task_job(
             ReferenceAudio(path=audio_paths if len(audio_paths) > 1 else audio_paths[0]) if audio_paths else None
         )
 
-        video_bytes, _stage_durations, _peak_memory_mb, _action = await handler.generate_video_bytes(
-            request,
-            task_id,
-            reference_image=reference_image,
-            reference_video=reference_video,
-            reference_audio=reference_audio,
+        # generate_video_bytes 从上游 #4728 起多回一个 video_metadata（5 元组）。直接按 4 个解包会在
+        # 视频已经生成完之后抛 ValueError，GPU 白跑一趟、任务报失败；统一走兼容 4/5 元组的解包。
+        video_bytes, _stage_durations, _peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
+            await handler.generate_video_bytes(
+                request,
+                task_id,
+                reference_image=reference_image,
+                reference_video=reference_video,
+                reference_audio=reference_audio,
+            )
         )
         if not video_bytes:
             # generate_video_bytes returns b"" for action-only models, which have
