@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
+from vllm_omni.diffusion.models.qwen_image_21_pipeline_config import QWEN_IMAGE_21_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -164,6 +165,10 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "pi05": PI05_PIPELINE,
+    # Deploy-only key for the A100-40G profile (Ulysses SP4 + W8A16 + fp8
+    # prefix KV). Auto-detection keeps resolving through the generic diffusion
+    # default; see qwen_image_21_pipeline_config.py.
+    "qwen_image_21": QWEN_IMAGE_21_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
