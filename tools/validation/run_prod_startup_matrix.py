@@ -66,8 +66,13 @@ def build_run_command(model: dict, image: str, container: str, source_override: 
     # backend_parameters rows are inconsistent: some entries are one flag per
     # element ("--num-gpus", "2"), others pack flag and value into a single
     # string ("--residency-config /path"). shlex.split over the joined string
-    # normalises both without disturbing quoted values.
-    params = shlex.split(" ".join(model["backend_parameters"] or []))
+    # normalises both. Each element must be shlex.quote()d BEFORE joining:
+    # a value like --diffusion-quantization-config={"method":"..."} carries
+    # embedded double quotes that the shell would have kept (GPUStack stores
+    # the argv as one element), but a bare join+split strips them mid-token,
+    # and argparse's json.loads then rejects {method:...} (qwen-image-pro's
+    # prod row hit exactly that).
+    params = shlex.split(" ".join(shlex.quote(p) for p in (model["backend_parameters"] or [])))
 
     env_args: list[str] = []
     for key, value in {**BASE_ENV, **(model["env"] or {})}.items():
