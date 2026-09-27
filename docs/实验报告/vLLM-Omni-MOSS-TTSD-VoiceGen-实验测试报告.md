@@ -36,6 +36,7 @@ docker run -d --name omni-moss-ttsd --gpus '"device=0,1"' --memory=240g \
   --allowed-local-media-path "$ROOT" --deploy-config "$ROOT/moss_ttsd_a100_40g.yaml" --port 8091
 # 就绪判 /ready
 ```
+
 > 修复固化前,serve 前加 `python3 $ROOT/patch_moss_codec.py &&`。VoiceGen 同理,换模型名 + `moss_voicegen_a100_40g.yaml` + `--gpus '"device=2,3"'`。
 
 ---
@@ -52,7 +53,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ```
 
 | 字段 | 必填 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `input` | ✅ | 对话脚本,`[S1]`/`[S2]` 标说话人,文本紧跟标签 |
 | `ref_audio` | ✅ | 说话人1参考音(`file://`/URL/base64) |
 | `ref_audio_2` | ⬜ | 说话人2参考音;省略则两人同音色 |
@@ -80,7 +81,7 @@ curl -s -X POST localhost:8092/v1/audio/speech -H 'Content-Type: application/jso
 ```
 
 | 字段 | 必填 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `input` | ✅ | 要合成的文本 |
 | `instructions` | ✅ | 音色文字描述(如"低沉磁性男声");无 ref_audio |
 
@@ -104,14 +105,14 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ```
 
 | 字段 | 必填 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `input` | ✅ | **schema 必填占位**(SoundEffect 内容不看它,传 `""` 即可) |
 | `ambient_sound` | ✅ | 声音描述(自然语言);**无 ref_audio** |
 
 ### 实测
 
 | 用例 | http | 生成 | 声道 | 采样率 | 时长 | 判读 |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 英文 "thunder + rain"(temp 1.0) | 200 | 4.73s | mono | 24000 | 10.16s | ⚠️ 噪声多,不像 |
 | 英文(temp 0.6) | 200 | — | mono | 24000 | 10.16s | 好一点,雨雷微弱 |
 | 中文 "雷声隆隆,雨声淅沥"(temp 0.7) | 200 | — | mono | 24000 | 10.16s | 略好,仍不如 AudioX |
@@ -132,7 +133,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ## 4. 待补
 
 | 维度 | 待测 |
-|---|---|
+| --- | --- |
 | TTSD 双音色 | 传 `ref_audio_2` 给 S1/S2 不同参考音,验说话人区分度 |
 | 长度/崩溃边界 | 对话/描述超长时的截断/崩溃行为(harness 不适用,需手动) |
 | 并发/吞吐 | 8B TTSD 双卡吞吐;VoiceGen 密度 |
@@ -145,7 +146,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ## 5. 一页速查
 
 | 维度 | MOSS-TTSD | MOSS-VoiceGenerator |
-|---|---|---|
+| --- | --- | --- |
 | 用途 | 多说话人对话(短剧/播客) | 零样本音色设计 |
 | 参数 | 8B | 1.7B |
 | 输入 | `[S1]/[S2]` 对话脚本 | `input` + `instructions` 描述 |

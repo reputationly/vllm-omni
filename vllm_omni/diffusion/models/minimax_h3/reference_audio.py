@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Normalizing a `ref2va` reference soundtrack onto the audio VAE's rate.
 
 The official recipe is three steps in a fixed order, and the order is what makes

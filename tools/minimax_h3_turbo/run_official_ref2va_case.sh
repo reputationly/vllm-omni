@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # One official MiniMax-H3 Ref2VA case against one checkpoint, under official conditions.
 # Usage: run_official_ref2va_case.sh REQUEST_JSON MODEL TAG [NFE]
 # Env:   CPU_OFFLOAD=0  serve with the weights resident in VRAM instead of streamed

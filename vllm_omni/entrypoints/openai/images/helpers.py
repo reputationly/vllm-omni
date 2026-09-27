@@ -21,7 +21,6 @@ LONGEVITY:
 See ``images/README.md`` (utils vs helpers, no overlap).
 """
 
-from vllm_omni.entrypoints.openai.utils import max_multimodal_image_inputs
 import io
 from http import HTTPStatus
 from numbers import Integral
@@ -35,6 +34,7 @@ from PIL import Image
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
+from vllm_omni.entrypoints.openai.utils import max_multimodal_image_inputs
 
 logger = init_logger(__name__)
 

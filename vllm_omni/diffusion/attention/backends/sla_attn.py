@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Block-sparse video attention via SLA (Sparse-Linear Attention) on CUDA.
 
 SLA (https://github.com/thu-ml/SLA, arXiv 2509.24006) scores mean-pooled query

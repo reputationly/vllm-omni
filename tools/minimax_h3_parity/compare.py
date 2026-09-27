@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Compare a MiniMax-H3 stage dump against the official one.
 
 Two kinds of comparison, and conflating them is how a parity report becomes

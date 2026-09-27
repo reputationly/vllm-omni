@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Protocol models for the asynchronous diffusion-audio task API.
 
 This is the diffusion-model sibling of ``audio_tasks.py``. Where that module

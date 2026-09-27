@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Resample RMVPE F0 (16 kHz hop) onto the SoulX mel frame grid."""
 
 from __future__ import annotations

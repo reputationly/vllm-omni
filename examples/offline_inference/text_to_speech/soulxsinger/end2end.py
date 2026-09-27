@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline SoulX-Singer SVS / SVC: single-stage DiT (preprocess inline).
 
 Pass raw prompt/target audio; vLLM-Omni runs integrated preprocess then inference.

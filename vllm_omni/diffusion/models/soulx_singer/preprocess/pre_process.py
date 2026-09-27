@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared ``pre_process_func`` helpers for SoulX-Singer pipelines (batch / full-payload only)."""
 
 from pathlib import Path

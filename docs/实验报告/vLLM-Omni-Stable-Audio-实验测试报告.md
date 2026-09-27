@@ -29,6 +29,7 @@ docker run -d --name omni-stableaudio --gpus '"device=0"' --memory=240g \
 ```
 
 请求(文生音频):
+
 ```bash
 curl -s -X POST localhost:8091/v1/audio/generate -H "Content-Type: application/json" \
   -d '{"input":"warm lofi hip hop beat with vinyl crackle and mellow piano","audio_length":20,"guidance_scale":7}' \
@@ -40,7 +41,7 @@ curl -s -X POST localhost:8091/v1/audio/generate -H "Content-Type: application/j
 ## 2. 生成矩阵(guidance_scale=7,单卡,已测 2026-07-18)
 
 | audio_length | 生成 | http | 大小 | 格式 | 峰值显存 | RTF |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 10s | 4.27s | 200 | 1.7M | 44.1k 16bit stereo | 12639 MiB | 0.43 |
 | 20s | 3.93s | 200 | 3.4M | 44.1k stereo | 12645 MiB | 0.20 |
 | 47s | 4.37s | 200 | 8.0M | 44.1k stereo | 12651 MiB | **0.093** |
@@ -59,7 +60,7 @@ curl -s -X POST localhost:8091/v1/audio/generate -H "Content-Type: application/j
 ## 4. 待测
 
 | 维度 | 待测 |
-|---|---|
+| --- | --- |
 | guidance_scale / num_inference_steps 扫 | 对时间/质量的影响 |
 | 崩溃边界 | audio_length > 47s?空 input?非法参数 |
 | 并发/吞吐 | 单卡多请求 QPS(gen~4s → 理论 ~15 条/min/卡) |
@@ -70,7 +71,7 @@ curl -s -X POST localhost:8091/v1/audio/generate -H "Content-Type: application/j
 ## 5. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 端点 | `POST /v1/audio/generate`(非 TTS) |
 | 采样率 | 44.1kHz 立体声 |
 | 显存 | ~12.6G/40G(不随时长)→ 单卡 2-3 副本 |

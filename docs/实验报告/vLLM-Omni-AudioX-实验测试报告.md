@@ -34,6 +34,7 @@ docker run -d --name omni-audiox --gpus '"device=2"' --memory=240g \
   vllm serve "$ROOT/AudioX" --omni --model-class-name AudioXPipeline --port 8092
 # 就绪判 /health(扩散模型 /ready 可能不翻)
 ```
+
 - **不要加 `--trust-remote-code`**(AudioX 是扩散 pipeline,非 transformers 远程代码模型)。
 - **无 deploy yaml**:靠 `--model-class-name AudioXPipeline`(registry 已注册)。
 - 单卡即可(扩散,单请求)。
@@ -43,16 +44,18 @@ docker run -d --name omni-audiox --gpus '"device=2"' --memory=240g \
 ## 2. 请求格式(chat 端点)
 
 **文生音效 / 音乐(t2a / t2m)**:
+
 ```bash
 curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model":"'"$ROOT"'/AudioX",
   "messages":[{"role":"user","content":[{"type":"text","text":"A dog barking in a quiet park with birds chirping."}]}],
   "extra_body":{"audiox_task":"t2a","num_inference_steps":250,"guidance_scale":7.0,"seed":42,"seconds_total":10.0}}'
 ```
+
 产物在 `choices[0].message.audio.data`(base64 WAV,需解码)。
 
 | extra_body 字段 | 说明 |
-|---|---|
+| --- | --- |
 | `audiox_task` | **必填**:t2a/t2m/v2a/v2m/tv2a/tv2m |
 | `num_inference_steps` | 扩散步数(默认100;**生产 ≥250**) |
 | `guidance_scale` | CFG(默认7.0) |
@@ -66,13 +69,14 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 ## 3. 实测
 
 | 任务 | 提示 | 步数 | http | 生成 | 声道/采样率 | 时长 | 听感 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | t2a | 狗叫+鸟鸣(quiet park) | 100 | 200 | 11.66s | 2 / 44100 | 10.00s | 语义对,但**气泡/咔哒噪声**,音量小 |
 | t2a | 同上 | 250 | 200 | 27.56s | 2 / 44100 | 10.00s | 噪声减轻(剩 2 声气泡),事件更集中 |
 | t2a | **暴雨+雷**(密集连续) | 250 | 200 | 27.45s | 2 / 44100 | 10.00s | ✅ **真实,无气泡** |
 | t2m | 欢快电子舞曲 | 100 | 200 | 11.28s | 2 / 44100 | 10.00s | 音乐性"还行" |
 
 **结论**:
+
 - **生成时间 ∝ 步数**(100→250 = 11.5→27.5s ≈ 2.4×);时长恒等于 `seconds_total`(扩散,与步数/内容无关)。
 - **气泡/咔哒 = 静音段 VAE 伪影**:稀疏/含静音提示才有(狗叫 quiet park);密集连续声(雨雷)完全干净 → 潜空间音频扩散固有特性,非 bug。
 - **音量偏低**:无响度归一化,生产靠 facade pyloudnorm(引擎无关,对所有模型统一)。
@@ -84,7 +88,7 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 镜像 61bcf3d6(+ ming 热 patch),单卡 A100 40G,官方 V2M 样例 mp4(≤10s),默认 250 步。**六玩法全部真机跑通**,格式统一 44.1k stereo、时长 = `seconds_total`。
 
 | 任务 | 提示 | http | 声道/采样率 | 时长 | 听感 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | v2a | (纯视频) | 200 | 2 / 44100 | 10.00s | ✅ 视频→音效 |
 | v2m | (纯视频) | 200 | 2 / 44100 | 10.00s | ✅ 视频→音乐 |
 | tv2a | "drum beating sound and human talking" + 视频 | 200 | 2 / 44100 | 10.00s | 鼓点清晰;**人声几乎听不到**(见下) |
@@ -92,6 +96,7 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 | t2a(对照) | "two people chatting in a cafe, human voices murmuring" | 200 | 2 / 44100 | 10.00s | ✅ 出"有人说话的嘟囔纹理" |
 
 **关键边界(内嵌后须提示业务)**:
+
 - **AudioX 不产清晰语音**:"human talking" 只出**人声纹理/嘟囔**,永远没词句 → 要真人对白走 TTS(Qwen3-TTS/CosyVoice),不是 AudioX。
 - **文本与视频语义须一致**:tv2a 里"talking"几乎听不到,因素材是 V2M(音乐)样例、画面无人说话 → 视频条件与文本冲突,弱线索(人声)被强线索(鼓点 + 无人声画面)掩蔽。**对照纯 t2a(无视频冲突)能出人声纹理** → 证明是冲突/掩蔽所致,非模型无能力。换一段"有人说话画面"的视频、text↔video 一致即可改善。
 - **多事件提示**:显著声(打击乐)盖过细弱声(人声);要突出某类声,别和更强的声混一条提示。
@@ -102,7 +107,7 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 ## 4. 待补
 
 | 维度 | 待测 |
-|---|---|
+| --- | --- |
 | 显存/并发 | 峰值显存、单卡吞吐、多副本密度 |
 | 步数/采样扫 | 步数 vs 音质拐点、sigma/cfg_rescale 对伪影影响 |
 | 时长上限 | `seconds_total` 上限(>10s?)与显存关系 |
@@ -113,7 +118,7 @@ curl -sS -X POST localhost:8092/v1/chat/completions -H 'Content-Type: applicatio
 ## 5. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 类型 | 扩散文/视频生音频(t2a/t2m/v2a/v2m/tv2a/tv2m) |
 | 端点 | `POST /v1/chat/completions`(非 /v1/audio/*) |
 | 启动 | `--model-class-name AudioXPipeline`,**无** --trust-remote-code,`DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN`,就绪判 `/health` |

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """L1 unit tests for the async diffusion-audio task API (AudioX / SoulX-Singer).
 
 Pure-logic coverage of the request -> chat mapping — no GPU / model / engine:

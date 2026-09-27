@@ -36,7 +36,7 @@ Wan2.2 报告结论:*"int8-torchao 在 A100/ARM 上不走 INT8 tensor core,矩�
 ### 2.1 机制差异:扩散(算力受限) vs AR(访存受限)
 
 | | Wan2.2(扩散 DiT) | Fish-S2 / Qwen3-Omni / MiniCPM-o(AR) |
-|---|---|---|
+| --- | --- | --- |
 | 计算模式 | N 步去噪**循环复用同一份权重**,单步算力重 | **每个 token 一次完整前向过所有层**,一秒几十上百 token |
 | 瓶颈 | **算力受限**,搬权重能和计算 overlap | **访存受限**,搬权重卡在带宽 |
 | MoE offload | 只把当前激活的 1 个专家放 GPU,可行 | 每 token 都要流一遍模型,30B(~60G)/token → 秒级出字 |
@@ -60,7 +60,7 @@ Wan2.2 报告结论:*"int8-torchao 在 A100/ARM 上不走 INT8 tensor core,矩�
 - **TP 张量并行**(一个大模型切多卡,每层 all-reduce):**吃卡间带宽,无 NVLink 明显掉速**;MoE 还加 all-to-all,最惨。
 
 | 模型 | 4×40G PCIE 能跑? | 怎么跑 | 代价 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **MiniCPM-o 4.5** | ✅ 能,较干净 | recipe 自带 **2/3/8 卡布局**;2 卡=thinker GPU0 + talker GPU1(纯 stage 拆);官方明说 "most 40GB+ pairs 只要 thinker 权重装得下" | 2 卡布局几乎无损 |
 | **Qwen3-Omni 30B MoE** | ⚠️ 能,偏疼 | 官方 stage-based 三进程(thinker/talker/code2wav);但 30B bf16 ~60G,**thinker 单 stage 超 40G → 必须 TP=2** | thinker TP=2 走 PCIE all-reduce + MoE all-to-all,延迟最高档 |
 | **Fish-S2 Pro** | ⚠️ 最勉强 | recipe **只给 1×A800-80G / 2×H100-80G**,峰值 ~48.9G;40G 无现成配方,TP=2 理论可行但 Fish 双 AR+DAC,TP 支持未验证 | 无官方 40G 路径,坑最深 |
@@ -72,7 +72,7 @@ Wan2.2 报告结论:*"int8-torchao 在 A100/ARM 上不走 INT8 tensor core,矩�
 ### 4.1 官方验证过的:三个基本都没有
 
 | 模型 | 官方量化权重 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | Fish-S2 Pro | ❌ | `fishaudio/s2-pro` 官方**只发 bf16**,量化全是社区 |
 | Qwen3-Omni | ❌ | 官方给非-Omni 的 Qwen3 发了 `-FP8`,**Omni 变体没做** |
 | MiniCPM-o 4.5 | 🟡 int4/GGUF/BNB | openbmb 官方出了,但**给自家 llama.cpp/BNB 栈用**,非 vllm-omni 验证格式 |
@@ -82,7 +82,7 @@ Wan2.2 报告结论:*"int8-torchao 在 A100/ARM 上不走 INT8 tensor core,矩�
 ### 4.2 A100 能用的社区权重(FP8 已排除)
 
 | 模型 | 权重 | 格式 | 显存 | 坑 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Fish-S2 | `Imagilux/fishaudio-s2-pro` | INT8 weight-only | ~5G | 只量化 Slow AR,原为 AMD ROCm 调,CUDA 也能跑 |
 | Fish-S2 | `baicai1145/s2-pro-w4a16` | GPTQ W4A16 | 更小 | 只量化 Slow AR 4B 主干,codec/Fast AR 仍高精度 |
 | Qwen3-Omni | `cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit` | AWQ 4bit | thinker ~15-17G | 社区;4bit 单卡 40G 宽裕 |

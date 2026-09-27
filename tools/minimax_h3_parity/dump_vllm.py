@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Dump vLLM-Omni's MiniMax-H3 stages in the shape ``compare.py`` expects.
 
 The upstream stages — geometry, packing, RNG — are pure functions on both sides,

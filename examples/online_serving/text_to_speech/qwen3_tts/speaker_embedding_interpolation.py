@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Speaker embedding extraction and interpolation for Qwen3-TTS.
 
 Extracts speaker embeddings from reference audio files using the ECAPA-TDNN

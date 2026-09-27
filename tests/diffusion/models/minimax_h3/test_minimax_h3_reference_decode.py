@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Lossless decoding of a `ref2va` reference, against the official decoder.
 
 Unlike the rest of the contract suite these need a codec, so they synthesize a

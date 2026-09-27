@@ -10,7 +10,7 @@
 ## 0. 结论摘要(TL;DR)
 
 | 问题 | 结论 |
-|---|---|
+| --- | --- |
 | 上游 vllm-omni 适配了吗 | **没有**。两个 PR(#4227 / #4788)都停在 2026-07-17,未合并 |
 | `/Users/.../api/ideogram4` 是官方 harness 吗 | **是**。`github.com/ideogram-oss/ideogram4`,HEAD `990fe1c`(2026-06-30),3173 LOC / 13 个 py 文件 |
 | 40G A100 能跑吗 | **能**。nf4 权重 16.12GB,1024²/2048² 都能跑;fp8(27.4GB)、int8 w8a8(29.2GB)只能勉强 1024²;bf16(53.59GB)不可能 |
@@ -27,7 +27,7 @@
 搜索 vllm-project/vllm-omni 的 issue/PR(含已关闭)结果:
 
 | PR | 内容 | 规模 | 状态 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **#4227** | Ideogram 4 主体适配(pipeline + transformer + registry) | 15 files,+2056 | `CHANGES_REQUESTED` —— review 意见是**缺 e2e 出图证据**,不是架构问题 |
 | **#4788** | fp8 权重 loader | 5 files,+1347 | 停滞 |
 
@@ -45,7 +45,7 @@
 ### 2.1 规格
 
 | 字段 | 值 |
-|---|---|
+| --- | --- |
 | `emb_dim` | 4608 |
 | `num_layers` | 34 |
 | `num_heads` | 18(head_dim = 256) |
@@ -129,7 +129,7 @@ return stacked.to(torch.float32)
 `sampler_configs.py` 预设:
 
 | 预设 | 步数 | guidance schedule |
-|---|---|---|
+| --- | --- | --- |
 | `V4_QUALITY_48` | 48 | gw=3 前 3 步,gw=7 后 45 步;mu=0.0,std=1.5 |
 | `V4_DEFAULT_20` | 20 | — |
 | `V4_TURBO_12` | 12 | — |
@@ -142,6 +142,7 @@ return stacked.to(torch.float32)
 ### 2.5 patch 数学
 
 `patch = patch_size(2) × ae_scale_factor(8) = 16`
+
 - 1024² → **4096** image token
 - 2048² → **16384** image token
 
@@ -152,7 +153,7 @@ return stacked.to(torch.float32)
 仓库:`github.com/ideogram-oss/ideogram4`,本地在 `/Users/reputationly/Desktop/code/api/ideogram4`
 
 | 文件 | 行数 | 作用 |
-|---|---|---|
+| --- | --- | --- |
 | `pipeline_ideogram4.py` | 637 | 全部编排逻辑,最重要 |
 | `modeling_ideogram4.py` | 379 | DiT 本体 |
 | `quantized_loading.py` | 278 | bnb-4bit + 自定义 weight-only fp8 |
@@ -192,7 +193,7 @@ out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 ### 4.1 官方 Model Zoo(`README.md:48-49`)
 
 | 版本 | 设备 | Diffusers 支持 | 许可 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | nf4 | CUDA | **Yes** | Ideogram 4 Non-Commercial |
 | fp8 | All | **No** | Ideogram 4 Non-Commercial |
 
@@ -201,7 +202,7 @@ out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 ### 4.2 显存账(HF/ModelScope API 实测权重体积)
 
 | 路线 | 权重 | 1024² | 2048² |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | nf4 + `ostris/ideogram_4_turbotime_lora` | ~11.7 GB | ✅ | ✅ |
 | nf4 + `ostris/ideogram_4_unconditional_lora` | ~11.0 GB | ✅ | ✅ |
 | **官方 nf4**(te 5.48 / 2× dit 5.22 / vae 0.17) | **16.12 GB** | ✅ | ✅ |
@@ -238,7 +239,7 @@ transformerlab/ideogram-4-int8-w8a8     # 第三方 int8 W8A8
 ### 5.1 两份许可要分开看
 
 | 对象 | 许可 | 商用 |
-|---|---|---|
+| --- | --- | --- |
 | harness **代码**(`ideogram4` 仓,`LICENSE.md`) | **Apache 2.0** | ✅ 可以 |
 | **模型权重** | **Ideogram Non-Commercial Model Agreement** | ❌ 不可以 |
 
@@ -258,7 +259,7 @@ README 与许可文件中**均未留商务联系方式**,目前已知入口只�
 **协议 §1(d) 定义的 Non-Commercial 四类,本项目一条都不占**:
 
 | 类别 | 内容 | 是否适用 |
-|---|---|---|
+| --- | --- | --- |
 | (i) | 不直接或间接产生收入,且非为商业利益或金钱报酬 | ❌ 对外计费 |
 | (ii) | 营利实体**仅**用于测试/评估/研发,且在**非生产环境**(明确排除 live systems、customer-facing applications) | ⚠️ 仅 P0–P3 适用 |
 | (iii) | 个人研究/实验/爱好 | ❌ |
@@ -289,7 +290,7 @@ README 与许可文件中**均未留商务联系方式**,目前已知入口只�
 ### 5.5 两条与现有工程计划直接冲突的条款
 
 | 条款 | 内容 | 与计划的冲突 |
-|---|---|---|
+| --- | --- | --- |
 | **§4** | 不得 *"circumvent, remove, alter, deactivate, degrade or thwart"* 公司实施的 content filters / watermarking | §3.2 计划"内网禁用 `safety.py`"。稳妥做法是**替换为等效的本地审核**,而非直接删除这道门 |
 | **§9** | Ideogram 可**随时通知终止**;终止后须**删除权重并停止使用**;§5–§10 条款在终止后继续有效 | 即使拿到商用授权,这也是必须登记的**业务连续性风险** |
 
@@ -303,7 +304,7 @@ README 与许可文件中**均未留商务联系方式**,目前已知入口只�
 ### 5.6 分界线在 P4,不在 P0
 
 | 阶段 | 能否进行 | 依据 |
-|---|---|---|
+| --- | --- | --- |
 | P0 harness 跑通、稳态矩阵、出图对拍 | ✅ | §1(d)(ii) 非生产环境的测试/评估/研发 |
 | P0.5 移植进 vllm-omni、内部验证 | ✅ | 同上,只要不上线 |
 | P1–P3 异步化 / 镜像 / GPUStack 内嵌(内部) | ✅ | 同上 |
@@ -380,7 +381,7 @@ load_int8(...)                            # 再叠加 20.4GB int8 权重
 关键事实:**vllm-omni 已经是 GPUStack 的内嵌 backend 并已在现网运行**。于是:
 
 | | P0.5 接模型 | P1 异步化 | P2 arm64 镜像 | P3 GPUStack 6 处改动 | P3.5 new-api | 长期维护 |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | **A. harness 直接内嵌** | **0** | 全新 ~500 行 | 全新 Dockerfile + launcher + CI | 全套 | 新渠道 + 物化 | **多一条独立引擎链** |
 | **B. 移植 vllm-omni** | 中 | 0 | 增量(重出镜像) | 0 | 加 model ID + profile | 与现有链合流 |
 | **C. 移植 LightX2V** | **最高** | 0 | 增量 | 0 | 加 model ID | 与现有链合流 |
@@ -409,7 +410,7 @@ load_int8(...)                            # 再叠加 20.4GB int8 权重
 P0.5 逐项拆解:
 
 | 项 | 难度 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | VAE | **零** | Flux2 KL AE,vllm-omni 已有 `flux2`,直接复用 |
 | text encoder 13 层 tap | **低** | vllm-omni 允许 text encoder 走 transformers,`_get_qwen3_vl_embeddings` 近乎原样搬。**这正是 C 路线做不到而 B 免费拿到的** |
 | DiT 本体 | 中 | 34 层单流,结构最接近 `z_image`(pipeline 731 + transformer 1063 行),照抄骨架 |
@@ -429,7 +430,7 @@ P0.5 逐项拆解:
 ### 8.1 HF gated vs ModelScope 开放(同一文件同一时刻实测)
 
 | 源 | 结果 |
-|---|---|
+| --- | --- |
 | HuggingFace `ideogram-ai/ideogram-4-fp8` | `http=401`,`"Access to model ideogram-ai/ideogram-4-fp8 is restricted."` |
 | ModelScope 镜像 | `http=200`,`size=1024`,`ApprovalMode = 0` |
 
@@ -464,6 +465,7 @@ curl -sS "https://huggingface.co/api/models?search=ideogram-4&limit=60"
 两者不冲突 —— 方法论 §13 的 P0 本来就写着"harness 跑通稳态矩阵 + 判死结论",harness 的定位就是 P0 工具。
 
 ### P0(harness,不碰 GPUStack)
+
 - [ ] ModelScope 拉 nf4
 - [ ] 40G A100 单卡跑通 1024² / 2048²
 - [ ] 固定 seed 存一批参考图 + 逐步 latent,作为移植对拍基准
@@ -471,6 +473,7 @@ curl -sS "https://huggingface.co/api/models?search=ideogram-4&limit=60"
 - [ ] 产物防呆三检(体积 / 熵 / 黑屏)
 
 ### P0.5(vllm-omni)
+
 - [ ] 拉 #4227 分支评估现状 ← **唯一未落地的决策变量**
 - [ ] 合入 #4788 fp8 loader
 - [ ] VAE 挂 flux2
@@ -480,6 +483,7 @@ curl -sS "https://huggingface.co/api/models?search=ideogram-4&limit=60"
 - [ ] 与 P0 基准逐步对拍
 
 ### P1-P4(基本为零)
+
 - [ ] 重出 vllm-omni 镜像(补 bnb / Qwen3-VL 依赖)
 - [ ] **先把模型注册进 `OMNI_PIPELINES`** —— 未注册的模型传 `--deploy-config` 会被整个静默丢掉,回落单卡默认档,20 分钟后才以 OOM 暴露
 - [ ] model-catalog 加条目
@@ -501,7 +505,7 @@ curl -sS "https://huggingface.co/api/models?search=ideogram-4&limit=60"
 ## 附录:调研中踩到的坑
 
 | 坑 | 现象 | 规避 |
-|---|---|---|
+| --- | --- | --- |
 | `gh search issues --state all` | `invalid argument "all" for --state flag` | 去掉 `--state`,加 `--include-prs` |
 | GitHub GraphQL | `Post "https://api.github.com/graphql": EOF` | 有界重试循环 |
 | `git fetch upstream` | LibreSSL `SSL_ERROR_SYSCALL` | 同上,重试 |

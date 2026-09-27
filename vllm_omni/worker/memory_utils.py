@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """GPU memory utilities for vLLM Omni workers.
 
 Includes a tolerant version of the upstream request_memory() that handles

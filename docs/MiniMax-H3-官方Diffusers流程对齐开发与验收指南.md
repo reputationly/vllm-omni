@@ -86,7 +86,7 @@ Mac 上禁止：
 以下 20 台 A100 节点已经配置 SSH 公钥免密登录。三种写法等价，执行 agent 优先使用短别名：
 
 | 节点 | 短别名 | 完整别名 | 原始入口 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0021 | `gpu21` | `dev-gpustack-a100-0021` | `ssh -p 43043 root@111.172.214.16` |
 | 0022 | `gpu22` | `dev-gpustack-a100-0022` | `ssh -p 43044 root@111.172.214.16` |
 | 0023 | `gpu23` | `dev-gpustack-a100-0023` | `ssh -p 43045 root@111.172.214.16` |
@@ -148,7 +148,7 @@ ssh -p 43056 root@111.172.214.16
 开发和验收必须固定版本。开始执行时记录实际 commit；除非用户明确要求升级，不要静默更新。
 
 | 项目 | 本任务初始基线 | 作用 |
-|---|---|---|
+| --- | --- | --- |
 | MiniMax-H3 模型仓库 | `d21241f0a4b3acbb34c97dae47fa417b7065e438` | 权重配置、processor、model index |
 | Hugging Face Diffusers | `d6726f38a0c5ca6c06a8f227fb7bade3486ed98d` (`0.40.0.dev0`) | 官方公开 harness |
 | vLLM-Omni | `a160673c5165c5b31545a2e732b7d204a4c0245c` | 本次复核基线；H3 改动已提交 |
@@ -419,7 +419,7 @@ reference 截到目标 `num_frames`。官方兼容模式必须服从固定 oracl
 模型级输入语义也不同：
 
 | 项目 | 固定 Diffusers oracle | 当前 vLLM 入口 |
-|---|---|---|
+| --- | --- | --- |
 | reference 宽高比 | `[1/4, 4]` | `[0.4, 2.5]` |
 | reference 边长 | 仅要求正数 | `[256, 5760]` |
 | 输出对齐后时长 | `[5, 15]` 秒 | `[2, 16]` 秒 |
@@ -656,7 +656,7 @@ normalize helper 都可以在 Mac 上无权重运行。预计 packing/scheduler 
 seed、步数、分辨率、帧数、shift。快速调试可用较少步数，最终验收至少有一组 50 sigma 节点。
 
 | ID | 任务 | 条件 | 主要覆盖点 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | T1 | T2VA | 纯文本 | RNG、text、joint video/audio denoise |
 | F1 | FL2VA | 仅首帧 | geometry anchor、VAE condition |
 | F2 | FL2VA | 首尾帧且宽高比不同 | cover-crop、condition 顺序 |

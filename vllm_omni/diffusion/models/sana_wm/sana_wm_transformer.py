@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SANA-WM Stage-1 transformer.
 
 Native vLLM-Omni port of the NVlabs SANA-WM DiT. Modules are built eagerly at

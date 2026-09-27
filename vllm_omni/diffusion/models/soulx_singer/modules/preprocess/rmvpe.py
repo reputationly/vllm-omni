@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """RMVPE F0 extractor.
 
 All model code is inlined (originally from RickyL-2000/ROSVOT

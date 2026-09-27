@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """What answering a capability question is allowed to cost the serving process.
 
 ``diffusion/model_metadata.py`` is the lightweight boundary: the HTTP layer asks

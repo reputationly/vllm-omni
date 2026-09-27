@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
 from collections.abc import Mapping

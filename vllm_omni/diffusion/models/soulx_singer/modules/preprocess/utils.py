@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared helpers for SoulX preprocess (I/O, config, checkpoints, pitch)."""
 
 from pathlib import Path

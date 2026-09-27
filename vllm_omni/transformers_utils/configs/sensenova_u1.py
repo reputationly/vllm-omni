@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HuggingFace-style configuration classes for SenseNova-U1."""
 
 from transformers import AutoConfig, PretrainedConfig, Qwen3Config

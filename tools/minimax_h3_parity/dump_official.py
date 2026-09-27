@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run the pinned official MiniMax-H3 harness and dump it stage by stage.
 
 The oracle is the Diffusers ``MiniMaxH3ModularPipeline`` at the commit this task

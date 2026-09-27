@@ -45,7 +45,7 @@ AR 与 DiT 两个引擎 level-1 sleep/wake，任一时刻仅一个驻留 GPU
 最终实测：
 
 | 项目 | 结果 |
-|---|---:|
+| --- | ---: |
 | AR 权重加载后 | 14.93 GiB/卡 |
 | AR 三参考图完整 think+recaption | 653 tokens / 90.32 秒 |
 | AR 速度 | 7.23 token/s |
@@ -69,7 +69,7 @@ AR 与 DiT 两个引擎 level-1 sleep/wake，任一时刻仅一个驻留 GPU
 ### 1.1 硬件
 
 | 项 | 配置 |
-|---|---|
+| --- | --- |
 | CPU 架构 | ARM aarch64 |
 | GPU | 4×NVIDIA A100-PCIE-40GB |
 | Compute Capability | sm_80 |
@@ -807,7 +807,7 @@ FP8 KV 即使省一半，TP4 下单请求只减少约 0.27GiB/rank，而且 A100
 ## 9. 六条候选优化路线的最终评级
 
 | 排名 | 路线 | sm_80+ARM | 结论 | 风险/投入 |
-|---:|---|---|---|---|
+| ---: | --- | --- | --- | --- |
 | 1 | vLLM-Omni TP4+EP4 + NF4 + sleep/wake | 是，已验证 | 生产主线 | 中 |
 | 2 | BnB NF4 + vLLM fused MoE | 是，已验证 | 已包含在主线 | 中 |
 | 3 | MoE token chunking | 是 | 可救 HF 峰值，不能救 eager 慢速 | 中 |
@@ -981,7 +981,7 @@ AR 是绝对主耗时。后续性能优化应优先：
 ### 11.3 节点规划
 
 | 节点 | 用途 |
-|---|---|
+| --- | --- |
 | 0023 | 主验证/候选生产节点 |
 | 0022 | 回归与备用 |
 | 0024 | 回归、kernel tuning 或 GPTQ/AWQ 研究 |
@@ -1134,7 +1134,7 @@ AR 90 秒占端到端绝大部分：
 ## 14. 常见误判速查
 
 | 现象 | 不应直接判断为 | 正确排查 |
-|---|---|---|
+| --- | --- | --- |
 | 父进程 `EOFError` | orchestrator 自身 bug | 查 worker 第一条 traceback、OOM、SIGKILL |
 | custom allreduce disabled | 四卡不能跑 | PCIe >2 GPU 正常回退 PYNCCL/NCCL |
 | NF4 checkpoint 约 46GB | 每卡只占 11.5GB | 还要算 dense、runtime、反量化临时量 |

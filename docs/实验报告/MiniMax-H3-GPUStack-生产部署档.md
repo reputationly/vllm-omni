@@ -13,7 +13,7 @@ H3 按 DiT 分区部署成两个独立实例，每个实例独占一台 4×A100-
 **tp4 + CPU offload + VAE tile 并行 + 并发 1**：
 
 | GPUStack 模型实例 | 权重 | 服务能力 | 部署档 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | FL2VA | `/nfs-data/models/MiniMax-H3-FL2VA-INT8` | T2VA、首/尾帧 FL2VA | `minimax_h3_a100_40g.yaml` |
 | Ref2VA | `/nfs-data/models/MiniMax-H3-Ref2VA-INT8` | 图片、视频及附加音频参考 | `minimax_h3_ref2va_w8a8_a100_40g.yaml` |
 
@@ -25,7 +25,7 @@ H3 按 DiT 分区部署成两个独立实例，每个实例独占一台 4×A100-
 ## 2. 前置条件（少一条就起不来）
 
 | 项 | 值 | 少了会怎样 |
-|---|---|---|
+| --- | --- | --- |
 | 权重 | `/nfs-data/models/MiniMax-H3-FL2VA-INT8`（离线 W8A8 INT8） | — |
 | 显存 | 4×A100 40G，**整卡独占** | 峰值 24.1 GiB/卡，和别的模型混部必炸 |
 | 宿主内存 | ≥ 200 GB 可用 | offload 常驻约 137 GB，不够会被 OOM killer 杀 worker |
@@ -146,7 +146,7 @@ exec vllm serve /nfs-data/models/MiniMax-H3-FL2VA-INT8 --omni --host 0.0.0.0 --p
 生产档 480p：`832×480 / duration=5.166667（124 帧）/ 20 步 / flow_shift=12 / seed=1101 / t2va`
 
 | 轮次 | 端到端 | `forward` | 其中 `decode` | DiT s/it | 产物字节 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | run1 | 72.13 s | 61.24 s | 2.68 s | 2.73 | 2,960,135 |
 | run2 | 70.43 s | 61.29 s | 2.73 s | 2.73 | 2,960,135 |
 
@@ -158,7 +158,7 @@ exec vllm serve /nfs-data/models/MiniMax-H3-FL2VA-INT8 --omni --host 0.0.0.0 --p
 其他档位（历史扫描，#24/#25，同 seed 同 prompt）：
 
 | 档 | 20 步 | 50 步 |
-|---|---|---|
+| --- | --- | --- |
 | 480p 832×480 / 124 帧 | 51.5–75.2 s | 117.1–165.1 s |
 | 768p 1344×768 / duration 4 s | 152.5 s | 303.6 s |
 
@@ -180,7 +180,7 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 ```
 
 | 参数 | 约束 | 违反时 |
-|---|---|---|
+| --- | --- | --- |
 | `duration` | **[2, 16] s**（fps 固定 24）。2026-08-12 由 `[4, 15]` 放宽，见下方注 | HTTP 400，0.02–0.06 s 内返回，不占生成槽位 |
 | 帧数 | `n % 17 == 5` | 自动对齐，不报错 |
 | `aspect_ratio`（t2va） | 具名值六选一（`21:9`/`16:9`/`4:3`/`1:1`/`3:4`/`9:16`），`adaptive`/`auto` 不接受。**契约按「恒传」定**，见下方注 | HTTP 400 |
@@ -194,6 +194,7 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 > 厂商声明范围之外——能出片，画质未经验证，出问题先怀疑这里。
 >
 > 门开在**请求时长**上，帧数对齐（向上取到 `17n+5`）发生在门之后，所以：
+>
 > - `duration=16.0` → 请求 384 帧 → 实际输出 **396 帧 / 16.5 s**（超过 16 s）
 > - `duration=2.0` → 请求 48 帧 → 实际输出 **56 帧 / 2.333 s**
 > - 直接提 `num_frames=396`（16.5 s）**会被拒**，只能用 `duration=16.0` 拿到
@@ -201,7 +202,6 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 > 由此也解释了一个坑：归档里 362 帧的 768p 用例，当初是用 `duration=15.0`
 > 提交、由对齐得到 362 帧的。把 362 直接当 `num_frames` 回填会 400
 > （15.083 > 15）——旧边界下复现旧用例必须提 `duration`，不是提对齐后的帧数。
-
 
 > **注：`aspect_ratio` 该不该恒传，代码与实测对不上，按「恒传」执行。**
 > 92ad602c 记的是「传了 `width`/`height` 就可省（实测 200）」，但代码里
@@ -223,7 +223,7 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 `except Exception`，一律 500。现在 400 能原样穿回来，0024 实测：
 
 | 用例 | 返回 | body |
-|---|---|---|
+| --- | --- | --- |
 | `num_frames=719`（29.958 s） | **400** / 0.062 s | `MiniMax H3 output duration must be in [2, 16] seconds, got 29.958`（报错文案随常量走，不再写死） |
 | `duration=2` | ~~400~~ **现在通过** | 2026-08-12 起下界改为 2 s；对齐后输出 56 帧 / 2.333 s |
 | `fps=30` | **400** / 0.016 s | `MiniMax H3 output fps is fixed at 24` |
@@ -262,7 +262,7 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 Ref2VA 与 FL2VA 是两个不同的 DiT 分区，不能拿 FL2VA INT8 权重冒充。当前两档为：
 
 | 档位 | 权重 | Deploy config | 用途 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | BF16 oracle | `/nfs-data/models/MiniMax-H3/Ref2VA` | `deploy-configs/minimax_h3_ref2va_bf16_a100_40g.yaml` | 质量基线、量化验收 |
 | W8A8 生产候选 | `/nfs-data/models/MiniMax-H3-Ref2VA-INT8` | `deploy-configs/minimax_h3_ref2va_w8a8_a100_40g.yaml` | A100 生产 |
 
@@ -297,7 +297,7 @@ seed 42026、832×480、请求 5 秒（实际 124 帧/5.1667 秒）、20 步完�
 仅反映同参数两档差异，不应按单一“同宿主收益”口径复用。
 
 | 单图 Ref2VA warm2 | BF16 | W8A8 |
-|---|---:|---:|
+| --- | ---: | ---: |
 | HTTP | 164.115 s | **147.886 s** |
 | prompt encode | 21.107 s | **14.500 s** |
 | diffuse | 131.257 s | **122.060 s** |
@@ -327,7 +327,7 @@ cache 口径不同，当前不下“INT8 更省宿主内存”的结论；最终
 W8A8 全量产线已验。
 
 | 输入 | 结果 | 生产结论 |
-|---|---|---|
+| --- | --- | --- |
 | 单图 | 通过 | 默认低成本 Ref2VA 档 |
 | 双图 | 通过；人物、场景、物件和动作均被采用 | 可开放，主参考关系必须写进 prompt |
 | 单视频 | 通过 | 约 6 分钟/5 秒 BF16 视频，需独立超时档 |

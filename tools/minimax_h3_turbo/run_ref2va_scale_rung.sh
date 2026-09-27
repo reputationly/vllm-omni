@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # One rung of the Ref2VA input-scale ladder, start to finish, on this host.
 # Usage: run_ref2va_scale_rung.sh RUNG MODEL [PREFIX]
 #

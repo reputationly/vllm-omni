@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Patch ``initialize_model`` to replace VAE GroupNorm with AITER GroupNorm on ROCm."""
 

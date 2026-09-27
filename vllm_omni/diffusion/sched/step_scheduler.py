@@ -17,7 +17,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -76,7 +76,7 @@ class StepScheduler(BaseScheduler):
                 return False
         return True
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
         if not scheduled_request_ids and not sched_output.finished_req_ids:
             return set()
@@ -139,6 +139,7 @@ class StepScheduler(BaseScheduler):
             return self._sequence_length(sampling.timesteps)
         if sampling.sigmas is not None:
             return len(sampling.sigmas)
+        assert sampling.num_inference_steps is not None
         return int(sampling.num_inference_steps)
 
     @staticmethod

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The contract has to survive every hop between the YAML and the pipeline.
 
 Two of the six review findings in this effort were the same accident: a contract

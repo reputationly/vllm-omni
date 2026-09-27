@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Putting rank 0's prepared references on every rank, without pickling pixels.
 
 The native tiled video VAE encodes with collectives, so when VAE patch

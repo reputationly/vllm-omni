@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """A 5.1 soundtrack in a reference video, which every other leg already handles.
 
 The official reference-video path demuxes the soundtrack itself and keeps the

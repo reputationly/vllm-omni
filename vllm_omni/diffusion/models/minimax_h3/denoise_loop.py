@@ -18,6 +18,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
@@ -473,6 +474,7 @@ def minimax_h3_denoise_loop(
 
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
+        check_request_cancellation()
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             _snapshot_begin(step)
@@ -568,6 +570,7 @@ def minimax_h3_denoise_loop(
             # Status only -- throttled and a no-op outside a served request.
             report_phase(PHASE_DENOISE, step + 1, num_steps)
             _snapshot_end(step, num_steps)
+            check_request_cancellation(synchronize=True)
 
     minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows

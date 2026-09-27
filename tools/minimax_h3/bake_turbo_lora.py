@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Bake a Diffusers/PEFT LoRA (e.g. the lightx2v MiniMax-H3 Turbo step-distillation
 adapters) into a native MiniMax-H3 transformer checkpoint.

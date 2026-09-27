@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Where ``resolve_model_config_path`` looks first, on every platform.
 
 Resolving a model's deploy YAML is a CPU-side, pre-device concern — it runs

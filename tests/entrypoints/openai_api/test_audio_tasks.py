@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """L1 unit tests for the async audio task API (GPUStack integration).
 
 Covers the pure-logic contract of the P1 async pieces — no GPU/model needed:

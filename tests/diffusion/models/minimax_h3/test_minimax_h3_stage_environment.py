@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """A stage-scoped contract selection has to reach whoever answers for it.
 
 ``stages[].runtime.env`` is applied while the stage starts and restored the

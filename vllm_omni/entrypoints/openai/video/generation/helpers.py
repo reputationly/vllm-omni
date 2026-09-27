@@ -1143,9 +1143,7 @@ async def _parse_video_form(
             reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
             images, audio_paths = [], []
         else:
-            images, video_paths, audio_paths, upload_order = await _persist_uploaded_media_references(
-                input_references
-            )
+            images, video_paths, audio_paths, upload_order = await _persist_uploaded_media_references(input_references)
             request.reference_order = _multipart_reference_order(handler, upload_order)
         if images:
             reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])

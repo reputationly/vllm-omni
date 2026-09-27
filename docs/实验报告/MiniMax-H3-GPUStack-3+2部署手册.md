@@ -15,7 +15,7 @@ Ref2VA 暂无独立的上游 Turbo8，因此不是六个实例。
 ## 2. 五个模型
 
 | GPUStack 名称 | 持久模型路径 | 分区 | 不传步数时 | Deploy config |
-|---|---|---|---:|---|
+| --- | --- | --- | ---: | --- |
 | `minimax-h3-fl2va-base` | `/nfs-models/wuhanjisuan894/models/MiniMax-H3/FL2VA` | FL2VA | 20 | `/deploy-configs/minimax_h3_fl2va_bf16_a100_40g.yaml` |
 | `minimax-h3-fl2va-turbo4` | `/nfs-models/wuhanjisuan894/models/MiniMax-H3-FL2VA-Turbo4-768p-BF16-vLLM` | FL2VA | 4 | 同上 |
 | `minimax-h3-fl2va-turbo8` | `/nfs-models/wuhanjisuan894/models/MiniMax-H3-FL2VA-Turbo8-BF16-vLLM` | FL2VA | 8 | 同上 |
@@ -35,7 +35,7 @@ FL2VA YAML 还独立固定 `VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE=official_cover_cr
 在“模型”→“部署模型”中选本地路径，然后对表中每一行各建一个模型。
 
 | 页面字段 | 填写值 |
-|---|---|
+| --- | --- |
 | 名称 / 模型路径 | 按 §2 对应行填写 |
 | 类别 | `video` |
 | 推理后端 | `vLLMOmni` |
@@ -100,7 +100,7 @@ TP4 副本拆到不同 worker。
 ## 5. 步数规则
 
 | 模型 | 不传时 | 产品建议 | API 显式传入 |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | Base | 20 | UI 可给 20/25/30/50 常用档 | 1–200 的任意整数；25 步合法 |
 | Turbo4 | 4 | 优先 4，可给 8 | 1–200 在协议上合法，但超过蒸馏有效区间通常无收益 |
 | Turbo8 | 8 | 优先 8，可给 4 | 同上 |
@@ -133,7 +133,7 @@ new-api 只在请求没有 `num_inference_steps` 时补 `defaultSteps`；用户�
 5. 三个 Turbo 实例的 `model_index.json` 必须同时含有 `source_lora_sha256`、
    `lora_rank`、`lora_alpha`、`effective_lora_scale` 和 `fusion_verification`；缺一项都说明
    该目录没有经过当前强校验组装流程，不应部署。
-5. 先灰度一个 FL2VA 和一个 Ref2VA，健康检查 `/ready` 为 200，再建齐五个模型。
+6. 先灰度一个 FL2VA 和一个 Ref2VA，健康检查 `/ready` 为 200，再建齐五个模型。
 
 启动日志必须能确认 `partition=fl2va/ref2va`、TP4、text encoder TP4、VAE patch4 和
 `max_num_seqs=1`。如果日志显示单卡、错分区或 Turbo 在无覆盖请求下跑 20 步，立即停止灰度。

@@ -29,6 +29,7 @@ docker run -d --name omni-cosyvoice3 --gpus '"device=1"' --memory=240g \
   "$IMG" vllm serve "$ROOT/Fun-CosyVoice3-0.5B-2512" --omni --trust-remote-code \
   --allowed-local-media-path "$ROOT" --port 8092
 ```
+
 - 目录含多份 onnx(campplus / flow.decoder / speech_tokenizer_v3),本地加载正常。
 - 依赖 `s3tokenizer`(镜像已装)。
 
@@ -37,7 +38,7 @@ docker run -d --name omni-cosyvoice3 --gpus '"device=1"' --memory=240g \
 ## 2. P1 — 功能 / 配置面
 
 | 能力 | 支持 | 状态 |
-|---|---|---|
+| --- | --- | --- |
 | 预设音色 | ❌(400:`no built-in speakers`) | — |
 | 零样本克隆 | ✅ `ref_audio`+`ref_text` | ✅ 通过 |
 | SFT / 跨语言 / 指令 / 情感 | ✅(官方) | ⬜ 待专测 |
@@ -49,7 +50,7 @@ docker run -d --name omni-cosyvoice3 --gpus '"device=1"' --memory=240g \
 ## 3. P2 — 长度压测(单请求,ref 克隆,多样中文文本)
 
 | 字数 | http | 生成(热) | audio | cps | RTF | 峰值显存 | 判读 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 50 | 200 | 7.11s | 13.48s | 3.7 | 0.527 | 21045 | ✅ 完整 |
 | 100 | 200 | 19.67s | 24.00s | 4.2 | 0.820 | 21291 | ✅ 完整 |
 | 200 | 200 | 75.04s | 63.44s | 3.2 | **1.183** | 26509 | ✅ 完整但**慢于实时** |
@@ -57,6 +58,7 @@ docker run -d --name omni-cosyvoice3 --gpus '"device=1"' --memory=240g \
 | ≥800 | — | — | — | — | — | 26511 | ⬜ 慢/未完整测(0% util 长挂,已 Ctrl-C) |
 
 **结论**:
+
 - **完整合成上限 ≈ 200 字/请求**,400 字即截断 —— 本批克隆模型里**上下文预算最小**。
 - **显存 21→26.5G**(≥200 字 +5.5G),单卡 1 副本。
 - **慢**:200 字 RTF 1.18,长请求 gen 时间陡增(len200 gen 75s),≥800 字实测长时间 0% util 无产出(疑长截断退化/卡),已中止。
@@ -73,7 +75,7 @@ docker run -d --name omni-cosyvoice3 --gpus '"device=1"' --memory=240g \
 ## 6. P6 — 崩溃边界
 
 | 输入 | 实测 | facade 动作 |
-|---|---|---|
+| --- | --- | --- |
 | ≥400 字 | HTTP 200 静默截断(cps 7) | 句级切分,单句 ≤~200 字 |
 | ≥800 字 | 长时间无产出(疑卡/退化) | ⬜ 需复测确认是否 400/超时;门面按 token 硬闸 ≤200 字 |
 | 无 ref / 裸路径 / 无 media flag | HTTP 400 | file:// + `--allowed-local-media-path` |
@@ -95,7 +97,7 @@ PORT=8092 CONTAINER=omni-cosyvoice3 GPU_ID=1 LENS="50 100 200 400" bash $H len
 ## 8. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 类型 | **纯克隆**(无内置音色),功能全(潜力) |
 | 生产配置 | 单卡 **1 副本**(显存 ~26.5G);24kHz |
 | 显存 | 21G(短)→ 26.5G(≥200字) |

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration class for higgs-audio v3 (HiggsMultimodalQwen3) in vllm-omni.
 
 ``HiggsAudioV3Config.from_pretrained(model_path)`` returns a config with

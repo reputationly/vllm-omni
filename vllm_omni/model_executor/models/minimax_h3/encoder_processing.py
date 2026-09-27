@@ -17,6 +17,19 @@ import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.models.minimax_h3.keyframes import prepare_fl2va_keyframes
+from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
+    MINIMAX_H3_ORDER_REQUEST,
+    canonical_order_from_buckets,
+    ordered_references_from_request,
+)
+from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
+    condition_labels as reference_condition_labels,
+)
+from vllm_omni.diffusion.models.minimax_h3.reference_audio import (
+    normalize_standalone_reference_audios,
+    reference_audio_max_duration,
+)
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaConditioning,
@@ -29,17 +42,6 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     resolve_minimax_h3_aspect_ratio,
     resolve_minimax_h3_output_canvas,
     resolve_minimax_h3_reference_image_shape,
-)
-from vllm_omni.diffusion.models.minimax_h3.keyframes import prepare_fl2va_keyframes
-from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
-    MINIMAX_H3_ORDER_REQUEST,
-    canonical_order_from_buckets,
-    condition_labels as reference_condition_labels,
-    ordered_references_from_request,
-)
-from vllm_omni.diffusion.models.minimax_h3.reference_audio import (
-    normalize_standalone_reference_audios,
-    reference_audio_max_duration,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
@@ -416,6 +418,8 @@ def _effective_audio_inputs(
     max_standalone_seconds: float,
 ) -> list[tuple[torch.Tensor, int]]:
     """Return the waveforms exactly as the audio WVAE will consume them."""
+    if not math.isfinite(max_standalone_seconds) or max_standalone_seconds <= 0:
+        raise ValueError("max_standalone_seconds must be positive and finite")
     audio_inputs = [item for item in video_audios if item is not None]
     audio_inputs.extend(
         (waveform[..., : int(round(max_standalone_seconds * sample_rate))], sample_rate)
@@ -755,6 +759,16 @@ def encode_media(
     Every visual participant must call this function with the same references.
     Component scopes allow the diffusion runner to stage one codec at a time.
     """
+    # Validate before the non-leader return so all participants reject bad input.
+    audio_inputs = _effective_audio_inputs(
+        media.video_audios,
+        media.audios,
+        max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
+    )
+    embedded_audio_count = sum(item is not None for item in media.video_audios)
+    validate_reference_audio_waveforms([item for item in media.video_audios if item is not None])
+    if media.audio_mode != "lock_source":
+        validate_reference_audio_waveforms(media.audios)
     visual_rows: list[torch.Tensor] = []
     visual_shapes: list[tuple[int, int, int]] = []
     video_edit_clean_rows: torch.Tensor | None = None
@@ -792,12 +806,6 @@ def encode_media(
     audio_lengths: list[int] = []
     audio_edit_clean_rows: torch.Tensor | None = None
     audio_edit_source_t = 0
-    embedded_audio_count = sum(item is not None for item in media.video_audios)
-    audio_inputs = _effective_audio_inputs(
-        media.video_audios,
-        media.audios,
-        max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
-    )
     if audio_inputs or media.audio_edit is not None:
         if audio_vae is None:
             raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")

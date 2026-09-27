@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """A 4xx raised inside a diffusion worker must stay a 4xx at the engine boundary.
 
 Regression guard for the MiniMax H3 symptom: an out-of-range ``duration``

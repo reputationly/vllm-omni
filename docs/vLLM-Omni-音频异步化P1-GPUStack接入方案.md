@@ -32,7 +32,7 @@ P1 异步:  POST /v1/tasks/audio/      → 后台 job → 调同一个 Omnispeec
 ### 分期(P1 只做 tts,唱段/音乐后置)
 
 | task_type | 端点 | 底层 handler | 覆盖 | 期 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **tts** | `/v1/tasks/audio/` | `/v1/audio/speech` → Omnispeech | Qwen3-TTS/VoxCPM2/CosyVoice3/Ming/MOSS-*/GLM | **P1** |
 | singing | **新开** `/v1/tasks/singing/` | `/v1/chat/completions`(多模态) | SoulX-Singer | P2 |
 | audio-gen | **新开** `/v1/tasks/audio-gen/` | `/v1/audio/generate` → OmniAudioGenerate | Stable-Audio(ACE 归独立 agent) | P2 |
@@ -67,7 +67,7 @@ GET    /ready                      → 503 加载/warmup 中 | 200 就绪(GPUSta
 `pending | processing | completed | failed | cancelled`(**cancelled 双 L**)
 
 | 引擎状态 | 门面映射(`gpustack/routes/videos.py:178-184`) |
-|---|---|
+| --- | --- |
 | pending | ASSIGNED |
 | processing | RUNNING |
 | completed | DONE |
@@ -81,7 +81,7 @@ GET    /ready                      → 503 加载/warmup 中 | 200 就绪(GPUSta
 ## 3. 复用清单(现成的通用异步基建,~60%)
 
 | 组件 | 位置 | 复用方式 |
-|---|---|---|
+| --- | --- | --- |
 | `AsyncDictStore[T]`(泛型任务状态存储) | `entrypoints/openai/stores.py:35-71` | 新建实例 `AUDIO_TASK_STORE: AsyncDictStore[AudioTaskResponse]` |
 | `TaskRegistry`(asyncio 后台任务登记 + 自动清理) | `stores.py:12-33` | 新建 `AUDIO_TASKS: TaskRegistry` |
 | 原子落盘(`NamedTemporaryFile` → `os.replace`)+ TTL | `storage.py:LocalStorageManager._save_sync:78-118` | 抽出/复用其"临时文件→原子改名"逻辑写到 `save_result_path` |
@@ -138,7 +138,7 @@ class AudioTaskResponse(BaseModel):    # status 字段照 LightX2V task_manager.
 文本校验:空文本 → 400;超长 → 400。**上限必须每模型不同**(IndexTTS 216-324 字杀引擎,Qwen3-TTS 960 字仍稳——统一上限就抹掉了多模型的意义),分三层:
 
 | 层 | 职责 | 载体 |
-|---|---|---|
+| --- | --- | --- |
 | **new-api(权威/面向用户)** | 每模型字数上限,产品级配置,可运营调整 | `AudioModelConfig` / `common/media_model_config.go` 的 `ValidateAudioTextForModel`(方法论 §7.2,已存在) |
 | **引擎(防崩兜底)** | 该实例所载模型的**安全上限**,防 IndexTTS 式杀引擎 | 每实例 env `VLLM_OMNI_AUDIO_MAX_TEXT_LEN`(GPUStack 部署时按模型设),缺省给该 model_type 的实测崩溃边界 |
 | 门面 | 基础校验(空/缺参) | `routes/videos.py` |
@@ -226,7 +226,7 @@ async def ready(raw_request):
 ## 6. 文件改动清单
 
 | 文件(仓库根为 `vllm-omni/`) | 动作 | 内容 |
-|---|---|---|
+| --- | --- | --- |
 | `vllm_omni/entrypoints/openai/protocol/audio_tasks.py` | **新建** | `AudioTaskStatus/Request/Response` |
 | `vllm_omni/entrypoints/openai/audio_task_manager.py` | **新建** | `AudioTaskManager`(FIFO+背压+取消);队列满抛 `RuntimeError`(照 LightX2V,路由转 503) |
 | `vllm_omni/entrypoints/openai/stores.py` | 改 | 加 `AUDIO_TASK_STORE` / `AUDIO_TASKS` 实例 |
@@ -266,6 +266,7 @@ async def ready(raw_request):
 ## 9. 已定 / 待确认
 
 **已定:**
+
 - ✅ **MAX_TEXT_LEN 每模型不同**:三层(new-api 权威 per-model / 引擎每实例 env 防崩兜底 / 门面基础校验),引擎不写死单一常量。见 §4.1。
 - ✅ **P2 唱段/音乐各开独立端点**(`/v1/tasks/singing/`、`/v1/tasks/audio-gen/`),不并进 `/v1/tasks/audio/`,复用同一异步基建。见 §1。
 
@@ -273,6 +274,7 @@ async def ready(raw_request):
 - ✅ **契约字段/状态串**:已对 LightX2V `task_manager.py` / `api/tasks/` 源码 —— 状态串 `pending/processing/completed/failed/cancelled`;status 响应 `start_time/end_time`(非 created_at/completed_at);queue 六字段;common+per-kind 路由;503 走 RuntimeError。见 §2/§4。
 
 **落地时最后一核(以门面实读为准):**
+
 - 门面 `gpustack/routes/videos.py` 对 status 响应的字段解析,若与 LightX2V 有出入以门面为准(理论上一致,因 LightX2V 已跑通)。
 - `/v1/tasks/audio/` 请求字段名(`input`/`text`、`ref_audio`/`spk_audio_path`)对齐 new-api adaptor 音频物化的实际注入键。
 
@@ -289,7 +291,7 @@ P1 已按本方案落地(commit `fcb6b9d0`)并在 **鲲鹏 ARM + A100-40G(0020)*
 **契约冒烟**(全绿):
 
 | 步骤 | 结果 |
-|---|---|
+| --- | --- |
 | `POST /v1/tasks/audio/`(voice=vivian) | `{"task_id":"audio_task_83f19…","status":"pending","start_time":null,"end_time":null,"save_result_path":"/tmp/async_smoke.wav"}` |
 | `GET /v1/tasks/{id}/status` 轮询 | `"status":"completed"`,`start_time=1784364100.24`,`end_time=1784364102.01`(生成 ~1.77s)—— **字段是 start_time/end_time,非 created_at/completed_at** |
 | 落盘(save_result_path,原子写) | `/tmp/async_smoke.wav` **203K** |

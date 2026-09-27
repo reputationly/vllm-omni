@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """FIFO task manager + backpressure for the async audio task API.
 
 The generic in-memory store/registry (``stores.py``) has no queue bound; the

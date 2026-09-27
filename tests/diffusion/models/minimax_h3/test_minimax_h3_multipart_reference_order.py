@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The one ordered surface that used to drop its order: multipart uploads.
 
 ``/v1/videos`` takes ``input_references`` as an ordered list of files, and

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The order a `ref2va` request reads its references in.
 
 For MiniMax-H3 the order is semantic three times over: it numbers the

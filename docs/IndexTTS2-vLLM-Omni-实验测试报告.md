@@ -10,7 +10,7 @@
 ## 1. 结论先行
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 单请求延迟(~4.7s 中文短句) | **1.7-1.9s(RTF≈0.37)** vs 旧 server.py 5.5-8s ≈ **3.8×** |
 | 并发吞吐 | 8 并发 7.2s 完成 ≈ **5.2× 实时** ≈ 旧串行实现 **7.5×** |
 | 音质 | 音色克隆/情感控制人耳验收通过;22.05kHz mono WAV,与旧实现同规格 |
@@ -23,7 +23,7 @@
 ## 1.1 缺口补测结果(2026-07-14 round 2)
 
 | 用例 | 结果 | 备注 |
-|---|---|---|
+| --- | --- | --- |
 | 长文本 72 字 | ✅ 15.3s 音频 | |
 | 长文本 216 字 | ✅ 29.9s 音频(8.0s 生成,RTF 0.27) | 句级上限比预想高 |
 | 长文本 **324 字** | ❌ **500 + 引擎崩溃退出** | CUDA assert,文本 token 超 600 |
@@ -38,7 +38,7 @@
 ### 长跑稳定性(300 句连跑,并发 4,max_num_seqs=4)
 
 | 指标 | 结果 |
-|---|---|
+| --- | --- |
 | 成功率 | **300/300(零失败),300/300 有效 RIFF 音频** |
 | 墙钟 | 287s,等效 1.05 句/s(并发 4) |
 | 单请求延迟(含排队) | p50 3.10s / p90 3.53s / p99 4.12s / max 4.71s |
@@ -49,7 +49,7 @@
 ### max_num_seqs 4 vs 8 吞吐对比(16 并发打满)
 
 | 配置 | 墙钟(排空16) | 吞吐 | 首波延迟 | 平均延迟 | 峰值显存 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | **max_num_seqs=4** | **40.3s** | **0.40 句/s** | 4.74s | 25.7s | 24.7G |
 | max_num_seqs=8 | 43.2s | 0.37 句/s | 9.20s | 33.3s | 24.8G |
 
@@ -60,8 +60,8 @@
 旧方案(index-tts `infer_v2` in-process)与 vllm-omni 是同一套权重、两套执行引擎:
 
 | # | 因素 | 旧实现 | vllm-omni | 影响 |
-|---|---|---|---|---|
-| 1 | **AR 解码策略** | HF `generate` + **beam search num_beams=3**(infer_v2.py:532)| vLLM 采样(top_k 30 / top_p 0.8,无 beam) | AR 阶段算力直接 ÷3,这是最大头 |
+| --- | --- | --- | --- | --- |
+| 1 | **AR 解码策略** | HF `generate` + **beam search num_beams=3**(infer_v2.py:532) | vLLM 采样(top_k 30 / top_p 0.8,无 beam) | AR 阶段算力直接 ÷3,这是最大头 |
 | 2 | **AR 执行方式** | transformers python 逐 token 循环,eager attention | vLLM 运行时:paged KV cache + CUDA Graph + FlashAttention,采样含 GPU 上的 repetition_penalty | 每 token 开销大幅下降 |
 | 3 | **S2Mel 扩散步数** | 25 步 Euler(infer_v2.py:645) | **12 步**(deploy yaml `diffusion_steps: 12`)+ DiT bf16 + DiT CUDA Graph | S2Mel 阶段 ≈÷2,画质(音质)人耳无感 |
 | 4 | **BigVGAN 声码器** | eager(我们还关了 cuda_kernel 避开 JIT 坑) | CUDA Graph 捕获 + torch.compile(4 个 mel 长度桶) | vocoder 显著提速 |
@@ -81,7 +81,7 @@ vllm-omni 容器(上游原样) ── IndexTTS-2 / 后续 MOSS-TTS、Qwen3-TTS�
 ```
 
 | 产物 | 位置 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | 镜像 | ACR `reputationly/vllm-omni:arm64-a100-20260714` | Mac(Apple Silicon 原生 arm64)直接 `docker build` + push,`docker/Dockerfile.cuda` 原样,仅 `--build-arg BASE_IMAGE=vllm/vllm-openai:v0.25.0` |
 | 附属模型 overlay | 已并入 NFS 模型目录 | `wav2vec2bert/`、`campplus.pth`、`semantic_codec.pth`(safetensors→pth 转换)、`bigvgan/`——全部源自旧 index-tts 的 `hf_cache/`,**无需重新下载** |
 | deploy 配置 | `<模型目录>/indextts2-a100.yaml` | 上游 `vllm_omni/deploy/indextts2.yaml` + 2 处修正(见坑 #1、§4) |
@@ -93,7 +93,7 @@ vllm-omni 容器(上游原样) ── IndexTTS-2 / 后续 MOSS-TTS、Qwen3-TTS�
 ## 4. 踩坑记录
 
 | # | 坑 | 现象 | 解法 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | **tokenizer 占位符离线崩**(唯一真坑) | 上游 deploy yaml 写 `tokenizer: gpt2`,vLLM 0.25 即使 `skip_tokenizer_init: true` 也要先把它 resolve 成路径 → `HF_HUB_OFFLINE=1` 下 snapshot_download 抛 `LocalEntryNotFoundError`,Orchestrator 直接崩 | yaml 两处改 `tokenizer: /models/IndexTTS-2/qwen0.6bemo4-merge`(模型目录里现成的本地 tokenizer,本地路径不触发 HF 查询) |
 | 2 | deploy yaml 没打进 pip 包 | pyproject package-data 只含 `stage_configs`,`vllm_omni/deploy/*.yaml` 不在 wheel 里 | 起服务显式 `--deploy-config`(镜像内 `/app/vllm-omni/vllm_omni/deploy/…` 有源码副本,或用模型目录里的自定义副本) |
 | 3 | hf-mirror 当天挂(Xet 同款报错) | `hf download` 配好 `HF_HUB_DISABLE_XET=1` 仍 `Local entry not found` | 不依赖在线下载:附属模型全部复用旧 index-tts 攒好的 `hf_cache/`(见 §3),`semantic_codec` 用 safetensors→pth 十行脚本转换 |
@@ -109,7 +109,7 @@ vllm-omni 容器(上游原样) ── IndexTTS-2 / 后续 MOSS-TTS、Qwen3-TTS�
 ## 5. 实测数据(A100 单卡,~4.7s 中文短句,含 base64 参考音色上传)
 
 | 用例 | 结果 |
-|---|---|
+| --- | --- |
 | 首请求(含附属模型懒加载) | 3.4s |
 | 单请求稳态 ×5 | 1.67 / 1.79 / 1.81 / 1.87 / 1.90 s |
 | 4 并发(= max_num_seqs) | 总 3.96s,等效 ~1.0s/句 |
@@ -149,26 +149,31 @@ scp /root/lx2v-node.sh root@<节点IP>:/root/ && ssh root@<节点IP> 'bash /root
 ## 8. 缺口 / 待办测试
 
 **已测完(结果见 §1.1 / §5 及各稳定性小节)**:
+
 - ✅ 长文本边界(72/216 通过,324/500 崩引擎)· 情感三模式(vector/audio/text)· 英文/中英混排 · seed 复现性 · 300 句长跑 · max_num_seqs 4→8 对比
 
 **引擎侧仍未测(选做,不阻塞选型结论)**:
+
 1. `indextts2_low_latency.yaml` 低延迟配置对比(本轮只测了默认 yaml + max_num_seqs 4/8)
 2. 长参考音色(>15s)、低质量/带噪参考音色的鲁棒性
 3. 极限并发下的排队公平性与超时行为
 
 **集成侧待测(换引擎、facade 落地后才谈得上"生产就绪",非引擎选型范畴)**:
+
 1. facade 句级切分 + 拼接的真实听感(句间停顿、韵律连贯)
 2. pyloudnorm 归一化后的实际听感
 3. GPUStack 调度下的多实例 / 模型热切换 / 健康检查联动
 4. 端到端(facade → 网关 → 引擎 → NFS → OBS)全链路验收
 
 **⚠️ 生产准入硬约束(必须先做,否则不可上线)**:
+
 1. **facade 句级切分**:input 按标点(。！？;换行)切句,逐句调引擎再拼接。这层本就是句级 TTS 的正常用法,不是补丁。
 2. **长度硬闸**:每句再按字符/token 数兜底(建议 ≤180 字/句留安全边际),超限截断或 400 拒绝——一个超长请求都不许到引擎。
 3. **容器 `--restart unless-stopped`**:万一漏网,自动拉起兜底(代价 ~5min 重启空窗)。测试容器用 `-d` 起(非 --rm,崩溃后 `Exited(0)` 可 `docker start` 恢复),但没配 `--restart`,生产必须加。
 4. (可选给上游提 issue)超长文本应在 CPU 侧 token 校验时优雅拒绝,而非到 GPU 触发 device-side assert 杀死引擎。根因:gpt `max_text_tokens=600` 嵌入表越界。栈顶 `gpu_ar_model_runner.py:1036 → CUDA error: device-side assert triggered`。
 
 **工程待办**:
+
 1. GPUStack 注册 vllm-omni Custom 后端(照 lightx2v 模式;镜像/启动命令/端口注入)
 2. M4 facade:复用 index-tts 仓 api_server 模块(TaskManager/TaskWorker),进程内 infer 改 HTTP 调网关 + 句级切分 + pyloudnorm + `loudness_lufs`/`gain_db` 参数
 3. `lx2v-node.sh` 的 `setup-base` 子命令 commit(当前在 gpustack 仓工作区未提交)

@@ -22,7 +22,7 @@
 ## 1. 主对比大表(全维度)
 
 | 维度 | **Qwen3-TTS** | **IndexTTS-2** | **VoxCPM2** | **MOSS-TTS-Nano** | **CosyVoice3** | **GLM-TTS** | Ming-omni-tts |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | **可用性** | ✅ 生产就绪 | ✅ **生产就绪(已定案)** | ✅ 可用 | ✅ 可用 | ✅ 可用 | ✅ 可用 | ❌ **启动崩** |
 | **音色方式** | **预设9 + 克隆 + 音色库** | 纯克隆 + **情感最强** | 纯克隆 | 纯克隆(+音色库) | 纯克隆(+SFT潜力) | 纯克隆(+音色库) | — |
 | **端点** | `/v1/audio/speech` | 同 | 同 | 同 | 同 | 同 | — |
@@ -48,7 +48,7 @@
 ### 2.1 显存 & 部署密度(单卡 A100 40G)
 
 | 模型 | idle→peak | 单卡副本 | 4卡节点副本 | 路线 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | MOSS-Nano | 1.0→4.5G | **8+** | **32+** | 多副本堆吞吐 |
 | VoxCPM2 | 13.4→14.1G | **2** | 8 | 多副本 |
 | Qwen3-TTS | 18→26G | 1 | 4 | 单副本(批处理) |
@@ -59,7 +59,7 @@
 ### 2.2 速度(RTF,越低越快;<1 = 快于实时)
 
 | 模型 | 短文本 | 长文本 | 评级 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | VoxCPM2 | ~0.6 | **0.12~0.21** | ⭐⭐⭐ 最快 |
 | Qwen3-TTS | ~0.17 | ~0.19 | ⭐⭐⭐ 快且稳 |
 | IndexTTS-2 | ~0.37 | 0.27 | ⭐⭐ 快 |
@@ -70,7 +70,7 @@
 ### 2.3 上下文预算(完整合成不截断的输入上限)
 
 | 模型 | 完整上限 | 最长音频 | 超限行为 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | VoxCPM2 | **~1600字** | ~320s | ≥6400字 HTTP 400(优雅) |
 | MOSS-Nano | **~1600字** | ~340s | 永不400,一律静默截断 |
 | Qwen3-TTS | ~200字 | ~48s | ~6400字 HTTP 400(优雅) |
@@ -81,7 +81,7 @@
 ### 2.4 并发/吞吐(单实例)
 
 | 模型 | 并发行为 | 单实例吞吐 | 提吞吐手段 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | IndexTTS-2 | **max_num_seqs=4最优(batch=8无收益)**,300句零失败 | conc8 5.2×实时 ≈ 0.9s/句 | 多卡多实例横向扩(非调batch) |
 | Qwen3-TTS | 批处理有收益(亚线性) | conc16 1.33条/s | 多卡多副本 + 批 |
 | VoxCPM2 | 弱且抖动 | 峰 ~1.5条/s | 多副本 |
@@ -93,6 +93,7 @@
 ## 3. 请求格式(统一克隆四件套 + Qwen3 特例)
 
 **克隆模型(VoxCPM2 / MOSS-Nano / CosyVoice3 / GLM)统一**:
+
 ```bash
 curl -s -X POST localhost:$PORT/v1/audio/speech -H 'Content-Type: application/json' -d '{
   "input":"要合成的文本",
@@ -100,21 +101,26 @@ curl -s -X POST localhost:$PORT/v1/audio/speech -H 'Content-Type: application/js
   "ref_text":"参考音频的准确转写",
   "response_format":"wav"}' --output out.wav
 ```
+
 - `ref_audio` **必须** URL / base64 data URL / `file://` URI(裸路径 → 400)。
 - serve **必须**加 `--allowed-local-media-path $ROOT`(否则 `Cannot load local files`)。
 - MOSS-Nano 额外:`-e HF_HOME=$ROOT/hf_cache`(codec 离线加载)。
 
 **Qwen3-TTS(唯一预设音色)**:
+
 ```bash
 -d '{"input":"文本","voice":"vivian","instructions":"愤怒、语速快","language":"Chinese"}'
 ```
+
 预设音色 `aiden/dylan/eric/ono_anna/ryan/serena/sohee/uncle_fu/vivian`;`instructions` 控情感。
 
 **IndexTTS-2(情感控制最强)**:惯用 base64 data URL + 8 维情感向量:
+
 ```bash
 -d '{"input":"你到底想干什么！","ref_audio":"data:audio/wav;base64,<b64>",
      "extra_params":{"emo_vector":[0,0.8,0,0,0,0,0,0],"emo_alpha":0.9}}'
 ```
+
 `emo_vector` 8 维顺序 **喜怒哀惧厌郁惊平**;另支持 `emo_audio`(参考情感音频)、`use_emo_text`+`emo_text`(文字描述情感)三种模式。⚠️ 情感参数包在 `extra_params` 里(与旧 server.py 的 `emotion_vector` 命名不同)。
 
 ---
@@ -122,7 +128,7 @@ curl -s -X POST localhost:$PORT/v1/audio/speech -H 'Content-Type: application/js
 ## 4. 全员通病 & 门面(facade)刚需
 
 | 坑 | 表现 | 门面动作 |
-|---|---|---|
+| --- | --- | --- |
 | **⚠️ IndexTTS-2 超长杀引擎** | ≥~216 字触发 CUDA device-side assert → **整个引擎死、容器退出、不自愈**(≠ 其它模型的优雅 400/静默截断) | **硬闸挡在引擎前**(建议 ≤180 字/句)+ 容器 `--restart unless-stopped` 兜底 |
 | **长文本静默截断(其它模型)** | 输入吃光 token 预算,音频封顶但 **HTTP 200**(看着成功) | **句级切分**:单句 ≤ 各模型完整上限;逐句合成再 pyloudnorm 拼接 |
 | **cps 判截断** | 字/音频秒 >6 = 截断(正常 ~4-5) | 产物侧校验 cps,超阈告警/重试 |
@@ -137,7 +143,7 @@ curl -s -X POST localhost:$PORT/v1/audio/speech -H 'Content-Type: application/js
 ## 5. 选型建议(按场景)
 
 | 场景 | 首选 | 理由 |
-|---|---|---|
+| --- | --- | --- |
 | **配音/短剧/强情感克隆** | **IndexTTS-2** | 情感控制最强(8维向量/情感音频/情感文本),并发稳(300句零失败),已定案 |
 | **要指定/多预设音色、情感可控** | **Qwen3-TTS** | 唯一预设音色 + instructions 情感 + 音色库 |
 | **长文本/长音频(有声书、旁白)** | **VoxCPM2** | ~1600字/320s 完整,RTF 最快,显存中等 |

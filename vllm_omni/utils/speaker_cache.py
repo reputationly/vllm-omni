@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Process-wide thread-safe LRU cache for speaker extraction artifacts.
 
 Keyed by ``(model_type, speaker_name, created_at)`` so each upload generation

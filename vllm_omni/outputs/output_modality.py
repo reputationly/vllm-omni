@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Output modality types for vLLM-Omni.
 
 This module defines the OutputModality enum and TensorAccumulationStrategy

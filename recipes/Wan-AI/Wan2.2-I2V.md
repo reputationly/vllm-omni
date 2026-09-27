@@ -181,20 +181,20 @@ for complete client examples and request formats.
 #### Notes
 
 - **Key flags:**
-  - `--omni` — enables vLLM-Omni diffusion serving.
-  - `--use-hsdp` — enables Hybrid Sharded Data Parallelism for the DiT model
+    - `--omni` — enables vLLM-Omni diffusion serving.
+    - `--use-hsdp` — enables Hybrid Sharded Data Parallelism for the DiT model
     weights.
-  - `--usp <N>` — Unified Sequence Parallelism degree.
-  - `--cfg <N>` — Classifier-Free Guidance parallelism; set to 2 for models
+    - `--usp <N>` — Unified Sequence Parallelism degree.
+    - `--cfg <N>` — Classifier-Free Guidance parallelism; set to 2 for models
     that require negative-prompt computation, omit for distilled models.
-  - `--vae-patch-parallel-size 8` — parallelizes VAE decoding across all 8
+    - `--vae-patch-parallel-size 8` — parallelizes VAE decoding across all 8
     cards.
-  - `--vae-use-tiling` — enables tiled VAE decoding to reduce peak memory.
+    - `--vae-use-tiling` — enables tiled VAE decoding to reduce peak memory.
 - **Performance tips:**
-  - Installing mindie-sd and enabling Laser Attention
+    - Installing mindie-sd and enabling Laser Attention
     (`MINDIE_SD_FA_TYPE=ascend_laser_attention`) provides up to ~40%
     performance improvement at 720p resolution due to long-sequence attention
     optimization.
 - **Known limitations:**
-  - `MULTI_STREAM_MEMORY_REUSE=2` is required on NPU when using HSDP/FSDP2
+    - `MULTI_STREAM_MEMORY_REUSE=2` is required on NPU when using HSDP/FSDP2
     due to a multi-stream memory reuse bug. This is not needed on CUDA.

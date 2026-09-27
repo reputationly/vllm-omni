@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Metadata merge helpers for SoulX-Singer preprocess."""
 
 from dataclasses import dataclass

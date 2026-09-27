@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The contract has to travel from deploy YAML to the H3 pipeline.
 
 The failure this guards against is specific and silent: a deployment writes

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Start one isolated MiniMax-H3 Turbo TP4 evaluation engine on a GPU worker.
 # Usage: run_vllm_turbo_eval.sh TAG MODEL PORT [docker -e NAME=VALUE ...]
 set -euo pipefail

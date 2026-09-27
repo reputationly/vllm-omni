@@ -23,12 +23,14 @@
 ## 1. 环境与权重
 
 - serve(单卡,离线):
+
 ```bash
 docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -v $ROOT:$ROOT -p 8091:8091 \
   "$IMG" vllm serve "$ROOT/Qwen3-TTS-1.7B-CustomVoice" --omni --trust-remote-code --port 8091
 ```
+
 - deploy `vllm_omni/deploy/qwen3_tts.yaml` 自动加载(2 stage 同卡 device 0)。启动关键:`max_model_len=4096`(stage0 talker)/ `65536`(stage1 code2wav);`generation_config` 默认 `temperature=0.9, top_k=50, top_p=1.0`。
 - 冷启动:`AsyncOmniEngine initialized in 331s`(~5.5min)。就绪探针 `/ready`(200 = warmup 完成)。
 
@@ -37,7 +39,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 ## 2. P1 — 功能 / 配置面
 
 | 能力 | 支持 | 用法 | 状态 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 预设音色(9) | ✅ | `voice`=`aiden/dylan/eric/ono_anna/ryan/serena/sohee/uncle_fu/vivian` | ✅ 冒烟通过 |
 | 情感/风格 | ✅ | `instructions`(如"愤怒、语速快");默认输出即自带表现力 | ✅ 冒烟通过(愤怒指令生效) |
 | 多语言 | ✅ 600+ | `language`(Chinese/English/Auto…) | ⬜ 待多语专测 |
@@ -55,7 +57,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 > `cps`(字/audio秒)正常 ~4-5;**>6 = 截断**(话没说完)。
 
 | 字数 | http | 生成(热) | audio | cps 字/秒 | RTF | 峰值显存 | 判读 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 50 | 200 | 1.98s | 11.2s | 4.5 | 0.177 | 18165 | ✅ 完整 |
 | 100 | 200 | 4.25s | 24.8s | 4.0 | 0.171 | 18165 | ✅ 完整 |
 | 200 | 200 | 8.09s | 48.0s | 4.2 | 0.169 | 18165 | ✅ 完整(**完整上限附近**) |
@@ -68,6 +70,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 | 12800 | 400 | 0.05s | — | — | — | — | ✅ 优雅拒绝 |
 
 **结论**:
+
 - **完整合成上限 ≈ 200 字/请求**(cps~4.5);200~6400 字 = **静默截断(HTTP 200 但音频不全)**;>~6400 字 = **HTTP 400 优雅拒绝**。
 - **显存**:短文本平 18.2G;近满上下文(3200~5600 字)升到 ~26G(+8G KV),仍 < 40G。**长文本无显存瓶颈,瓶颈是 token 预算**。
 - **运营刚需**:facade **句级切分 + 长度硬闸**(单句 ≤~200 字),逐句合成再 pyloudnorm 拼接。这是 Qwen3-TTS 上生产的前置条件。
@@ -77,7 +80,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 ## 4. P3 — 采样 / 流式 / max_num_seqs
 
 | 项 | 现状 | 待测 |
-|---|---|---|
+| --- | --- | --- |
 | 默认采样 | `temperature=0.9, top_k=50, top_p=1.0`(generation_config) | 稳定性(同文本多次差异)、降温对一致性影响 |
 | 流式 TTFB | 支持 `stream_format=audio`(PCM) / SSE / WS | ⬜ 首包延迟 |
 | max_num_seqs | deploy 默认(见 qwen3_tts.yaml) | ⬜ 扫最优点 vs 吞吐 |
@@ -87,7 +90,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 ## 5. P4 — 任务面
 
 | 任务 | 状态 |
-|---|---|
+| --- | --- |
 | 预设音色 TTS | ✅ |
 | 情感 TTS(instructions) | ✅(默认即有表现力) |
 | 多语言 | ⬜ |
@@ -101,7 +104,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 > 100 字/请求(24.8s 音频),并发提交 N。
 
 | 并发 | 总时长 | 吞吐(条/s) | 均摊(s/条) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 4.38s | 0.23 | 4.38 |
 | 2 | 4.96s | 0.40 | 2.48 |
 | 4 | 6.19s | 0.65 | 1.55 |
@@ -115,7 +118,7 @@ docker run -d --name omni-qwen3tts --gpus '"device=0"' --memory=240g \
 ## 7. P6 — 崩溃边界(门面前置校验)
 
 | 输入 | 实测 | facade 动作 |
-|---|---|---|
+| --- | --- | --- |
 | 输入 token > 4096(~6400 字) | **HTTP 400 秒拒,容器 up** | 前置长度硬闸(按 token 估),不必依赖引擎 |
 | 200~6400 字 | **HTTP 200 但音频静默截断** ⚠️ | **句级切分**(单句 ≤~200 字)——这是比崩溃更隐蔽的坑 |
 | 空 input | ⬜ | ⬜ 待测 |
@@ -140,7 +143,7 @@ PORT=8091 VOICE=vivian CONTAINER=omni-qwen3tts GPU_ID=0 CONC="1 2 4 8 16" bash /
 ## 9. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 生产配置 | 单卡 1 副本;4×A100 节点 4 副本;24kHz |
 | 显存 | idle 18G / 峰值 26G(近满上下文),均 <40G |
 | RTF(短文本) | ~0.17,快 6× |

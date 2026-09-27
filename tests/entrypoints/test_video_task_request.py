@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for VideoTaskRequest path/param resolution (CPU-only).
 
 Covers the GPUStack facade contract for ``POST /v1/tasks/video/``: media inputs

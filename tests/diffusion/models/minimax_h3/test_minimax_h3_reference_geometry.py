@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """参考素材的几何归一化。
 
 rows 正比于归一后的像素数（VAE 空间压缩 16 倍，再 patch 合并 2x2，即每 32x32 像素 1 row），

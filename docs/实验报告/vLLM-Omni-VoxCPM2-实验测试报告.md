@@ -23,6 +23,7 @@
 ## 1. 环境与权重
 
 - serve(单卡,离线,放行本地 ref):
+
 ```bash
 docker run -d --name omni-voxcpm2 --gpus '"device=0"' --memory=240g \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e HF_HOME=$ROOT/hf_cache \
@@ -31,13 +32,16 @@ docker run -d --name omni-voxcpm2 --gpus '"device=0"' --memory=240g \
   --allowed-local-media-path "$ROOT" --port 8091
 # 就绪:curl /ready(200)
 ```
+
 - **依赖**:镜像已内置 `voxcpm>=2.0`(旧镜像会 `ImportError: No module named 'voxcpm'` → 本轮新镜像已修复,`docker run --rm $IMG python3 -c "import voxcpm"` 通过)。
 - **克隆请求**(关键 3 字段):
+
 ```bash
 curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/json' -d '{
   "input":"要合成的文本","ref_audio":"file:///.../\_ref_zh.wav",
   "ref_text":"参考音频的准确转写","response_format":"wav"}' --output out.wav
 ```
+
 > `ref_audio` 不能是裸路径(报 `must be a URL / base64 / file://`);`file://` 需配 serve 端 `--allowed-local-media-path`(否则 `Cannot load local files without --allowed-local-media-path`)。
 
 ---
@@ -45,7 +49,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ## 2. P1 — 功能 / 配置面
 
 | 能力 | 支持 | 用法 | 状态 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 预设音色 | ❌ | 无内置 speaker | — |
 | 零样本克隆 | ✅ | `ref_audio`(file:///URL/base64)+ `ref_text` | ✅ 冒烟通过(http 200 出 WAV) |
 | 情感/风格 | ⬜ | 待测(是否支持 `instructions`) | ⬜ |
@@ -61,7 +65,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 > `cps`(字/audio秒)正常 ~4-5;**>6 = 截断**(音频封顶,话没说完)。
 
 | 字数 | http | 生成(热) | audio | cps | RTF | 峰值显存 | 判读 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 50 | 200 | 1.71s | 12.64s | 4.0 | 0.135 | 13677 | ✅ 完整 |
 | 100 | 200 | 4.25s | 25.76s | 3.9 | 0.165 | 13135 | ✅ 完整 |
 | 200 | 200 | 10.31s | 49.60s | 4.0 | 0.208 | 13677 | ✅ 完整 |
@@ -72,6 +76,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 | 6400 | **400** | 0.04s | — | — | — | 14069 | ✅ **优雅拒绝**(不崩) |
 
 **结论**:
+
 - **完整合成上限 ≈ 1600 字/请求**(~320s 音频,cps~5);~3200 字 = **静默截断(HTTP 200 但音频封顶)**;≥6400 字 = **HTTP 400 优雅拒绝**。
 - **显存几乎不随长度变**(13.1→14.1G,+1G / 320s 音频)→ **长文本无显存瓶颈,瓶颈是 token 预算**。这与 Qwen3-TTS(近满上下文 +8G KV)不同,VoxCPM2 更省。
 - **运营建议**:facade 长度硬闸(单请求 ≤~1600 字)+ 超长句级切分,逐句合成再拼接。
@@ -81,7 +86,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ## 4. P3 — 采样 / 流式(待补)
 
 | 项 | 现状 | 待测 |
-|---|---|---|
+| --- | --- | --- |
 | 采样稳定性 | 未测(同文本多次差异) | ⬜ |
 | 流式 TTFB | 未知是否支持 | ⬜ |
 | ref 质量敏感度 | ref_text 与音频转写是否需严格对齐 | ⬜(影响克隆音质) |
@@ -91,7 +96,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ## 5. P4 — 任务面
 
 | 任务 | 状态 |
-|---|---|
+| --- | --- |
 | 零样本克隆 TTS | ✅ |
 | 情感/多语言 | ⬜ |
 | 多参考/长文本拼接 | ⬜ |
@@ -103,7 +108,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 > 100 字/请求,并发提交 N。
 
 | 并发 | 总时长 | 吞吐(条/s) | 均摊(s/条) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 5.65s | 0.18 | 5.65 |
 | 2 | 46.73s | 0.04 | 23.36 |
 | 4 | 57.95s | 0.07 | 14.49 |
@@ -117,7 +122,7 @@ curl -s -X POST localhost:8091/v1/audio/speech -H 'Content-Type: application/jso
 ## 7. P6 — 崩溃边界
 
 | 输入 | 实测 | facade 动作 |
-|---|---|---|
+| --- | --- | --- |
 | ≥~6400 字(超 token 预算) | **HTTP 400 秒拒,容器 up** | 前置长度硬闸 |
 | ~3200 字 | **HTTP 200 但音频静默截断**(cps 24) | 句级切分(单句 ≤~1600 字) |
 | 裸路径 ref_audio | HTTP 400(`must be URL/base64/file://`) | 门面统一转 `file://` |
@@ -144,7 +149,7 @@ PORT=8091 CONTAINER=omni-voxcpm2 GPU_ID=0 CONC="1 2 4 8 16" bash /nfs-models/_tr
 ## 9. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 类型 | **纯克隆**(无内置音色),`ref_audio`+`ref_text` 必填 |
 | 生产配置 | 单卡 **2 副本**(显存 ~13.4G);4×A100 节点 8 副本;24kHz |
 | 显存 | idle ~13.4G / 峰值 ~14.1G(几乎不随长度),均 <40G |

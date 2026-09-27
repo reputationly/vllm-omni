@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Int8 storage for the MiniMax-H3 Qwen3-VL text encoder.
 
 The failure this guards against is silent: a scale placed by a different rule

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Run one vLLM-Omni H3 video request and persist reproducible measurements."""
 
 from __future__ import annotations

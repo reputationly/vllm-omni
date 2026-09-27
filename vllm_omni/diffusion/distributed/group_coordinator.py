@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -384,6 +387,7 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
+        source_rank_in_group = src
         src = self.ranks[src]
 
         rank = self.rank
@@ -394,7 +398,7 @@ class GroupCoordinator:
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
-            self.broadcast_object(metadata_list, src=src)
+            self.broadcast_object(metadata_list, src=source_rank_in_group)
             async_handles = []
             for tensor in tensor_list:
                 if tensor.numel() == 0:
@@ -411,7 +415,7 @@ class GroupCoordinator:
                 async_handle.wait()
 
         else:
-            metadata_list = self.broadcast_object(None, src=src)
+            metadata_list = self.broadcast_object(None, src=source_rank_in_group)
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:

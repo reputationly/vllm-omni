@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-element statistics for two prompt-embedding dumps.
 
 A 32-element sample cannot separate "one bf16 ULP everywhere", which is the

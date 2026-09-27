@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """How many frames of a `ref2va` reference video reach the video VAE.
 
 The VAE consumes ``17 * n + 5`` frames. A generated clip's own frame count

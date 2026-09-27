@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from .convnext import ConvNeXtV2Block
 from .decoder import CFMDecoder
 from .flow_matching import FlowMatchingTransformer

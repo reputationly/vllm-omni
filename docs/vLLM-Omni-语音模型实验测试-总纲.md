@@ -14,6 +14,7 @@
 ## 0. 目标
 
 对 vllm-omni 支持、已下载的每个语音/音频模型,搞清 **4 件事**,每个模型出一份独立报告:
+
 1. **功能** —— 支持哪些能力(预设/克隆/情感/多语/方言/多说话人/唱段/音效),实际效果。
 2. **硬件匹配** —— A100-40G 单卡装不装得下,峰值显存,冷启动,采样率。
 3. **调优** —— `max_num_seqs`、流式、采样参数、是否量化(A100 上量化只省显存不提速,一般不动)。
@@ -31,7 +32,7 @@
 ## 2. 通用指标(每模型报告统一列)
 
 | 指标 | 定义 |
-|---|---|
+| --- | --- |
 | 冷启动加载 | 容器起到 `/ready` 200 的墙钟(含 torch.compile/CUDA graph/warmup) |
 | 单请求 RTF | `生成墙钟(热) / 产物音频秒数`;<1 快于实时 |
 | 峰值显存 | 生成期间 `nvidia-smi` 采样的该卡显存峰值(harness 自动采) |
@@ -43,7 +44,7 @@
 ## 3. 模型优先级与分组
 
 | Tier | 模型 | 子目录 | 特点 | 额外依赖 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **1 配音主力** | **Qwen3-TTS** | `Qwen3-TTS-1.7B-CustomVoice` | 预设音色库+多语+情感(instructions) | — |
 | 1 | **VoxCPM2** | `VoxCPM2` | 48k 高保真,可预设可克隆 | — |
 | 1 | **CosyVoice3** | `Fun-CosyVoice3-0.5B-2512` | 0.5B 极轻量,克隆需 ref_audio+ref_text | — |
@@ -63,7 +64,7 @@
 全部单卡 → 一次性铺开并行测,不用串行等。分配(每台 4 卡):
 
 | 机器 | GPU0 | GPU1 | GPU2 | GPU3 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **0016** 配音主力 | Qwen3-TTS | VoxCPM2 | CosyVoice3 | Ming-omni-tts(`--enforce-eager`) |
 | **0017** MOSS 家族(全加 codec env) | MOSS-Nano(-Nano codec) | MOSS-Realtime | MOSS-VoiceGenerator | MOSS-TTSD |
 | **0018** 其他 | GLM-TTS | Stable-Audio(`/v1/audio/generate`) | SoulX-Singer(需 phone_set) | (机动) |
@@ -71,6 +72,7 @@
 | **0020** | 现 Qwen3-TTS 在跑(继续用) | (机动) | (机动) | (机动) |
 
 **并行纪律**:
+
 1. **每台内错峰启动 ≥2min/实例** —— 4 个模型同时冷启动会抢 NFS 冷读(T5/权重),方法论实测 3×并发冷读打进 18min 病态。起完一个等 `/ready` 200 + `MemAvailable≥15G` 再起下一个。
 2. **前置**:0016-0019 需载镜像 —— `docker load < /nfs-models/_transfer/vllm-omni-arm64-a100.tar`(prepare-transfer 已生成)或直连 ACR `docker pull`;确认 NFS 挂载(权重)。**bench 无外部依赖**(时长走 Python `wave`,不用装 ffmpeg)。
 3. **压测隔离**:功能/长度测在功能实例上跑;**并发压测放 0019/0020 的副本上**,别在功能实例上打并发污染显存峰值读数(安静宿主原则)。
@@ -113,7 +115,7 @@ PORT=8091 VOICE=vivian CONTAINER=omni-<m> GPU_ID=0 CONC="1 2 4 8" bash scripts/s
 ## 6. 进度追踪
 
 | 模型 | 功能 | 长度压测 | 并发 | 崩溃边界 | 报告 | 状态 |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | Qwen3-TTS | 部分(冒烟+情感+长句已过) | ⬜ | ⬜ | 部分(960字未崩) | ⬜ | 进行中 |
 | VoxCPM2 | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | 待测 |
 | CosyVoice3 | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | 待测 |

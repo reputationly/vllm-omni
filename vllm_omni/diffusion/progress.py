@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request generation progress, reported out of the worker process.
 
 A pipeline calls :func:`report_phase` as it moves through prepare / encode /

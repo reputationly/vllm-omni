@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Putting the `fl2va` keyframes onto the target canvas.
 
 The two keyframes are not treated alike. The first one is the *geometry anchor*:

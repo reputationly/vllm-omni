@@ -163,7 +163,7 @@ python tools/minimax_h3_turbo/assemble_distilled_partition.py \
 yaml 按 task 选现成的，**不要新建**：
 
 | task | 复用哪份 |
-|---|---|
+| --- | --- |
 | fl2va / t2va | `/deploy-configs/minimax_h3_a100_40g.yaml`（或 turbo8 那份，两者仅默认步数不同） |
 | ref2va | `/deploy-configs/minimax_h3_ref2va_bf16_a100_40g.yaml` |
 
@@ -216,7 +216,7 @@ attention backend 之类）。步数、权重、LoRA 版本都不算。
 ## 5. 当前状态（2026-09-04）
 
 | 档位 | LoRA | 缩放 | 基座 | 产物 | 状态 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | fl2va 480p | `fl2v_turbo_8step_v1.0` | 0.0625 | FL2VA | `MiniMax-H3-FL2VA-Turbo8-BF16` | 线上，实测 1.76x |
 | fl2va 768p | `fl2v_turbo_4step_v1.0_768p` | 1.0 | FL2VA | `MiniMax-H3-FL2VA-Turbo4-768p-BF16` | 已烘，作 v1.1 的 A/B 基线 |
 | fl2va 768p | `fl2v_turbo_4step_v1.1_768p` | 1.0 | FL2VA | `MiniMax-H3-FL2VA-Turbo4-768p-v1.1-BF16-vLLM` | 现网在跑 |
@@ -332,7 +332,7 @@ v1.1 的 `||delta||/||W||` 中位数是 0.0015，v1.2 只有 0.0001 —— **施
 再比范数与余弦，默认每 25 个模块采一层、共 13 层）交叉核过：
 
 | 比较 | 范数比 R/L 中位数 | 余弦中位数 | 读法 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | v1.1 → **v1.2** | **0.036** | **+0.006**（min −0.007 / max +0.397） | 幅度只有 1/28，方向近乎正交 |
 | 8step_v1.0_768p → **v1.2** | **1.228** | +0.043（max **+0.797**，深层） | 同量级，深层方向明显相关 |
 | （对照）v1.0_768p → v1.1_768p | 1.160 | **+0.872** | 这才是「同配方续训」长什么样 |
@@ -396,7 +396,7 @@ N 次 transformer evaluation 需要 N+1 个 sigma boundary，工具已经按这�
 ## 7. 相关文件
 
 | 用途 | 路径 |
-|---|---|
+| --- | --- |
 | 下载脚本（含清单与结构校验） | `scripts/download_minimax_h3_turbo_lora.sh` ⚠️ 见下 |
 | 烘焙工具 | `tools/minimax_h3/bake_turbo_lora.py` |
 | 融合验真与来源回填 | `tools/minimax_h3_turbo/lora_provenance.py` |

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Pre-launch admission control for parallel stage initialization.
 
 When ``VllmOmniOrchestratorConfig.parallel_stage_init`` is enabled, several stage

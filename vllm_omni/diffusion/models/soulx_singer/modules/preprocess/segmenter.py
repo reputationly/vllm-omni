@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Rule-based vocal segmentation from F0 contour (no neural net)."""
 
 from __future__ import annotations

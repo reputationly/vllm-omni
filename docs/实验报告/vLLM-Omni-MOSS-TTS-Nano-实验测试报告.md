@@ -24,6 +24,7 @@
 ## 1. 环境与权重
 
 - serve(单卡,离线,放行本地 ref,codec 走 cache):
+
 ```bash
 docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e HF_HOME=$ROOT/hf_cache \
@@ -31,6 +32,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
   "$IMG" vllm serve "$ROOT/MOSS-TTS-Nano" --omni --trust-remote-code \
   --allowed-local-media-path "$ROOT" --port 8091
 ```
+
 - `max_model_len=4096`(见 `/v1/models`)。
 - **踩坑**:codec 用 HF-id 加载(不读 env `MOSS_TTS_CODEC_PATH`),离线必须 `HF_HOME` 指向预填了 `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` 的 cache。
 
@@ -39,7 +41,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 ## 2. P1 — 功能 / 配置面
 
 | 能力 | 支持 | 用法 | 状态 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 预设音色 | ❌ | 无内置 speaker(400:`has no built-in speakers`) | — |
 | 零样本克隆 | ✅ | `ref_audio`(file:///URL/base64)+ `ref_text` | ✅ 冒烟通过 |
 | 音色库上传 | ✅(提示) | 400 报文提示 `POST /v1/audio/voices` | ⬜ 待测 |
@@ -52,7 +54,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 ## 3. P2 — 长度压测(单请求,ref=_ref_zh.wav,多样中文文本)
 
 | 字数 | http | 生成(热) | audio | cps | RTF | 峰值显存 | 判读 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 50 | 200 | 28.67s | 13.68s | 3.7 | 2.096 | 1135 | ✅ 完整(慢) |
 | 100 | 200 | 35.40s | 27.28s | 3.7 | 1.298 | 1171 | ✅ 完整 |
 | 200 | 200 | 33.50s | 50.40s | 4.0 | 0.665 | 1337 | ✅ 完整 |
@@ -63,6 +65,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 | 6400 | 200 | 86.60s | 338.80s | 18.9 | 0.256 | 4453 | ⚠️ 静默截断(封顶不变) |
 
 **结论**:
+
 - **完整合成上限 ≈ 1600 字/请求(~340s 音频)**;≥3200 字 = **静默截断,音频恒封顶 ~338s**;**全程 HTTP 200,永不 400** —— 比 VoxCPM2(超长 400 拒绝)更"闷",facade 必须自己按 token 估长度硬闸。
 - **显存随长度线性但极小**:1.1G(50字)→ 4.5G(6400字),满打满算 <5G。**长文本无任何显存压力**。
 - **速度是短板**:短文本 RTF>1(慢于实时),长文本才摊到 ~0.25。
@@ -72,7 +75,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 ## 4. P3 — 采样 / 流式(待补)
 
 | 项 | 现状 | 待测 |
-|---|---|---|
+| --- | --- | --- |
 | 采样稳定性 | 未测 | ⬜ |
 | 流式 TTFB | 未知 | ⬜ |
 | 音色库 `/v1/audio/voices` | 400 提示支持 | ⬜ |
@@ -82,7 +85,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 ## 5. P4 — 任务面
 
 | 任务 | 状态 |
-|---|---|
+| --- | --- |
 | 零样本克隆 TTS | ✅ |
 | 音色库上传复用 | ⬜ |
 | 情感/多语言 | ⬜ |
@@ -94,13 +97,14 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 > 100 字/请求,并发提交 N。
 
 | 并发 | 总时长 | 吞吐(条/s) | 均摊(s/条) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 27.99s | 0.04 | 27.99 |
 | 2 | 48.35s | 0.04 | 24.18 |
 | 4 | 95.05s | 0.04 | 23.76 |
 | 8 | 185.52s | 0.04 | 23.19 |
 
 **结论(关键)**:**吞吐恒 0.04 条/s,并发 1→8 完全不变,均摊稳定 ~23s/条 → 请求全串行,批处理零收益(等效 batch=1)**。这是本模型最硬的运营约束:
+
 - **单实例吞吐 ≈ 2.6 条/min(100 字)**,无论并发多少。
 - **提吞吐唯一手段 = 多副本**。好在显存仅 ~1-4.5G,**单卡可堆 8+ 副本**,4×A100 节点理论 32+ 副本 → 靠数量把聚合吞吐拉起来。
 - 与 Qwen3-TTS(conc16 有批处理收益、1.33 条/s)形成鲜明对比:**Nano 走"多小副本"路线,不走"单大实例批处理"路线**。
@@ -110,7 +114,7 @@ docker run -d --name omni-moss-nano --gpus '"device=0"' --memory=240g \
 ## 7. P6 — 崩溃边界
 
 | 输入 | 实测 | facade 动作 |
-|---|---|---|
+| --- | --- | --- |
 | ≥3200 字 | **HTTP 200 但音频静默截断(封顶 ~338s)**,永不 400 | 按 token 前置硬闸(单请求 ≤~1600 字)+ 句级切分 |
 | 无 `ref_audio` | HTTP 400(`no built-in speakers, use ref_audio+ref_text`) | 门面强制带 ref |
 | 裸路径 / 无 media flag | HTTP 400 | 统一 `file://` + serve `--allowed-local-media-path` |
@@ -137,7 +141,7 @@ PORT=8091 CONTAINER=omni-moss-nano GPU_ID=0 CONC="1 2 4 8 16" bash /nfs-models/_
 ## 9. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 类型 | **纯克隆**(无内置音色),`ref_audio`+`ref_text` 必填 |
 | 生产配置 | 单卡 **8+ 副本**(显存 ~1-4.5G);4×A100 节点 32+ 副本;24kHz |
 | 显存 | 1.1G(短)→ 4.5G(6400字),极轻 |

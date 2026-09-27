@@ -909,8 +909,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 self,
                 max_entries=cuda_graph_max_decode_graphs,
                 model_level_offload=(
-                    od_config.enable_cpu_offload
-                    or getattr(od_config, "enable_distributed_layerwise_offload", False)
+                    od_config.enable_cpu_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
                 ),
             )
             if self.enable_cuda_graph_decode

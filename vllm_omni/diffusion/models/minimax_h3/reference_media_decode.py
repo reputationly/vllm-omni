@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Decoding a `ref2va` reference straight from its source container.
 
 The official path reads RGB24 frames and the real frame rate out of the source,

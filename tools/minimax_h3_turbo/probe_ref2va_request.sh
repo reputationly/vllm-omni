@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Serve one Ref2VA checkpoint and POST a ladder request verbatim, keeping the
 # engine up and recording the *body* of whatever the API answers.
 # Usage: probe_ref2va_request.sh TAG MODEL REQUEST_JSON

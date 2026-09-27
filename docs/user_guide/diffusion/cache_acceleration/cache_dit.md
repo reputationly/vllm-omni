@@ -1,6 +1,5 @@
 # Cache-DiT Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -71,6 +70,39 @@ omni = Omni(
 ---
 
 ## Example Script
+
+### Multi-Stage Models (MammothModa2)
+
+MammothModa2 is a multi-stage AR→DiT pipeline; the diffusion runner owns the
+Cache-DiT lifecycle of its DiT stage. Configure it on the **DiT stage entry**
+of the deploy YAML so the acceleration only applies to the denoising stage:
+
+```yaml
+# deploy YAML (see vllm_omni/deploy/mammoth_moda2.yaml)
+stages:
+  - stage_id: 1
+    # ... other DiT stage settings ...
+    cache_backend: cache_dit
+    cache_config:
+      Fn_compute_blocks: 1
+      Bn_compute_blocks: 0
+      max_warmup_steps: 4
+      residual_diff_threshold: 0.24
+      max_continuous_cached_steps: 3
+    enable_cache_dit_summary: true   # log skip-ratio stats per request
+```
+
+Behavior notes:
+
+- Only the repeated main-layer stack is cached; the Q-Former refiners always run.
+- Sequential-CFG parity requires the unconditional pass on every denoise step,
+  so the `cfg_range` skip optimization is not used: outside the interval CFG is
+  neutralized with `scale=1.0` instead of skipping the uncond forward.
+- Requests with `text_guidance_scale = 1.0` run with cache hooks disabled.
+- `residual_diff_threshold` defaults to `0.24` (measured ~1.7-2.2x at 50 steps,
+  PSNR 27-34 dB vs uncached). For 20-step generation — especially with a
+  partial `cfg_range` — use `0.12` for noticeably closer parity at a modest
+  speed cost.
 
 ### Offline Inference
 
@@ -167,7 +199,7 @@ OmniDiffusionSamplingParams(
 ```
 
 | Server startup | Request quality | Behavior |
-|---|---|---|
+| --- | --- | --- |
 | `--cache-backend cache_dit` | omitted | Use or restore the startup Cache-DiT profile |
 | `--cache-backend cache_dit` | `lossless` | Remove Cache-DiT hooks and run the reference path |
 | `--cache-backend cache_dit` | `high` | Use or install H3's conservative Cache-DiT profile |
@@ -235,7 +267,7 @@ SCM allows you to specify which steps must be computed and which can use cached 
 `scm_steps_mask_policy` options (number of compute steps out of 28):
 
 | Policy | Compute Steps | Speed | Quality |
-|--------|--------------|-------|---------|
+| -------- | -------------- | ------- | --------- |
 | `None` (default) | All | Baseline | Best |
 | `"slow"` | 18 / 28 | Moderate | High |
 | `"medium"` | 15 / 28 | Balanced | Good |
@@ -266,7 +298,7 @@ cache_config={
 In `cache_config` passed to `Omni` constructor, it accepts the arguments of `DBCacheConfig` ([Cache-DiT API Reference](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)). Key parameters are listed below:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `Fn_compute_blocks` | int | 1 | First n blocks for difference computation (optimized for single-transformer models) |
 | `Bn_compute_blocks` | int | 0 | Last n blocks for fusion |
 | `max_warmup_steps` | int | 4 | Steps before caching starts (optimized for few-step distilled models) |
@@ -305,6 +337,7 @@ In `cache_config` passed to `Omni` constructor, it accepts the arguments of `DBC
 **Symptoms**: Generated images have visible artifacts or lower quality
 
 **Solution**:
+
 ```python
 # Reduce aggressiveness - use more conservative settings
 cache_config={

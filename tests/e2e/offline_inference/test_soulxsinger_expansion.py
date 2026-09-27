@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """E2E offline inference tests for SoulX-Singer (single-stage, preprocess inline)."""
 
 import functools

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Normalizing a `ref2va` reference video onto MiniMax-H3's own 24 fps grid.
 
 Three steps, in this order, and the order is the contract:

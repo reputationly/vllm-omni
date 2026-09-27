@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Protocol models for the asynchronous image task API (GPUStack integration).
 
 Third sibling of ``audio_tasks.py`` (TTS) and ``audiogen_tasks.py`` (diffusion

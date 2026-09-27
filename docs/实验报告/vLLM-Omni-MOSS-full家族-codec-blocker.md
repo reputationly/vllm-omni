@@ -19,6 +19,7 @@
 ## 1. 崩溃现象
 
 以 MOSS-TTSD 为例,8B talker(stage0)加载正常,死在 stage1 codec:
+
 ```
 File ".../vllm_omni/model_executor/models/moss_tts/modeling_moss_tts_codec.py", line 680, in load_weights
 RuntimeError: MOSS Audio Tokenizer weights were not fully loaded:
@@ -32,13 +33,15 @@ RuntimeError: MOSS Audio Tokenizer weights were not fully loaded:
 ## 2. 根因(已核到权重与代码)
 
 **codec 加载流程**(`modeling_moss_tts_codec.py`):
+
 - `_build_codec()`(line 727)**先试 V2 类** `MossAudioTokenizerV2Model`,失败才回落 V1。
 - codec 路径来自 config `audio_tokenizer_name_or_path`,MOSS-TTSD config **未设**该字段 → 回落默认 `OpenMOSS-Team/MOSS-Audio-Tokenizer`。
 - `load_weights()`(line 604)带一套 `_SUFFIX_REMAP` 映射 v1/v2 命名差异。
 
 **权重实测**(`OpenMOSS-Team/MOSS-Audio-Tokenizer`,2 分片 safetensors,共 1600 键,16 个 proj 键):
+
 | 位置 | checkpoint 实际有 | 模型(vendored V2)期望 |
-|---|---|---|
+| --- | --- | --- |
 | encoder.{3,5} | `output_proj` | `input_proj`(缺) |
 | decoder.{0,2,4} | `input_proj` | `output_proj`(缺) |
 
@@ -57,7 +60,7 @@ RuntimeError: MOSS Audio Tokenizer weights were not fully loaded:
 MOSS-Audio-Tokenizer 是 **full-MOSS 家族共享 codec**(官方明确:服务 TTS/TTSD/VoiceGenerator/SoundEffect/Realtime)。故此 blocker 波及:
 
 | 模型 | codec | 状态 |
-|---|---|---|
+| --- | --- | --- |
 | MOSS-TTS-Nano | MOSS-Audio-Tokenizer-**Nano** | ✅ 可用(codec 不同,不受影响) |
 | MOSS-TTSD | MOSS-Audio-Tokenizer | ❌ stage1 codec 崩 |
 | MOSS-VoiceGenerator | MOSS-Audio-Tokenizer | ❌ 预期同样崩(同 codec) |

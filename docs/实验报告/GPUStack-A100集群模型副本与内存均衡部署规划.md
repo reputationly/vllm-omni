@@ -46,7 +46,7 @@
 ## 2. 目标副本数
 
 | 模型 | 单副本 GPU | 目标副本 | 占用 GPU | 物理节点数 |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | ace-step | 1 | 4 | 4 | 4 |
 | audiox | 1 | 4 | 4 | 4 |
 | indextts-2 | 1 | 4 | 4 | 4 |
@@ -66,7 +66,7 @@
 | wan2.2-flf2v | 4 | 2 | 8 | 2 |
 | wan2.2-i2v | 4 | 2 | 8 | 2 |
 | wan2.2-t2v | 4 | 2 | 8 | 2 |
-| **合计** |  | **64** | **112** | 28 台工作节点 |
+| **合计** | | **64** | **112** | 28 台工作节点 |
 
 SeedVR2、Wan2.2-VACE 保持 0 副本。
 
@@ -75,7 +75,7 @@ SeedVR2、Wan2.2-VACE 保持 0 副本。
 GPU 编号均为节点内的 `cuda:0`～`cuda:3`。
 
 | 节点 | cuda:0 | cuda:1 | cuda:2 | cuda:3 | 内存搭配说明 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 0001 | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | 四卡独占副本 1 |
 | 0002 | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | 四卡独占副本 2 |
 | 0003 | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v | 四卡独占副本 1 |
@@ -114,7 +114,7 @@ GPUStack 中每个模型使用 `spread`，并将 `gpu_selector.gpu_ids` 严格�
 以下为无业务请求时的只读快照；容器内存来自 cgroup，PSS/private 来自容器进程的 `/proc/*/smaps_rollup` 汇总。
 
 | 模型/部署 | 节点现状 | cgroup 内存 | 关键证据 | 判断 |
-|---|---:|---:|---|---|
+| --- | ---: | ---: | --- | --- |
 | Bernini + LTX2-v2a | 0009 | 139.4 + 75.2 GiB | Bernini 匿名内存约 134.7 GiB；LTX 配置开启 DiT/VAE/Gemma CPU offload | 当前把两个高 RAM 流式模型放在一起，是 0009 达到 225.6 GiB 的主因 |
 | Qwen Image ×2 + Edit ×1 | 0011 | 77.9 + 66.4 + 61.4 GiB | 三者配置均为 `cpu_offload=true, offload_granularity=block`；主机 shared 约 180 GiB、swap 已用约 3.3 GiB | 同节点堆叠三个 Qwen 不合理，应拆成每节点一个 |
 | Hunyuan Image 3 | 0021 | 197.9 GiB | residence 配置为 AR/DiT 双引擎、`sleep_level: 1`；PSS 约 185.7 GiB | 属于为 4×A100 40G 设计的主机权重驻留，不是异常泄漏 |
@@ -126,7 +126,7 @@ GPUStack 中每个模型使用 `spread`，并将 `gpu_selector.gpu_ids` 严格�
 原则不是统一打开或关闭 offload，而是优先采用各模型报告中已经验证的最快可用形态：
 
 | 分类 | 模型 | 已验证结论 |
-|---|---|---|
+| --- | --- | --- |
 | **应常驻显存** | Z-Image | bf16 单卡峰值 21.8 GiB、热态 7.64 秒；int8 慢 2.86 倍，多卡只快 1.21 倍。应保持 bf16 单卡无 offload。 |
 | **应常驻显存** | ACE-Step | XL Turbo + 4B LM 峰值 26.5 GiB，600 秒音乐仍可单卡运行，主机 Shmem 低于 200 MiB。 |
 | **应常驻显存** | Qwen3-TTS | 常驻约 18 GiB，近满上下文峰值约 26 GiB；单卡足够。 |
@@ -254,7 +254,7 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 目标副本：
 
 | 类型 | 模型 | 副本/物理节点 |
-|---|---|---:|
+| --- | --- | ---: |
 | 单卡 | ace-step、audiox、indextts-2、ltx2-v2a、qwen-image、qwen-image-edit、qwen3-tts、soulx-singer、z-image、ernie-image-turbo | 各3 |
 | 双卡 | bernini、moss-ttsd、moss-voicegen | 各3 |
 | 四卡 | wan2.2-t2v、wan2.2-i2v、wan2.2-flf2v、infinitetalk-480p | 各3 |
@@ -264,7 +264,7 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 精确节点规划：
 
 | 节点 | cuda:0 | cuda:1 | cuda:2 | cuda:3 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0001、0002、0015 | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v |
 | 0003、0004、0024 | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v |
 | 0005、0006、0026 | infinitetalk-480p | infinitetalk-480p | infinitetalk-480p | infinitetalk-480p |
@@ -284,7 +284,7 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 根据新的业务优先级，增加 `bernini`、`hunyuan-image-3`、`qwen-image`，将 `wan2.2-t2v` 和 `infinitetalk-480p` 均设为2节点：
 
 | 模型 | 目标副本/物理节点 | GPU/副本 | 总GPU |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | bernini | 4 | 2 | 8 |
 | hunyuan-image-3 | 3 | 4 | 12 |
 | qwen-image | 5 | 1 | 5 |
@@ -293,14 +293,14 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 | 其余9个单卡模型 | 各3 | 1 | 27 |
 | moss-ttsd、moss-voicegen | 各3 | 2 | 12 |
 | wan2.2-i2v、infinitetalk-720p、wan2.2-flf2v | 各3 | 4 | 36 |
-| **合计** |  |  | **116** |
+| **合计** | | | **116** |
 
 最终使用 **116张GPU/29台机器**，保留0030一台整机空闲。
 
 精确节点规划：
 
 | 节点 | cuda:0 | cuda:1 | cuda:2 | cuda:3 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0001、0002 | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v |
 | 0003、0004、0024 | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v |
 | 0005、0006 | infinitetalk-480p | infinitetalk-480p | infinitetalk-480p | infinitetalk-480p |
@@ -324,7 +324,7 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 ### 9.1 最终模型副本表
 
 | 模型 | GPU/副本 | 最终副本数 | 物理节点 | 总GPU |
-|---|---:|---:|---|---:|
+| --- | ---: | ---: | --- | ---: |
 | ace-step | 1 | 3 | 0009、0014、0015 | 3 |
 | audiox | 1 | 3 | 0010、0014、0023 | 3 |
 | bernini | 2 | 4 | 0009、0010、0014、0015 | 8 |
@@ -346,12 +346,12 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 | ernie-image-turbo | 1 | 3 | 0018、0019、0020 | 3 |
 | seedvr2 | — | 0 | 不部署 | 0 |
 | wan2.2-vace | — | 0 | 不部署 | 0 |
-| **总计** |  | **58个实例** | **29台业务节点** | **116** |
+| **总计** | | **58个实例** | **29台业务节点** | **116** |
 
 ### 9.2 最终30台节点逐卡表
 
 | 节点 | cuda:0 | cuda:1 | cuda:2 | cuda:3 | 说明 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 0001 | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | 四卡副本 |
 | 0002 | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | wan2.2-t2v | 四卡副本 |
 | 0003 | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v | wan2.2-i2v | 四卡副本 |
@@ -388,7 +388,7 @@ ERNIE 已变成“高显存、低主机内存”模型，和高主机内存的 Q
 GPU索引从0开始。双卡/四卡模型的同一行括号表示一个副本必须同时选择这些GPU；所有模型使用 `spread`，并将 `gpu_selector.gpu_ids` 限定为下表节点和GPU。
 
 | GPUStack模型名称 | 副本数 | 节点与GPU（从0开始） |
-|---|---:|---|
+| --- | ---: | --- |
 | `ace-step` | 3 | `dev-gpustack-a100-0009:[3]`；`dev-gpustack-a100-0014:[2]`；`dev-gpustack-a100-0015:[3]` |
 | `audiox` | 3 | `dev-gpustack-a100-0010:[3]`；`dev-gpustack-a100-0014:[3]`；`dev-gpustack-a100-0023:[3]` |
 | `bernini` | 4 | `dev-gpustack-a100-0009:[0,1]`；`dev-gpustack-a100-0010:[0,1]`；`dev-gpustack-a100-0014:[0,1]`；`dev-gpustack-a100-0015:[0,1]` |
@@ -418,7 +418,7 @@ GPUStack页面填写要点：单卡模型设置 `gpus_per_replica=1`，`bernini`
 部署完成后，GPUStack 在 0021、0022、0029 上显示约 76%～83% 的容器内存占用。只读检查结果如下：
 
 | 节点 | 容器内存 | MemAvailable | 共享内存 | 匿名内存 | Swap已用 | 重启/OOM |
-|---|---:|---:|---:|---:|---:|---|
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
 | 0021 | 208.3 GiB（82.96%） | 42 GiB | 172 GiB | 19.8 GiB | 353 MiB | 0 / false |
 | 0022 | 204.4 GiB（81.39%） | 42 GiB | 172 GiB | 19.8 GiB | 43 MiB | 0 / false |
 | 0029 | 191.6 GiB（76.30%） | 43 GiB | 172 GiB | 18.3 GiB | 1.8 GiB | 0 / false |

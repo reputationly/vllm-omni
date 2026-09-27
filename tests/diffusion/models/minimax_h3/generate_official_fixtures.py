@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Freeze the MiniMax-H3 official Diffusers contract into a JSON fixture.
 
 ``test_minimax_h3_official_contract.py`` compares vLLM-Omni against the fixture

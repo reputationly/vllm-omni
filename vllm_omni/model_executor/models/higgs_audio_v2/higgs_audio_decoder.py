@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HiggsAudio codec decoder kernel for higgs-audio v2.
 
 This module hosts the parameter-side building blocks for the higgs-audio-v2

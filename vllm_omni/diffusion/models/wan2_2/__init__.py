@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from vllm_omni.platforms import current_omni_platform
 
 from .patch_diffusers import patch_wan_rms_norm
 from .pipeline_wan2_2 import (
@@ -53,4 +55,5 @@ __all__ = [
     "WanVACETransformer3DModel",
 ]
 
-patch_wan_rms_norm()
+if current_omni_platform.is_npu():
+    patch_wan_rms_norm()

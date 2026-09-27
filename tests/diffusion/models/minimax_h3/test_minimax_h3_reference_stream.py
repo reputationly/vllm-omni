@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Bounded-memory `ref2va` reference decoding, against the buffered path.
 
 The buffered path is correct and unusable: admission gates the *compressed*

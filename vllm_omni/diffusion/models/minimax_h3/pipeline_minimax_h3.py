@@ -27,6 +27,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -52,17 +53,27 @@ from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
+    offload_streams_blocks,
     resolve_offload,
+    resolve_offload_strategy,
     should_offload_component,
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.progress import (
+    PHASE_DECODE,
+    PHASE_DENOISE,
+    PHASE_ENCODE,
+    PHASE_PREPARE,
+    report_phase,
+)
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -82,10 +93,19 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     prepare_encoder_inputs,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import build_minimax_h3_presentation
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    MINIMAX_H3_OUTPUT_SHORT_EDGE,
+    MINIMAX_H3_SUPPORTED_ASPECT_RATIOS,
+    _align_multiple,
+    build_minimax_h3_presentation,
+)
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
     deserialize_prepared_reference_videos,
+    load_video_audio,
+    load_video_frames,
+    prepare_reference_videos,
+    prepare_reference_videos_official,
 )
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
@@ -126,6 +146,16 @@ from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
     load_minimax_h3_native_lora,
 )
+from .ordered_references import (
+    MINIMAX_H3_ORDER_BUCKETS,
+    MINIMAX_H3_ORDER_REQUEST,
+    MiniMaxH3OrderedReference,
+    audio_bucket_slots,
+    canonical_order_from_buckets,
+    describe_order,
+    ordered_references_from_request,
+    visual_bucket_slots,
+)
 from .packed_sequence import (
     MINIMAX_H3_MAX_PAD_SEQ_LEN,
     MINIMAX_H3_SEQ_ALIGN,
@@ -138,16 +168,6 @@ from .packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
-from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
-    minimax_h3_rf_v_to_x0,
-)
-from .time_request import (
-    MINIMAX_H3_SHAPE_PLANNER,
-    minimax_h3_time_shift_sigmas,
-)
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
-from .ordered_references import MINIMAX_H3_ORDER_BUCKETS, MINIMAX_H3_ORDER_REQUEST, MiniMaxH3OrderedReference, audio_bucket_slots, canonical_order_from_buckets, describe_order, ordered_references_from_request, visual_bucket_slots
 from .reference_image_geometry import (
     MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET,
     MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
@@ -160,26 +180,17 @@ from .reference_image_geometry import (
 )
 from .reference_video_frames import vae_chunk_frame_count
 from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
+from .scheduling_minimax_h3_euler_ancestral import (
+    minimax_h3_euler_eta0_step,
+    minimax_h3_rf_v_to_x0,
+)
 from .strategy import MiniMaxH3InferenceStrategy, contract_environ, legacy_strategy, resolve_strategy
-from .time_request import minimax_h3_align_frame_count
-from vllm_omni.model_executor.models.minimax_h3.reference_video import (
-    load_video_audio,
-    load_video_frames,
-    prepare_reference_videos,
-    prepare_reference_videos_official,
+from .time_request import (
+    MINIMAX_H3_SHAPE_PLANNER,
+    minimax_h3_align_frame_count,
+    minimax_h3_time_shift_sigmas,
 )
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    MINIMAX_H3_OUTPUT_SHORT_EDGE,
-    MINIMAX_H3_SUPPORTED_ASPECT_RATIOS,
-    _align_multiple,
-)
-from vllm_omni.diffusion.progress import (
-    PHASE_DECODE,
-    PHASE_DENOISE,
-    PHASE_ENCODE,
-    PHASE_PREPARE,
-    report_phase,
-)
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
 from .vdn import VDNCheckpoint, resolve_vdn_checkpoint
 from .vdn_hybrid import validate_hybrid_runtime
 
@@ -207,6 +218,7 @@ MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
 MINIMAX_H3_TURBO_VIDEO_SHIFT = 6.0
 
 MINIMAX_H3_TURBO_SIGMA_POINTS = 5
+
 
 def _reference_image_short_edge() -> int:
     """ref2va 参考图被归一到的短边，默认 2048（保持既有行为）。
@@ -252,6 +264,7 @@ def _reference_image_short_edge() -> int:
         return MINIMAX_H3_REFERENCE_IMAGE_DEFAULT_TARGET
     return parse_reference_image_short_edge(raw)
 
+
 def _reference_image_no_upscale() -> bool:
     """置 1 时只缩不放：短边已小于目标的图不再被插值放大。
 
@@ -269,6 +282,7 @@ def _reference_image_no_upscale() -> bool:
     说明它不像是硬性要求。仅凭代码判不了，需要画质 A/B 才能决定是否翻默认值。
     """
     return parse_reference_image_no_upscale(os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV, ""))
+
 
 def _reference_image_max_pixels() -> int:
     """归一后的面积上限，0（默认）表示不封顶，保持既有行为。
@@ -301,12 +315,14 @@ def _output_max_pixels(short_edge: int | None = None) -> int:
         return MINIMAX_H3_OUTPUT_MAX_PIXELS
     return int(MINIMAX_H3_OUTPUT_MAX_PIXELS * (edge / MINIMAX_H3_OUTPUT_SHORT_EDGE) ** 2)
 
+
 def _allowed_output_short_edges() -> tuple[int, ...]:
     raw = os.getenv(_EXPERIMENTAL_SHORT_EDGE_ENV)
     if not raw:
         return (MINIMAX_H3_OUTPUT_SHORT_EDGE,)
     extra = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
     return tuple(dict.fromkeys((MINIMAX_H3_OUTPUT_SHORT_EDGE, *extra)))
+
 
 # EXPERIMENTAL. 768 is not a policy choice: the released weights are distilled at it, so
 # anything else leaves that distribution. 2026-08-30 rejected native 1080p on ``corr_all``,
@@ -351,6 +367,7 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
         "Ref2VA/transformer/**",
     ],
 }
+
 
 def _local_minimax_h3_partition(path: Path) -> str | None:
     """Read a local partition from its release metadata, not its directory name."""
@@ -414,6 +431,7 @@ def _resolve_minimax_h3_model_root(
             require_all=True,
         )
     )
+
 
 def _resolve_minimax_h3_partition_path(
     model: str,
@@ -513,6 +531,7 @@ def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
 # live while nobody is calling them. Measured on 4x A100-40G, the video VAE holds 9.700 GiB
 # on every rank from load until the process exits, and the denoise steps -- which is where
 # the peak is -- never touch it.
+
 
 def _resolve_minimax_h3_schedule(
     schedule: DMD2SigmaSchedule | None,
@@ -627,6 +646,7 @@ def get_minimax_h3_post_process_func(
     del od_config
     return _minimax_h3_post_process
 
+
 def _resolve_minimax_h3_aspect_ratio(
     task: str,
     value: Any,
@@ -674,6 +694,7 @@ def _resolve_minimax_h3_aspect_ratio(
         supported = ", ".join(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS)
         raise OmniClientError(f"MiniMax H3 aspect_ratio must be one of {supported}, got {value!r}")
     return numeric_value
+
 
 def _order_reference_conditions(
     references: Sequence[MiniMaxH3OrderedReference],
@@ -749,6 +770,7 @@ def _order_reference_conditions(
 
     return ordered_visual, ordered_visual_shapes, ordered_audio, ordered_audio_lengths, ref_blocks
 
+
 def _split_condition_rows(rows: torch.Tensor | None, counts: Sequence[int]) -> list[torch.Tensor]:
     """Cut a concatenated conditioning tensor back into its per-reference parts.
 
@@ -772,11 +794,13 @@ def _split_condition_rows(rows: torch.Tensor | None, counts: Sequence[int]) -> l
         cursor += int(count)
     return parts
 
+
 def _visual_condition_row_count(shape: Sequence[int]) -> int:
     """Packed rows one visual condition occupies, from its latent shape."""
     latent_t, latent_h, latent_w = (int(value) for value in shape)
     _, patch_h, patch_w = MINIMAX_H3_PATCH_SIZE
     return latent_t * (latent_h // patch_h) * (latent_w // patch_w)
+
 
 def _align_multiple_down(value: float, multiple: int = 32) -> int:
     """向下对齐。_align_multiple 用的是最近取整，会向上越过源尺寸（1008 -> 1024）。"""
@@ -846,6 +870,7 @@ def _dit_rank_world() -> tuple[Any, int, int]:
         return None, 0, 1
     group = get_world_group().device_group
     return group, dist.get_rank(group), dist.get_world_size(group)
+
 
 def _log_reference_order(references: Sequence[MiniMaxH3OrderedReference], mode: str) -> None:
     """Record one auditable order per request, rather than once per DiT rank."""
@@ -937,6 +962,7 @@ def _broadcast_tensor(
     dist.broadcast(output, src=0, group=group)
     return output
 
+
 def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
     """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
     if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
@@ -961,6 +987,7 @@ def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, i
         _align_multiple(width, 32),
     )
 
+
 def _reference_image_strategy_for_release(
     strategy: MiniMaxH3InferenceStrategy,
     *,
@@ -984,6 +1011,7 @@ def _reference_image_strategy_for_release(
         )
     return strategy
 
+
 def _reference_image_shape_for_strategy(
     image: Image.Image,
     *,
@@ -1002,6 +1030,7 @@ def _reference_image_shape_for_strategy(
         target_canvas=(output_width, output_height) if mode == "match" else None,
         fixed_area_pixels=strategy.reference_image_max_pixels if mode == "fixed_area" else None,
     )
+
 
 def _reference_image_shape(
     image: Image.Image,
@@ -1091,6 +1120,7 @@ def _reference_image_shape(
         out_height = min(out_height, _align_multiple_down(height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE))
     return (out_width, out_height)
 
+
 def _parity_dump_vision_inputs(vision_kwargs: dict) -> None:
     """The vision tower's input, for isolating preprocessing from execution.
 
@@ -1130,6 +1160,7 @@ def _parity_dump_vision_inputs(vision_kwargs: dict) -> None:
         (target / "vision_inputs.json").write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
     except Exception as exc:  # pragma: no cover
         logger.warning("MiniMax H3 parity vision dump failed (ignored): %s", exc)
+
 
 def _parity_dump_prompt_embeds(ids, hidden, tags, *, task: str, strategy) -> None:
     """Write the conditioning stage to disk when a parity run asks for it.
@@ -1185,6 +1216,7 @@ def _parity_dump_prompt_embeds(ids, hidden, tags, *, task: str, strategy) -> Non
     except Exception as exc:  # pragma: no cover - a dump must never fail a request
         logger.warning("MiniMax H3 parity dump failed (ignored): %s", exc)
 
+
 # 把 VAE 这类组件的"用前上卡、用后回主机"从 layerwise 开关里解耦出来。
 #
 # 2026-09-22 实测纠正:一度以为恢复上游的 enable_omni_model_cpu_offload 就能顶替它 ——
@@ -1202,6 +1234,7 @@ def _component_offload_requested() -> bool:
 
 
 MINIMAX_H3_PARITY_DUMP_ENV = "VLLM_OMNI_H3_PARITY_DUMP_DIR"
+
 
 def _broadcast_frame_array(
     frames: np.ndarray | None,
@@ -1277,6 +1310,7 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    supports_request_cancellation: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -1322,6 +1356,7 @@ class MiniMaxH3Pipeline(
     ) -> tuple[LoRAModel, PEFTHelper] | None:
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
+        self._clear_adaln_caches()
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
@@ -1469,17 +1504,16 @@ class MiniMaxH3Pipeline(
     def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
         """Hold a request to the contract of the artifact that is loaded.
 
-        Sigma-point count and both flow shifts vary across the Turbo family, so
+        Denoiser count and both flow shifts vary across the Turbo family, so
         each is checked against the adapter's own spec rather than a single
         published configuration.
         """
 
         extra = sampling.extra_args or {}
-        sigma_points = sampling.num_inference_steps
-        if sigma_points != spec.sigma_points:
+        if sampling.num_inference_steps != spec.denoise_steps:
             raise OmniClientError(
                 f"{spec.filename} is a {spec.denoise_steps}-step artifact and requires "
-                f"num_inference_steps={spec.sigma_points} "
+                f"num_inference_steps={spec.denoise_steps} "
                 f"({spec.sigma_points} sigma points produce {spec.denoise_steps} denoiser evaluations)"
             )
         try:
@@ -1737,6 +1771,21 @@ class MiniMaxH3Pipeline(
                 self._vdn_ref = resolve_vdn_checkpoint(od_config, self.transformers_ref, model_path=ref2va_model_path)
                 if self._vdn_ref is not None:
                     self.transformers_ref.enable_vdn_branches(**self._vdn_ref.spec.branch_kwargs())
+        self._configure_adaln_sidecar(
+            self.transformer,
+            "minimax_h3_adaln_cache_path",
+            expected_partition,
+            self._fasth3.source if self._fasth3 is not None else None,
+            eligible=transformer_quant_config is None and not modular,
+        )
+        if ref2va_model_path is not None:
+            self._configure_adaln_sidecar(
+                self.transformers_ref,
+                "minimax_h3_ref_adaln_cache_path",
+                "ref2va",
+                None,
+                eligible=transformer_quant_config is None and not modular,
+            )
 
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -1789,8 +1838,8 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and bool(
-            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
+        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and (
+            offload_streams_blocks(od_config)
         )
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
@@ -1820,7 +1869,7 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
         needs_component_cache = legacy_manual_components or offloads_text_encoder
-        if getattr(od_config, "enable_distributed_layerwise_offload", False) and needs_component_cache:
+        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
             if legacy_manual_components:
                 _register_dlo_component_cache(
@@ -1904,6 +1953,8 @@ class MiniMaxH3Pipeline(
                 # tensors to the stream, so they reach load_weights as ordinary
                 # named parameters of the modules enable_vdn_branch built.
                 stream = self._vdn.apply(stream)
+            if getattr(component, "_adaln_sidecar_candidate", None) is not None:
+                stream = self._verify_adaln_weights(component, stream)
             loaded = component.load_weights(stream)
             if prefix == "transformer.":
                 transformer_loaded = set(loaded)
@@ -1911,6 +1962,7 @@ class MiniMaxH3Pipeline(
                 ref_loaded = set(loaded)
             if prefix != "text_encoder.":
                 component.post_load_weights()
+                self._finish_adaln_sidecar(component)
             loaded_with_prefix.update(prefix + name for name in loaded)
         # The text encoder and both VAEs load eagerly in ``__init__`` rather
         # than through ``weights_sources``. Record them for the runner's strict
@@ -1946,6 +1998,89 @@ class MiniMaxH3Pipeline(
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
         return self._fasth3 is not None or self._vdn is not None or self._vdn_ref is not None
+
+    def _configure_adaln_sidecar(
+        self,
+        transformer: MiniMaxH3DiTModel,
+        key: str,
+        variant: str,
+        adapter_path: str | Path | None,
+        *,
+        eligible: bool,
+    ) -> None:
+        from safetensors import SafetensorError
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        from .adaln_cache import MiniMaxH3AdalnCache, file_digest
+
+        config = self.od_config.cache_config
+        path = config.get(key) if isinstance(config, Mapping) else getattr(config, key, None)
+        if path is None or not transformer.adaln_cache.max_bytes:
+            return
+        try:
+            # Compiled blocks bypass projection reuse. Reject before reading the
+            # sidecar so load completion cannot move an unused payload to GPU.
+            if not self.od_config.enforce_eager:
+                raise ValueError(
+                    "offline sidecars require --enforce-eager; compiled H3 blocks bypass cached projections"
+                )
+            if not eligible or get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("offline sidecar uses native BF16 TP1 math; use the default runtime cache here")
+            sidecar = MiniMaxH3AdalnCache(transformer.arch, path=path, model_variant=variant)
+            sidecar.bind_adapter(file_digest(adapter_path) if adapter_path is not None else None)
+            # Keep optional CPU-derived data outside the registered model tree.
+            object.__setattr__(transformer, "_adaln_sidecar_candidate", sidecar)
+        except (OSError, RuntimeError, TypeError, ValueError, SafetensorError) as exc:
+            logger.warning("Rejecting optional H3 AdaLN sidecar; runtime caching remains enabled: %s", exc)
+
+    @staticmethod
+    def _verify_adaln_weights(
+        component: MiniMaxH3DiTModel, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        for name, tensor in weights:
+            candidate = getattr(component, "_adaln_sidecar_candidate", None)
+            if candidate is not None:
+                try:
+                    candidate.verify_weight(name, tensor)
+                except ValueError as exc:
+                    object.__setattr__(component, "_adaln_sidecar_candidate", None)
+                    logger.warning("Rejecting optional H3 AdaLN sidecar: %s", exc)
+            yield name, tensor
+
+    @staticmethod
+    def _finish_adaln_sidecar(component: nn.Module) -> None:
+        from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+        candidate = getattr(component, "_adaln_sidecar_candidate", None)
+        if candidate is None:
+            return
+        try:
+            modules = {
+                f"blocks.{i}.adaln_proj.linear": block.adaln_proj.linear for i, block in enumerate(component.blocks)
+            }
+            modules["final_layer.adaln_proj.linear"] = component.final_layer.adaln_proj.linear
+            for module in (*modules.values(), component.time_embedder.proj_in, component.time_embedder.proj_out):
+                if getattr(module.quant_method, "_gemm_impl", None) is not default_unquantized_gemm:
+                    raise ValueError("offline sidecar requires the builder's torch linear backend")
+            candidate.finish_loading(component.video_patch_proj.weight.device)
+            component.adaln_cache.seed(candidate, modules)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("Rejecting optional H3 AdaLN sidecar; using runtime projections: %s", exc)
+        finally:
+            object.__setattr__(component, "_adaln_sidecar_candidate", None)
+
+    def _clear_adaln_caches(self) -> None:
+        for name in ("transformer", "transformers_ref"):
+            cache = getattr(getattr(self, name, None), "adaln_cache", None)
+            if cache is not None:
+                cache.clear()
+
+    def _prepare_adaln_adapter(self, sampling: OmniDiffusionSamplingParams) -> None:
+        request = getattr(sampling, "lora_request", None)
+        identity = None if request is None else (request.lora_int_id, request.lora_path, float(sampling.lora_scale))
+        if identity != getattr(self, "_adaln_adapter_identity", None):
+            self._clear_adaln_caches()
+            self._adaln_adapter_identity = identity
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
         if task == "ref2va" and hasattr(self, "transformers_ref"):
@@ -2049,20 +2184,15 @@ class MiniMaxH3Pipeline(
         min_seconds = round(min_frames / fps, 3)
         max_seconds = round(max_frames / fps, 3)
         if duration is not None:
+            duration_error = f"MiniMax H3 output duration must be in [{min_seconds:g}, {max_seconds:g}] seconds, "
             if isinstance(duration, bool):
-                raise OmniClientError(
-                    f"MiniMax H3 output duration must be in [{min_seconds:g}, {max_seconds:g}] seconds, got {duration!r}"
-                )
+                raise OmniClientError(duration_error + f"got {duration!r}")
             try:
                 duration = float(duration)
             except (TypeError, ValueError) as exc:
-                raise OmniClientError(
-                    f"MiniMax H3 output duration must be in [{min_seconds:g}, {max_seconds:g}] seconds, got {duration!r}"
-                ) from exc
+                raise OmniClientError(duration_error + f"got {duration!r}") from exc
             if not math.isfinite(duration) or not min_seconds <= duration <= max_seconds:
-                raise OmniClientError(
-                    f"MiniMax H3 output duration must be in [{min_seconds:g}, {max_seconds:g}] seconds, got {duration}"
-                )
+                raise OmniClientError(duration_error + f"got {duration}")
             requested_frames = int(round(duration * fps))
         elif int(sampling.num_frames or 1) > 1:
             requested_frames = int(sampling.num_frames)
@@ -2264,10 +2394,8 @@ class MiniMaxH3Pipeline(
         if _component_offload_requested():
             return True
         if getattr(od_config, "diffusion_offload_config", None) is None:
-            return bool(
-                getattr(od_config, "enable_layerwise_offload", False)
-                or getattr(od_config, "enable_distributed_layerwise_offload", False)
-            )
+            # The compatibility topology stages every component it can.
+            return offload_streams_blocks(od_config)
         return component is getattr(self, "text_encoder", None) and should_offload_component(
             od_config, TEXT_ENCODER_COMPONENT
         )
@@ -3227,6 +3355,10 @@ class MiniMaxH3Pipeline(
         additional_information = raw_prompt.get("additional_information") or {}
         encoder_output = additional_information.get("encoder_output")
         if encoder_output is None:
+            # Preserve main's text-only handoff for deployments that still
+            # encode media locally; a supplied unified payload takes priority.
+            encoder_output = additional_information.get("text_encoder_output")
+        if encoder_output is None:
             return None
         if not isinstance(encoder_output, Mapping):
             raise OmniClientError("MiniMax H3 encoder output must be a mapping")
@@ -3438,6 +3570,12 @@ class MiniMaxH3Pipeline(
                         video_shift=self.default_video_shift,
                         audio_shift=self.default_audio_shift,
                     )
+                if self._fasth3 is not None:
+                    self._fasth3.check_request(
+                        sampling,
+                        video_shift=self.default_video_shift,
+                        audio_shift=self.default_audio_shift,
+                    )
                 text_conditioning = self._extract_text_conditioning(raw_prompt)
                 if require_external_text and text_conditioning is None:
                     raise OmniClientError(
@@ -3555,7 +3693,9 @@ class MiniMaxH3Pipeline(
         if not blocks:
             return context
         num_images = sum(1 for block in blocks if block.get("kind") == "image")
-        video_has_audio = [block.get("kind") == "video_audio" for block in blocks if block.get("kind") in ("video", "video_audio")]
+        video_has_audio = [
+            block.get("kind") == "video_audio" for block in blocks if block.get("kind") in ("video", "video_audio")
+        ]
         num_audios = sum(1 for block in blocks if block.get("kind") == "audio")
 
         multi_modal_data = {}
@@ -3742,7 +3882,27 @@ class MiniMaxH3Pipeline(
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
 
+        self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
+        transformer = getattr(
+            self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
+        )
+        cache = getattr(transformer, "adaln_cache", None)
+        if cache is not None and cache.sidecar is not None:
+            mode = task
+            if task == "ref2va":
+                mode += "-mixed" if visual_shapes and audio_lengths else "-audio" if audio_lengths else "-image"
+            try:
+                cache.sidecar.check_request(
+                    mode=mode,
+                    num_steps=num_steps,
+                    base_schedule=base_schedule,
+                    flow_shift=float(extra.get("flow_shift", self.default_video_shift)),
+                    audio_flow_shift=float(extra.get("audio_flow_shift", self.default_audio_shift)),
+                )
+            except ValueError as exc:
+                logger.warning("Rejecting optional AdaLN sidecar for this schedule; using runtime cache: %s", exc)
+                cache.clear()
         quality_plan = self._quality_policy.resolve(
             quality=sampling.quality,
             num_inference_steps=num_steps,
@@ -3806,10 +3966,12 @@ class MiniMaxH3Pipeline(
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
+        check_request_cancellation()
         context = self._prepare_request_inputs(
             request.prompts[0],
             request.sampling_params,
         )
+        check_request_cancellation()
         denoise_kwargs = self._denoise_kwargs(context)
         num_outputs = context["num_outputs"]
         videos = []
@@ -3817,6 +3979,7 @@ class MiniMaxH3Pipeline(
         # Entering sampling; minimax_h3_denoise_loop reports the per-step detail.
         report_phase(PHASE_DENOISE)
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
+            check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
             if context.get("continuation") is None:
                 video_latent, audio_latent = self.diffuse(**output_kwargs)
@@ -3830,6 +3993,7 @@ class MiniMaxH3Pipeline(
                     text_conditioning=context.get("continuation_text_conditioning"),
                 )
             report_phase(PHASE_DECODE)
+            check_request_cancellation()
             if context["preencode_mp4"]:
                 videos.append(
                     self.decode_to_mp4(

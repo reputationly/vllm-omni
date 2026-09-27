@@ -24,6 +24,7 @@
 ## 1. 环境与 serve(单卡,SVS)
 
 **离线前置**(一次性):
+
 ```bash
 ROOT=/nfs-models/wuhanjisuan894/vllm-omni-speech
 # ① phone_set.json(GitHub 固定 commit;Mac/镜像下后 SFTP)
@@ -37,6 +38,7 @@ JSON
 ```
 
 serve:
+
 ```bash
 docker run -d --name omni-soulx --gpus '"device=0"' --memory=240g \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e HF_HOME=$ROOT/hf_cache \
@@ -63,10 +65,11 @@ curl -sS -X POST localhost:8093/v1/chat/completions -H 'Content-Type: applicatio
     "preprocess_weights_dir":"'"$ROOT"'/SoulX-Singer-Preprocess",
     "language":"Mandarin","control":"score","vocal_sep":false,"auto_shift":true,"pitch_shift":0}}'
 ```
+
 产物在 `choices[0].message.audio.data`(base64 WAV)。
 
 | extra_args | 说明 |
-|---|---|
+| --- | --- |
 | `prompt_metadata_path` / `target_metadata_path` / `audio_path` | **precomputed 模式**:预计算元数据(音符/歌词)+ 参考人声 wav → 跳过在线 preprocess |
 | `preprocess_weights_dir` | rmvpe 等(音高) |
 | `language` / `control` | Mandarin/Cantonese/English;`score`(曲谱)/`melody`(旋律) |
@@ -92,11 +95,12 @@ curl -sS -X POST localhost:8093/v1/chat/completions -H 'Content-Type: applicatio
 镜像 61bcf3d6,单卡 A100 40G。两条未验证链路真机跑通:
 
 | 用例 | 模式 | http | 声道/采样率 | 时长 | 判读 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | zh_prompt 音色唱 music(**喂原始音频**) | SVS 集成 preprocess | 200 | mono/24000 | 51.40s | ✅ 服务器内联 ASR+音符+音高+人声分离,免预计算 JSON;偶发个别字不清(ASR 识错) |
 | zh_prompt 音色转 music 歌声 | SVC 歌声转换 | 200 | mono/24000 | 51.48s | ✅ 换音色,无大问题 |
 
 **离线依赖/前置(内嵌固化清单 —— 均为镜像/cache 缺项,POC 逐一补齐验通)**:
+
 - **pip**:`BS-RoFormer`(人声分离+F0,SVC/集成 preprocess 都要)+ `g2pM`/`g2p-en`/`ToJyutping`(中/英/粤 G2P,集成 preprocess 识歌词后转音素要)
 - **NLTK 数据**:`averaged_perceptron_tagger` + `cmudict`(g2p-en 初始化时下,离线需预置)
 - **HF cache**:`openai/whisper-base`(SVC 的 WhisperEncoder 加载;`HF_HUB_OFFLINE=1` 下会崩 → 必须预填进 HF cache。HF 直连不通,用 `HF_ENDPOINT=https://hf-mirror.com` + `HF_HUB_DISABLE_XET=1` 下,~1.1G)
@@ -110,7 +114,7 @@ curl -sS -X POST localhost:8093/v1/chat/completions -H 'Content-Type: applicatio
 ## 4. 待补
 
 | 维度 | 待测 |
-|---|---|
+| --- | --- |
 | 控制 | melody vs score、pitch_shift、多语言(粤语/英文) |
 | 显存/时长 | 峰值显存、更长曲目、并发 |
 | 人声分离 | `vocal_sep=true`(带伴奏输入) |
@@ -120,7 +124,7 @@ curl -sS -X POST localhost:8093/v1/chat/completions -H 'Content-Type: applicatio
 ## 5. 一页速查
 
 | 维度 | 结论 |
-|---|---|
+| --- | --- |
 | 类型 | 歌声合成(SVS)/ 转换(SVC),FlowMatching 扩散 |
 | 端点 | `POST /v1/chat/completions`(多模态)+ `--deploy-config soulxsinger_svs.yaml` |
 | 启动 | 单卡 gpu_mem 0.5;`--trust-remote-code`;`DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN`;就绪判 `/health` |

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """BS-RoFormer vocal separation adapter (external pip package + SoulX chunking)."""
 
 from __future__ import annotations

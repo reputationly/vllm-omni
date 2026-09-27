@@ -31,6 +31,7 @@ def _proc_status_field(field: str) -> str:
         pass
     return "n/a"
 
+
 def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
     seen: set[int] = set()
     devices: list[tuple[torch.Tensor, torch.device]] = []

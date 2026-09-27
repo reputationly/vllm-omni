@@ -227,6 +227,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+# Our SPDX header policy puts two comment lines above the file-level noqa, so
+# N999 can never sit on line 1 here as ruff requires. The directory name is
+# upstream's ("ComfyUI-vLLM-Omni"), not a module we import.
+"apps/ComfyUI-vLLM-Omni/**" = ["N999"]
 # MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.
 # These files keep upstream conventions (star imports, long lines, math-symbol
 # argument names) so they stay easy to diff against upstream releases.
@@ -352,6 +356,7 @@ extend-ignore-identifiers-re = [
     ".*arange",
     ".*MoBA",
     ".*temperal_downsample",
+    ".*temperal_upsample",
     ".*_nd",
     ".*nd$",
     ".*EmbedND$",

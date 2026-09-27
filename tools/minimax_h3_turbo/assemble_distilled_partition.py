@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Assemble a vLLM MiniMax-H3 Turbo partition without copying model weights.
 
 The fused transformer, base components, and output must already live on the

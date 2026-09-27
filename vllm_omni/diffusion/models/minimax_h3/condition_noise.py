@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 visual/audio condition-noise augmentation.
 
 The request's condition timestep is applied to both the tensor value and the

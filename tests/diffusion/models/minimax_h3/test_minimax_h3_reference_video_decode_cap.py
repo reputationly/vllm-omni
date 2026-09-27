@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """How much of a reference video survives the HTTP layer's decode.
 
 Every H3 request is snapped up to the next ``17 * n + 5``, and the pipeline

@@ -1180,95 +1180,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
         return parts
 
-    async def _inject_audio_from_video_urls(
-        self,
-        messages: list[ChatCompletionMessageParam],
-    ) -> list[ChatCompletionMessageParam]:
-        """Pre-extract audio from video URLs and inject as audio_url content items.
-
-        When use_audio_in_video=True, the qwen2_5_omni_thinker multimodal
-        processor requires that the number of audio items equals the number of
-        video items (it subtracts mm_counts["video"] from mm_counts["audio"]).
-        The client only sends video_url items; this method adds the matching
-        audio_url items on the server side before the renderer processes them.
-        """
-        import io
-
-        from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
-
-        new_messages: list[ChatCompletionMessageParam] = []
-        for msg in messages:
-            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
-            if not isinstance(content, list):
-                new_messages.append(msg)
-                continue
-
-            video_urls = [
-                part.get("video_url", {}).get("url")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "video_url" and part.get("video_url", {}).get("url")
-            ]
-
-            if not video_urls:
-                new_messages.append(msg)
-                continue
-
-            audios = await asyncio.gather(*(extract_audio_from_video_async(u) for u in video_urls))
-
-            audio_items: list[dict] = []
-            for audio_array, sample_rate in audios:
-                buf = io.BytesIO()
-                if soundfile is not None:
-                    soundfile.write(buf, audio_array, samplerate=int(sample_rate), format="WAV")
-                else:
-                    import struct
-
-                    import numpy as np
-
-                    audio_np = np.asarray(audio_array, dtype=np.float32)
-                    sr = int(sample_rate)
-                    num_channels = 1
-                    bits_per_sample = 32
-                    num_frames = len(audio_np)
-                    data_size = num_frames * num_channels * (bits_per_sample // 8)
-                    # Write minimal RIFF/WAV header
-                    buf.write(b"RIFF")
-                    buf.write(struct.pack("<I", 36 + data_size))
-                    buf.write(b"WAVE")
-                    buf.write(b"fmt ")
-                    buf.write(
-                        struct.pack(
-                            "<IHHIIHH",
-                            16,
-                            3,
-                            num_channels,
-                            sr,
-                            sr * num_channels * (bits_per_sample // 8),
-                            num_channels * (bits_per_sample // 8),
-                            bits_per_sample,
-                        )
-                    )
-                    buf.write(b"data")
-                    buf.write(struct.pack("<I", data_size))
-                    buf.write(audio_np.tobytes())
-
-                audio_b64 = base64.b64encode(buf.getvalue()).decode()
-                audio_items.append(
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
-                    }
-                )
-
-            new_content = list(content) + audio_items
-            if isinstance(msg, dict):
-                new_msg = {**msg, "content": new_content}
-            else:
-                new_msg = msg.model_copy(update={"content": new_content})
-            new_messages.append(new_msg)
-
-        return new_messages
-
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
 
@@ -2439,6 +2350,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         kv_transfer_params = None
         response_metrics: dict[str, Any] | None = None
 
+        # For text+audio requests the audio final output shares output
+        # indexes with the text final output. Collect audio choices and
+        # merge them into the matching text choice after the loop instead
+        # of appending duplicate-index choices (#7376).
+        pending_audio_choices: list[OmniChatCompletionResponseChoice] = []
+
         # Build requested modalities set for filtering
         requested_modalities = (
             set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
@@ -2488,9 +2405,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
-                if isinstance(choices_data, ErrorResponse):
-                    return choices_data
+                audio_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                if isinstance(audio_data, ErrorResponse):
+                    return audio_data
+                pending_audio_choices.extend(audio_data)
+                choices_data = []
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2508,6 +2427,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if extra:
                     response_metrics.update(extra)
             choices.extend(choices_data)
+
+        if pending_audio_choices:
+            choices = self._merge_audio_choices(choices, pending_audio_choices)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 
@@ -2820,6 +2742,37 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         kv_transfer_params = final_res.kv_transfer_params
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
+
+    def _merge_audio_choices(
+        self,
+        choices: list[ChatCompletionResponseChoice],
+        audio_choices: list[OmniChatCompletionResponseChoice],
+    ) -> list[ChatCompletionResponseChoice]:
+        """Fold audio outputs into the matching text choice (#7376).
+
+        A non-streaming chat request with ``modalities=["text", "audio"]``
+        produces two final outputs (text and audio) whose entries share the
+        same output index. Appending both as separate choices yields
+        duplicate ``index`` values, and clients that read ``choices[0]``
+        never see the audio. Merge the audio object and its metadata into
+        the choice with the matching index; audio-only requests (no text
+        choice) keep the standalone audio choice.
+        """
+        for audio_choice in audio_choices:
+            for i, existing in enumerate(choices):
+                if existing.index != audio_choice.index:
+                    continue
+                merged = OmniChatCompletionResponseChoice(
+                    **existing.model_dump(exclude={"message"}),
+                    message=existing.message,
+                    audio_metadata=audio_choice.audio_metadata,
+                )
+                merged.message.audio = audio_choice.message.audio
+                choices[i] = merged
+                break
+            else:
+                choices.append(audio_choice)
+        return choices
 
     def _create_audio_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False

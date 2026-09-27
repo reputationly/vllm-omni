@@ -16,6 +16,7 @@ base `vllm/vllm-openai:v0.25.0`(官方 arm64)+ vllm-omni **main@62589203**(= 当
 → **它已经是全模型镜像**,和 `indextts2:arm64-a100-latest`(GPUStack 生产引擎包)是两回事。
 
 **两条路二选一:**
+
 - **复用**:直接 pull `vllm-omni:arm64-a100-20260714` 到 16-20,当前 commit 无新增模型就够用。
 - **重打(本手册主线,便于以后自持)**:同一条命令出一个新日期 tag,流程如下。
 
@@ -24,7 +25,7 @@ base `vllm/vllm-openai:v0.25.0`(官方 arm64)+ vllm-omni **main@62589203**(= 当
 ## 1. 硬约束与预检(构建期确认,避免上机白跑)
 
 | 项 | 要求 | 验证 |
-|---|---|---|
+| --- | --- | --- |
 | base 架构 | `vllm/vllm-openai:v0.25.0` 官方带 **arm64** manifest | `docker manifest inspect vllm/vllm-openai:v0.25.0 \| grep arm64` |
 | GPU kernel | torch + vllm `.so` 含 **sm_80** | 见 §3 预检命令 |
 | base tag | **必须覆盖默认的 v0.24.0** → 用 v0.25.0 | Dockerfile ARG 默认 stale,构建时 `--build-arg` 显式给 |
@@ -129,7 +130,7 @@ run() {  # run <子目录> <端口> [额外参数...]
 > 下表"额外参数"列是模板之外要补的 flag。端点默认 `POST /v1/audio/speech`,注明的除外。
 
 | 子目录 | 模型 | ★ | 额外参数 | 端点 / 关键请求参数 | 输入要求 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `Qwen3-TTS-1.7B-CustomVoice` | Qwen3-TTS | ★1 | (无,自动加载 `qwen3_tts.yaml`) | `/v1/audio/speech`:`voice`=预设音色、`instructions`=风格 | **有预设音色**,无需 ref |
 | `VoxCPM2` | VoxCPM2 | ★2 | (无) | `/v1/audio/speech`:`ref_audio` 可选 | 可预设可克隆;**48k** |
 | `Fun-CosyVoice3-0.5B-2512` | CosyVoice3 | ★2 | (无) | `/v1/audio/speech`:`ref_audio`+`ref_text` | **克隆必需** ref_audio+ref_text |
@@ -145,10 +146,12 @@ run() {  # run <子目录> <端口> [额外参数...]
 ### 4.2 MOSS 三兄弟共享 codec(已补进下载脚本)
 
 MOSS-Nano / Realtime / VoiceGenerator 起服务要一份 codec(上游默认从 HF 自动拉,`HF_HUB_OFFLINE=1` 下必须本地有)。已加进 `download_speech_models.sh` 默认集:
+
 - `moss_codec` → `OpenMOSS-Team/MOSS-Audio-Tokenizer`(Realtime / VoiceGenerator 用)
 - `moss_codec_nano` → `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano`(Nano 用)
 
 起服务时给容器传 `-e MOSS_TTS_CODEC_PATH=$ROOT/MOSS-Audio-Tokenizer`(Nano 用 `-Nano` 那个)。补下命令:
+
 ```bash
 MODELS="moss_codec moss_codec_nano" bash download_speech_models.sh
 ```

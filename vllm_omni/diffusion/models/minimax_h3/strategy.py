@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Which MiniMax-H3 contract an instance serves, resolved once at startup.
 
 Two orthogonal dimensions, deliberately kept apart:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The random draws of one MiniMax-H3 request, in one testable place.
 
 A request draws three kinds of noise — one per visual condition, then the target

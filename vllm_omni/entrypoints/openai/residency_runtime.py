@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Construction and lifetime of a co-located, exclusively-resident engine group.
 
 Ties together the declaration (:mod:`residency_config`) and the mutual-exclusion

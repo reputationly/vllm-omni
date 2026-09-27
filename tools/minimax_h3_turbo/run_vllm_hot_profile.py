@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Run one warmup plus one measured MiniMax-H3 request against a TP engine."""
 
 from __future__ import annotations

@@ -1,6 +1,5 @@
 # VAE Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -18,12 +17,12 @@
 VAE parallelism distributes VAE (Variational AutoEncoder) decode/encode work across multiple GPUs. This guide covers VAE patch/tile parallelism, which splits latent space into spatial tiles or patches, and Wan spatial-shard decode, which shards decoder feature maps along height or width.
 
 This is particularly useful for:
+
 - **High-resolution image generation** where VAE decode can become a memory bottleneck
 - **Memory-constrained environments** where the VAE decode activation peak exceeds available VRAM
 - **Multi-GPU setups** where you want to leverage distributed resources for the VAE stage
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
-
 
 VAE patch parallelism uses two strategies based on image size:
 
@@ -31,7 +30,6 @@ VAE patch parallelism uses two strategies based on image size:
 |----------|----------|--------------|------------------|----------------|
 | **Tiled Decode** | Large images (triggers VAE tiling) | Distributes existing VAE tiling computation across ranks. Each rank decodes a subset of overlapping tiles. | Uses VAE's native `blend_v` and `blend_h` functions to seamlessly merge overlapping regions | Bit-identical (same logic as single-GPU tiling) |
 | **Patch Decode** | Small images (no VAE tiling) | Splits latent into spatial patches with halos. Each rank decodes one patch with boundary context. | Halo regions provide edge context; core regions are directly stitched without blending | Near-identical (diff < 0.5%, visually imperceptible) |
-
 
 VAE Patch Parallelism **reuses the DiT process group** (`dit_group`) and does not initialize a separate ProcessGroup. This means:
 
@@ -194,6 +192,7 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 ### Common Issue 1: Model Not Support VAE Patch Parallel
 
 **Symptoms**:
+
 ```
 WARNING: vae_patch_parallel_size=2 is set but VAE patch parallelism is NOT enabled for xxxPipeline; ignoring.
 ```
@@ -217,7 +216,6 @@ if vae_pp_size > 1 and not is_distributed_vae:
 
 2. To add support for a new model, implement `DistributedVaeMixin` on its VAE class (contributions are welcome).
 
-
 ### Common Issue 2: `vae_patch_parallel_size` Exceeds DiT Process Group Size
 
 **Symptoms**: Shows warning message, and vae patch parallel size is resized to DiT process group size
@@ -227,6 +225,7 @@ if vae_pp_size > 1 and not is_distributed_vae:
 **Recommendation**: Always set `vae_patch_parallel_size` to be no greater than your DiT process group size.
 
 Note that the size of DiT process group size equals to:
+
 ```text
 dit_parallel_size = data_parallel_size
                   × cfg_parallel_size
@@ -235,6 +234,7 @@ dit_parallel_size = data_parallel_size
                   × tensor_parallel_size
 
 ```
+
 _sequence_parallel_size = ulysses_degree × ring_degree_
 
 ---

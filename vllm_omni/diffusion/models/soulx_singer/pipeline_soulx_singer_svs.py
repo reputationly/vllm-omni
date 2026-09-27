@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """SoulX-Singer SVS (score-driven) pipeline implementation."""
 
 from collections.abc import Iterable

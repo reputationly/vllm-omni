@@ -26,6 +26,7 @@ The available parameters belonging to (Qwen2Model) are: {'layers.*', 'embed_toke
 ```
 
 **分析**:
+
 - Ming-omni-tts 的 checkpoint 里带 `lm_head.*` 权重,但 vllm-omni 给它套用的是 **`Qwen2Model`**(不含 `lm_head` 的裸 backbone,`lm_head` 属于 `Qwen2ForCausalLM`)。
 - `AutoWeightsLoader` 试图把 `lm_head` 塞进 `Qwen2Model` → 找不到该参数 → `ValueError`,引擎核初始化失败 → `Orchestrator initialization failed`。
 - 属于**模型注册/权重映射不匹配**:要么该模型的类应为 `*ForCausalLM`(含 lm_head),要么其 `load_weights` 需 skip/映射 `lm_head`。
@@ -49,7 +50,7 @@ docker logs omni-ming 2>&1 | grep "no module or parameter named 'lm_head'"
 ## 3. 处置
 
 | 项 | 结论 |
-|---|---|
+| --- | --- |
 | 现状 | ❌ 启动即崩,无法服务 |
 | 类别 | vllm-omni 模型适配代码 bug(`lm_head` vs `Qwen2Model`) |
 | 是否本轮可救 | 否(需改模型实现,非部署侧) |

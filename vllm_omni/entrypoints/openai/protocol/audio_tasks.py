@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Protocol models for the asynchronous audio task API (GPUStack integration).
 
 Mirrors the async task contract used by LightX2V / IndexTTS so the GPUStack

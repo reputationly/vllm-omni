@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for vllm-project/vllm-omni#5349 (P1): normal completion
 goes through _free_request(), not finish_requests() (the external
 abort/cancel entry point). Without a cleanup_receiver() call there,

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """SoulX-Singer OpenAI-compatible chat client (SVS / SVC).
 
 Sends prompt audio via ``input_audio`` and target accompaniment via

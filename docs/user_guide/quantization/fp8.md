@@ -17,7 +17,7 @@ in deep DiT blocks.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| -------- | --------- |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
@@ -65,7 +65,17 @@ vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
 `QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
 In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
 the image — so the first cold start does not recompile. The engine's startup dummy
-run already exercises the kernels, so with a warm cache the first real request is fast.
+run exercises the kernels, but new shapes, layouts, dtypes, or bias settings may
+still need compilation or tuning. The warmup helper uses inference mode and
+transposed weights without bias. Daemon workers compile candidates in-process
+while retaining autotuning and caching.
+
+Scale validation and Quack/FlashInfer dispatch run inside a PyTorch custom op.
+This keeps layer-specific scale addresses and validation-cache updates out of
+Dynamo tracing without introducing a graph break. Unpopulated scales and Quack
+failures still fall back to FlashInfer at runtime. CUDA graph capture additionally
+requires warming the dispatch with populated scales; Python validation and
+dispatch do not rerun during CUDA graph replay.
 
 To pre-warm specific shapes (e.g. at image build time):
 
@@ -83,7 +93,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ### Diffusion Models
 
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
-|-------|-----------|:-------:|:------:|----------------|------------------|------------------|
+| ------- | ----------- | :-------: | :------: | ---------------- | ------------------ | ------------------ |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
 | Qwen-Image-2.1 | `Qwen/Qwen-Image-2.1` | Yes | Not validated | Skip image-stream MLPs for best fidelity; all-layer FP8 is loadable but composition drifts on some prompts. On Blackwell GB200 FP8 saves ~17% peak memory but is not faster than BF16 at 1024x1024. Text encoder FP8 covers the language model only — the vision tower and LM head stay BF16 | `img_mlp` | ✅︎ (language model only) |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
@@ -152,7 +162,7 @@ For a pipeline that exposes both a transformer and a quantization-aware text
 encoder, the scope is:
 
 | Configuration | Transformer | Text encoder | Components without supported quantizable layers |
-|---------------|-------------|--------------|-------------------------------------------------|
+| --------------- | ------------- | -------------- | ------------------------------------------------- |
 | `quantization="fp8"` | FP8 | FP8 | checkpoint precision |
 | `{"transformer": {"method": "fp8"}}` | FP8 | checkpoint precision | checkpoint precision |
 | `{"text_encoder": {"method": "fp8"}}` | checkpoint precision | FP8 | checkpoint precision |
@@ -201,7 +211,7 @@ does not fit the workload.
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | - | Quantization method (`"fp8"`) |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16 |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling, or `"static"` when scales are available |

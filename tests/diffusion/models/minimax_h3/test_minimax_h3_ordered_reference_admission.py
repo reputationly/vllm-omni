@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Whether an ordered ``references`` list can be admitted at the HTTP boundary.
 
 ``POST /v1/tasks/video/`` *manufactures* ``reference_order`` from every

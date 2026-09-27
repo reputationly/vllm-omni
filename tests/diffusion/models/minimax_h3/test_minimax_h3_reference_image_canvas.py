@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Whether the serving layer binds reference images to the generated canvas.
 
 Historically it always did: any request carrying ``width``/``height`` had every

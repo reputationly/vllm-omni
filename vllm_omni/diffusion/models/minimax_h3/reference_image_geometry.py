@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The reference-image short edge: its bounds, and the one parser for it.
 
 This module exists because the knob had grown *two* parsers with different

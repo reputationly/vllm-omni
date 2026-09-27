@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for Phase 1 foundation types (RFC #1601).
 
 Note: Uses importlib to load modules directly, bypassing the vllm_omni

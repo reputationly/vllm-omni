@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The MiniMax-H3 request RNG contract, both modes.
 
 ``legacy`` must keep producing exactly what the pipeline produced before the

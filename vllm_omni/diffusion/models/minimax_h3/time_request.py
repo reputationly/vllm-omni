@@ -40,7 +40,7 @@ def _time_shift_sigmas(
     shift_scale: float = 6.0,
     base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
-    """Build a shifted sigma schedule.
+    """Build N + 1 sigma boundaries for N denoiser evaluations.
 
     ``base_schedule`` supplies the rectified-flow positions explicitly and takes
     precedence over ``num_steps``. Distilled checkpoints need it because their
@@ -64,9 +64,6 @@ def _time_shift_sigmas(
 
     import torch
 
-    if num_steps <= 0:
-        raise ValueError("MiniMax H3 num_steps must be > 0")
-
     # The rectified-flow sigma range is fixed at [1.0, 0.0].
     # Diffusers counts denoising intervals (transformer evaluations), while a
     # sigma trajectory contains both ends of every interval.  N requested
@@ -80,7 +77,6 @@ def _time_shift_sigmas(
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
     return [float(value) for value in shifted.tolist()]
 
 

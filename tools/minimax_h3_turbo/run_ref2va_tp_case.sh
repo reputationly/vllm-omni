@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # The same Ref2VA request the TP4 ladder runs, on a single card.
 # Usage: run_ref2va_tp1_case.sh RUNG MODEL [PREFIX]
 #
