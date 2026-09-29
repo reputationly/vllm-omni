@@ -75,11 +75,17 @@ VAE 并行或 CPU offload 参数；它们已在 YAML 中统一固定。
 VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S=7200
 VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200
 VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0
+VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=7200
 VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE=1
 VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK=8
 VLLM_OMNI_H3_INFERENCE_CONTRACT=legacy
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
+
+`VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` 是 2026-09-29 补的第四条假墙：扩散 `execute_model` 的 RPC
+预算默认 **600 秒**（`diffusion/executor/multiproc_executor.py:48`），超时会把整个 worker 组
+关掉，症状是"这条 500 RPC timeout、之后的请求全报 `no live replica`"；而 30 秒档 768p 单条
+`diffuse` 就要 608.5 s，正好越线。详见《生产部署档》§3.2 的说明。
 
 灰度期可再加 `VLLM_OMNI_H3_LOG_STEP_MEMORY=1`；稳定后改为 `0` 或删除，避免长期打印
 每步显存。Ref2VA YAML 保留 Base 的固定面积策略；选择带 `distilled` 元数据的 Ref

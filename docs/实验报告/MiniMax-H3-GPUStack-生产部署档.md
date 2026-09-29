@@ -72,6 +72,7 @@ key 不叫 `minimax_h3` 是第二道保险：`minimaxh3` 正好是 `minimaxh3fl2
 export VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S=7200   # 假墙 2：默认 30 s，大分辨率必超时
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200       # 假墙 3：注意无 _S 后缀
 export VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0        # 假墙 1：置 0 关闭
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=7200      # 假墙 4：默认 600 s，30 秒档必超时
 export VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE=1   # 进 VAE 前把 DiT 换出，腾 ~12.9 GiB/卡
 export VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK=8   # VAE 后处理分块，拆掉整片 float32 缓冲（#45）
 export VLLM_OMNI_H3_LOG_STEP_MEMORY=1          # 可选：每步打显存，排查用，稳定后可关
@@ -108,9 +109,10 @@ exec vllm serve /nfs-data/models/MiniMax-H3-FL2VA-INT8 --omni --host 0.0.0.0 --p
 那一大串换成一个文件：
 
 ```bash
-export VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S=7200   # 六个 env 一个都不能少，见下
+export VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S=7200   # 七个 env 一个都不能少，见下
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200
 export VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=7200
 export VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE=1
 export VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK=8
 export VLLM_OMNI_H3_LOG_STEP_MEMORY=1
@@ -122,11 +124,24 @@ exec vllm serve /nfs-data/models/MiniMax-H3-FL2VA-INT8 --omni --host 0.0.0.0 --p
 
 **两样东西挪不进 YAML，别试**（都已按代码核过，不是猜的）：
 
-1. **六个 `VLLM_OMNI_*` 环境变量**。stage 级 `env:` 会被解析进 `StageDeployConfig.env`
+1. **七个 `VLLM_OMNI_*` 环境变量**。stage 级 `env:` 会被解析进 `StageDeployConfig.env`
    然后原地丢掉——`stage_runtime_env` / `stage_runtime_setup`（`engine/stage_init_utils.py`）
    没有活的调用方，生产路径 `stage_engine_startup.py` → `setup_stage_devices` 只传 `devices`。
 2. **`--init-timeout` / `--stage-init-timeout`**。既不是 `StageDeployConfig` 字段，
    也不是 pipeline-wide 字段，写进 YAML 会落进 `engine_extras` 再被过滤掉。
+
+> **`VLLM_OMNI_DLO_DP_WAVE_TIMEOUT`（假墙 4，2026-09-29 补）**
+> 它给扩散的 `execute_model` RPC 封了**默认 600 秒**的预算
+> （`diffusion/executor/multiproc_executor.py:48`），超时后走
+> `_fail_closed_on_dp_wave_timeout` **主动关掉整个 worker 组**——于是**下一条**请求拿到的是
+> `Stage-0 has no live replica`，真正的报错留在上一条的
+> `DLO DP collective wave timed out after 600.0s` 里。2026-09-25 的 `af46abebb`（#7745）
+> 把它从"仅在 AllGather 生效"改成对 `execute_model` 无条件生效，而**仓库里没有任何部署档、
+> tools 脚本或本手册设过它**——这就是 30 秒档第一次跑必然失败的原因。
+>
+> 实测（gpu36，fl2va VDN-INT8，4×A100-40G）：30 秒档 768p 单条 `diffuse` 就要 **608.5 s**，
+> 已经越过 600。不设它的症状是"请求跑了十分钟然后 500，之后所有请求都说 no live replica"，
+> **而被掐死的那条其实已经把去噪跑完了**——别看着 500 先去怀疑显存。
 
 另外 `--num-gpus 4` 不用传：`num_gpus` 由 `parallel_config.world_size` 推导
 （tp4×sp1×cfg1 = 4，`stage_init_utils.py:1382`）。
@@ -202,6 +217,8 @@ curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
 > 由此也解释了一个坑：归档里 362 帧的 768p 用例，当初是用 `duration=15.0`
 > 提交、由对齐得到 362 帧的。把 362 直接当 `num_frames` 回填会 400
 > （15.083 > 15）——旧边界下复现旧用例必须提 `duration`，不是提对齐后的帧数。
+
+<!-- -->
 
 > **注：`aspect_ratio` 该不该恒传，代码与实测对不上，按「恒传」执行。**
 > 92ad602c 记的是「传了 `width`/`height` 就可省（实测 200）」，但代码里
