@@ -63,13 +63,29 @@ stages:
     max_num_seqs: 1
     devices: "0,1,2,3"
 
-    # The two VAEs are 10.26 GiB per rank and the denoise steps never touch them, but
-    # `_component_on_device` only stages them when this is set: the staging path used to be
-    # gated behind layerwise offload, which is a different job (streaming the DiT's blocks)
-    # that this deployment does not want. Measured at 15s@1080p: denoise peak 35.79 ->
-    # 25.53 GiB, warm 708s -> 629s. Costs 10.26 GiB per rank of HOST memory instead, so
-    # drop caches before starting if the box has been reading checkpoints all day.
+    # 短边 1080 生成档，**追加式**（768 仍然合法）。
+    #
+    # ⚠️ **本档是 ref2va，而这条 env 对 ref2va 是惰性的**（2026-09-29 实测）。Ref2VA
+    #   接受具名 aspect_ratio、参考图不绑定输出画布，所以网关侧 h3ApplyCanvas 会按
+    #   （短边, 比例）推出 width/height 发过来；而引擎的 `_resolve_output_canvas` ——
+    #   唯一读 `_allowed_output_short_edges()` 白名单的地方 —— **只在 height/width 都
+    #   缺省时才会被调用**。实测（env 故意不设、只发显式画布）：
+    #
+    #     width=1920 height=1056 → 200，出片 1920×1056
+    #
+    #   也就是说 ref2va 不需要这条 env 也能出 1080p；留着的唯一用途是堵"任何不带显式
+    #   画布的直连 1080 请求会被 400"那条缝。fl2va 那边正相反（画布不由网关给、短边
+    #   只能由请求字段给），两个都必需。
+    #
+    # --- continuation（长视频）与 1080p 的关系，见本文件末尾的专段 ---
     env:
+      VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE: "1080"
+      # The two VAEs are 10.26 GiB per rank and the denoise steps never touch them, but
+      # `_component_on_device` only stages them when this is set: the staging path used to be
+      # gated behind layerwise offload, which is a different job (streaming the DiT's blocks)
+      # that this deployment does not want. Measured at 15s@1080p: denoise peak 35.79 ->
+      # 25.53 GiB, warm 708s -> 629s. Costs 10.26 GiB per rank of HOST memory instead, so
+      # drop caches before starting if the box has been reading checkpoints all day.
       VLLM_OMNI_H3_OFFLOAD_COMPONENTS: "1"
 
     enable_cpu_offload: true
@@ -103,3 +119,73 @@ stages:
     default_sampling_params:
       # VDN 的 turbo 是 8 步；flow_shift 同样从制品的 metadata.json 读，见硬约束 4。
       num_inference_steps: 8
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 长视频：只有本档（ref2va）能用 continuation，而且**必须改网关**才能到 30 秒以上
+# ─────────────────────────────────────────────────────────────────────────────
+# 引擎的三档时长常量（`model_executor/models/minimax_h3/long_video.py`）：
+#
+#   long_video 未开                  → 15 s
+#   long_video=true + full           → 30 s
+#   long_video=true + continuation   → 300 s，**仅 Ref2VA**
+#
+# **fl2va 没有 continuation 这条路**：`continuation.py:57` 对 `task != "ref2va"` 直接
+# raise。所以 fl2va 的上限硬停在 30 秒（full），这不是取舍，是引擎约束。
+#
+# ## 未给 mode 时的默认值是 continuation —— 是我们的网关把它按成 full 的
+#
+#   mode = extra.get("long_video_mode", "continuation" if long_video and task == "ref2va" else "full")
+#
+# 网关（new-api `minimax_h3.go`）现在无条件注入 `long_video_mode="full"`，于是
+# **>30 秒的 ref2va 请求现在必然 400**（full 的上限就是 30）。要在本档出 30 秒以上，
+# 注入规则得改成：
+#
+#   durationSec > 15 且 ≤ 30  → long_video=true + full
+#   durationSec > 30          → long_video=true + continuation
+#
+# 这条规则不需要新配置字段：>30 秒**只有** continuation 能表达，而它**只有** ref2va 收，
+# 万一有 fl2va 请求漏进 >30 那段，引擎会响亮地 400（`continuation requires Ref2VA`），
+# 不会静默出错误档位 —— 比在网关里自己判断任务类型更简单也更安全。
+#
+# ## 两个必须一起看的前提
+#
+# 1. **不许装 Cache-DiT**（`pipeline:3911`）：
+#      if continuation is not None and quality_plan.cache_dit is not None: raise ...
+#    报错文案是 `set quality=lossless`，但网关**正在把 quality 键删掉**（那行是因为
+#    `quality=high` 撞 cpu_offload 会废掉实例）。目前两道闸都关着：源码里
+#    `MINIMAX_H3_CACHE_DIT_ENABLED = False`，且本档没有 `cache_backend`。
+#    ⚠️ **给本档加 `cache_backend: cache_dit` 会让 continuation 全线 400**，而报错会把人
+#    引向一个已经被网关删掉的键。加它之前必须先解决这条链。
+#
+# 2. **不许用 latent-mask 编辑**（`encoder_processing.py:516`，编码期就拦）。参考图 +
+#    参考音频 + 提示词这条路不涉及，不是障碍；只有 `video_noise_mask` /
+#    `audio_noise_mask` 那些玩法受影响。step execution 也收（本档没开）。
+#
+# ## 耗时：逐窗累加，会撞穿默认超时
+#
+# 每窗 = 一个独立去噪（窗口 277 帧、约 115k 行，与 15s@768p full 同量级，那一档实测
+# 361~394 s/条）。窗口数按 `plan_continuation_windows`（默认 window=277 / overlap=22）：
+#
+#   输出 30 s → 736 帧 → **3 窗**   ≈ 18 分钟
+#   输出 75 s → 1807 帧 → **7 窗**  ≈ 43 分钟（7 是上游 recipe 给的数）
+#   输出 300 s → 7213 帧 → **29 窗** ≈ **3 小时**（外推，未实测）
+#
+# 所以本档要开 30 秒以上，`VLLM_OMNI_VIDEO_SYNC_TIMEOUT` 的 7200（2 小时）**会被 300 秒
+# 档撞穿**：要提到 ≥14400。`VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` 也建议一并对齐到 14400
+# （单窗 370 s 用 7200 够，但既然要出长片，让两道墙同高更好排查）。
+# 网关侧的准入时延必须**按模型配**（`lightx2v_model_latency_seconds` /
+# `lightx2v_model_queue_wait_seconds`）—— video 类默认估时 90 s / 容忍 150 s，
+# 会让 29 窗的任务被 429 误拒。
+#
+# ## 显存：由**单窗**决定，与总时长无关 —— 但**本档没测过**
+#
+# 上游 recipe 原话：`Denoising memory is bounded by the window, while cumulative latent
+# storage still grows with duration.` 窗口里 `num_frames` 被换成该窗的帧数，所以去噪
+# 显存只由（窗口 277 + guide 22 + 参考媒体/文本）决定。注意 guide 是**条件块**，VDN 对
+# 非 target 区间双向稠密，所以它不是"两个短视频叠加"那么便宜；粗算 used_len 约 115k，
+# 约为 30s@768p full（223k）的一半。
+#
+# ⚠️ 上面全是**读代码 + 上游文档**推的，**本档一发都没跑过**。fl2va 那套 1080p 时长阶梯
+# （20 s 可用 / 22 s 悬崖 / 25 s OOM）是 **full 模式**的数，**不适用于 continuation**，
+# 反向也不成立。上线前先跑一发 **60 s @768p**：一次能同时验窗口数是否 = 6、每窗的
+# `driver free` / `torch max allocated`、以及耗时外推对不对。1080p 要等 768p 的曲线拉出来。

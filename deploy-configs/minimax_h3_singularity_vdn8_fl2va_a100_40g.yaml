@@ -68,13 +68,60 @@ stages:
     max_num_seqs: 1
     devices: "0,1,2,3"
 
-    # The two VAEs are 10.26 GiB per rank and the denoise steps never touch them, but
-    # `_component_on_device` only stages them when this is set: the staging path used to be
-    # gated behind layerwise offload, which is a different job (streaming the DiT's blocks)
-    # that this deployment does not want. Measured at 15s@1080p: denoise peak 35.79 ->
-    # 25.53 GiB, warm 708s -> 629s. Costs 10.26 GiB per rank of HOST memory instead, so
-    # drop caches before starting if the box has been reading checkpoints all day.
+    # 短边 1080 生成档。**追加式**：768 仍然合法，所以这台服务器既能收既有请求，
+    # 也能收 1080p 的请求。
+    #
+    # --- 这条 env 只是**白名单**，它单独不能让 fl2va 出 1080p（2026-09-29 实测）---
+    #   引擎里短边的缺省值是**常量**，env 只决定某个值**合法不合法**：
+    #
+    #     encoder_processing.py:208  target.get("short_edge", extra.get("short_edge", 768))
+    #     pipeline_minimax_h3.py:2215  同一份常量、同一条读取链
+    #
+    #   同机、同为 5 秒档、短边只此一处变化，四条实测：
+    #
+    #     部署 env   请求 short_edge   结果
+    #      未设         未传            200  1344×768
+    #      未设         1080            400  `must be one of (768,), got 1080`
+    #     1080         未传            200  1344×768   ← env 不改缺省值
+    #     1080         1080            200  1888×1088  ← 画幅仍跟随首图
+    #
+    #   所以本 env 与**网关下发的 `extra_params.short_edge`** 缺一不可：少了网关那一半，
+    #   用户点了 1080P 会静默拿到 768p（最坏的一种，界面无提示）；少了这条 env，请求是
+    #   硬 400（好查）。网关侧见 new-api 的 `h3ApplyKeyframeShortEdge`（90daec63a）。
+    #
+    # 为什么由网关发短边而不是改画布：FL2VA 的 aspect_ratio **永远取自首图**，网关侧
+    # h3ApplyCanvas 对关键帧不推画布。发短边不碰画幅 —— 首图仍是唯一的比例来源，不会被
+    # 拉伸。改用显式 width/height 就会把首图拉伸到另一个比例，那是 h3ApplyCanvas 注释里
+    # 明确否决过的做法。
+    #
+    # 出片尺寸是**短边 1080 + 首图比例**，不是 16:9 的 1920×1056：1.75 比例的首图 ->
+    # 1888×1088（2026-09-29 实测）。别按请求里的 aspect_ratio 反推。
+    #
+    # --- 1080p 的时长上限是 **20 秒**（2026-09-29 实测，本底座同档）---
+    #   fl2va VDN-INT8、单发、每发重启后冷启，末步 driver 余量 / torch max allocated：
+    #
+    #      5 s ✅ 24.93 / 22.86 GiB    15 s ✅ 12.33 / 25.53 GiB
+    #     18 s ✅  7.48 / 30.07 GiB    20 s ✅  6.03 / 37.57 GiB
+    #     22 s ✅  0.35 / 38.52 GiB ← 悬崖边     25 s ❌ / 30 s ❌ OOM
+    #
+    #   涨的不是窗口部分而是**全局行**（参考图/音频/文本）—— VDN 对全局行在两个方向上
+    #   都是稠密的，而它随时长线性涨。所以 15→20 秒时长只涨 33%、峰值涨 47%。
+    #   30 秒只能退 768p：实测 736 帧 / 30.667 s、整条 8 步余量 12.0~12.9 GiB。
+    #
+    #   ⚠️ 这张表是 **full 模式**。continuation 模式（只有 ref2va 收）的显存由**单窗**
+    #   决定、与总时长无关，那套数**不适用于本表**，也**尚未实测**。
+    #
+    # 顺带：这张表出自自研档（`MiniMax-H3-FL2VA-Pruned-VDNfull-INT8`）的实测，本档是
+    # Singularity 底座。两者同为 19.5 GB / 同套 VDN 窗口，量级可比；但**上限要按本档
+    # 复测一遍再定** —— 别把对照档的数直接当本档的承诺。
     env:
+      VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE: "1080"
+      # The two VAEs are 10.26 GiB per rank and the denoise steps never touch them, but
+      # `_component_on_device` only stages them when this is set: the staging path used to be
+      # gated behind layerwise offload, which is a different job (streaming the DiT's blocks)
+      # that this deployment does not want. Measured at 15s@1080p: denoise peak 35.79 ->
+      # 25.53 GiB, warm 708s -> 629s. Costs 10.26 GiB per rank of HOST memory instead, so
+      # drop caches before starting if the box has been reading checkpoints all day.
       VLLM_OMNI_H3_OFFLOAD_COMPONENTS: "1"
 
     enable_cpu_offload: true
