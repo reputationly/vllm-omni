@@ -8,7 +8,8 @@
 #   ./run_server.sh
 #   CUDA_VISIBLE_DEVICES=0 ./run_server.sh
 #
-# Streaming (async-chunk) is on by default via vllm_omni/deploy/cosyvoice3.yaml.
+# Streaming (async-chunk) is on by default. H200 selects the optimized profile;
+# other devices use vllm_omni/deploy/cosyvoice3.yaml.
 # Set NO_ASYNC_CHUNK=1 to use the legacy synchronous path.
 
 set -e

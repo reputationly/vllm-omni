@@ -44,6 +44,8 @@ MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
 #
 # Additive on purpose: an override that REPLACED 768 would make a server configured for
 # 1080 reject every existing request, which is a deployment break, not an experiment.
+# Upstream still hard-locks 768 (it raises on any other value); this widens the accepted
+# set instead, which is what the A100-40G 1080p deployment needs.
 _EXPERIMENTAL_SHORT_EDGE_ENV = "VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE"
 
 
@@ -67,7 +69,6 @@ def _output_max_pixels(short_edge: int | None = None) -> int:
     return int(MINIMAX_H3_OUTPUT_MAX_PIXELS * (edge / MINIMAX_H3_OUTPUT_SHORT_EDGE) ** 2)
 
 
-MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "21:9": 21.0 / 9.0,
@@ -168,17 +169,16 @@ def resolve_minimax_h3_aspect_ratio(
 
 
 def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    """Resize an H3 reference image to the official 2048-short-edge canvas."""
+    """Preserve reference resolution, rounding each axis to the 32-pixel grid."""
     width, height = image.size
     ratio = width / height
     if not 0.4 <= ratio <= 2.5:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
     return (
-        _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
-        _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _align_multiple(width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _align_multiple(height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
     )
 
 

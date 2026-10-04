@@ -99,6 +99,21 @@ def ramp_cumulative(index: int, ramp: list[int], steady: int) -> int:
     return sum(ramp) + (index + 1 - ramp_len) * steady
 
 
+def ramp_decode_windows(ramp: list[int], left_context: int) -> list[int]:
+    """Decode window (left context + new frames) of each ramp chunk for a stateless decoder.
+
+    Chunk ``i`` re-decodes up to ``left_context`` earlier frames with its
+    ``ramp[i]`` new ones, e.g. ``[1, 2, 4, 8, 16, 25]`` with 25 frames of
+    context -> ``[1, 3, 7, 15, 31, 50]``.
+    """
+    windows: list[int] = []
+    emitted = 0
+    for new_frames in ramp:
+        windows.append(new_frames + min(emitted, max(0, left_context)))
+        emitted += new_frames
+    return windows
+
+
 def compute_ramp_emit(
     length: int,
     chunk_index: int,
