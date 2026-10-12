@@ -64,7 +64,7 @@ def test_reference_video_canvas_matches_official(oracle, monkeypatch, no_upscale
     §5.0 P2). The fixture's screened cases are all at or above the canvas, so the
     official canvas must be reproduced either way.
     """
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV,
         _reference_video_shape,
     )
