@@ -1788,12 +1788,44 @@ def test_encoder_forward_forwards_video_inputs():
         ((2048, 2048), (768, 768)),
     ],
 )
-def test_reference_video_shape_caps_large_inputs_without_enlarging_small_inputs(size, expected):
+def test_reference_video_shape_caps_large_inputs_without_enlarging_small_inputs(size, expected, monkeypatch):
+    # Upstream #8253's "do not enlarge small references" behaviour is opt-in in this
+    # fork (sync manual §5.0 P2): the deployed default keeps enlarging, so pin the
+    # switch on for these upstream expectations and leave the assertions untouched.
+    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE", "1")
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         _reference_video_shape,
     )
 
     assert _reference_video_shape(*size) == expected
+
+
+@pytest.mark.parametrize(
+    ("size", "expected_when_off", "expected_when_on"),
+    [
+        # Below the canvas: the two modes differ.
+        ((512, 288), (1344, 768), (512, 288)),
+        ((640, 384), (1280, 768), (640, 384)),
+        # At or above the canvas: capped either way.
+        ((1344, 768), (1344, 768), (1344, 768)),
+        ((1920, 1152), (1280, 768), (1280, 768)),
+        ((2048, 2048), (768, 768), (768, 768)),
+    ],
+)
+def test_reference_video_no_upscale_switch_defaults_to_enlarging(
+    monkeypatch, size, expected_when_off, expected_when_on
+):
+    """`VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE` defaults OFF, preserving the deployed contract."""
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+        MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV,
+        _reference_video_shape,
+    )
+
+    monkeypatch.delenv(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, raising=False)
+    assert _reference_video_shape(*size) == expected_when_off
+
+    monkeypatch.setenv(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, "1")
+    assert _reference_video_shape(*size) == expected_when_on
 
 
 def test_text_encoder_stub_constructs_without_group_or_weights():
