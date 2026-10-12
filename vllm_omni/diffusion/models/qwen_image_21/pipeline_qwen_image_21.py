@@ -80,6 +80,72 @@ OUTPUT_RESOLUTION = 1024
 # descriptive constant for validation without becoming the source of truth.
 MAX_QWEN_IMAGE_21_INPUT_IMAGES = QWEN_IMAGE_21_MAX_INPUT_IMAGES
 
+CONDITION_BUDGET_ENV = "VLLM_OMNI_QWEN_IMAGE_21_CONDITION_BUDGET_MPX"
+_DEFAULT_CONDITION_BUDGET_PIXELS = 11_000_000
+
+
+def _condition_budget_pixels() -> float:
+    raw = os.getenv(CONDITION_BUDGET_ENV)
+    if not raw:
+        return float(_DEFAULT_CONDITION_BUDGET_PIXELS)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{CONDITION_BUDGET_ENV} must be a number of megapixels, got {raw!r}.") from exc
+    if value <= 0:
+        raise ValueError(f"{CONDITION_BUDGET_ENV} must be positive, got {raw!r}.")
+    return value * 1_000_000
+
+
+def _allocate_condition_areas(image_sizes: list[tuple[int, int]], output_area: float, budget: float) -> list[float]:
+    """Pick a target resize area for every condition image.
+
+    Each image is capped by the output area — condition and output share one
+    resolution class, as with diffusers' `output_resolution` — and by its own pixel
+    count, since upscaling adds tokens but no detail. No image goes below
+    `OUTPUT_RESOLUTION**2`, the fixed size this pipeline historically used, so a
+    request whose caps already sit at that floor (1024-class output or small
+    references) resizes exactly as before. When the capped areas exceed `budget`,
+    the larger images are lowered to one common level (water-filling): images that
+    need less than their share keep their cap and hand the rest to the others.
+    """
+    floor = float(OUTPUT_RESOLUTION * OUTPUT_RESOLUTION)
+    caps = [max(floor, min(float(output_area), float(w * h))) for w, h in image_sizes]
+    if sum(caps) <= budget:
+        return caps
+    if len(caps) * floor >= budget:
+        return [floor] * len(caps)
+    order = sorted(range(len(caps)), key=caps.__getitem__)
+    areas = list(caps)
+    remaining = budget
+    for position, index in enumerate(order):
+        level = remaining / (len(order) - position)
+        if caps[index] > level:
+            # Every image from here on is capped above the level, so they all get it.
+            # The level never drops below `floor`: it starts above it and only rises
+            # as smaller caps are settled.
+            for rest in order[position:]:
+                areas[rest] = level
+            break
+        remaining -= caps[index]
+    return areas
+
+
+def _condition_areas(
+    request: OmniDiffusionRequest, prompt: dict[str, Any], images: list[PIL.Image.Image], output_area: int
+) -> list[float]:
+    """Condition-image target areas for one request (explicit override first)."""
+    sampling = request.sampling_params
+    if sampling.condition_resolution:
+        return [float(sampling.condition_resolution**2)] * len(images)
+    budget = _condition_budget_pixels()
+    # Classifier-free guidance caches a second copy of the prefix, and every extra
+    # output per prompt is another batch row with its own copy.
+    copies = max(1, sampling.num_outputs_per_prompt or 1)
+    if (sampling.true_cfg_scale or 1.0) > 1 and prompt.get("negative_prompt"):
+        copies *= 2
+    return _allocate_condition_areas([image.size for image in images], output_area, budget / copies)
+
 
 def _read_vae_scale_factor(od_config: OmniDiffusionConfig) -> int:
     """Read the VAE spatial compression ratio from the checkpoint's vae/config.json."""
@@ -227,22 +293,8 @@ def get_qwen_image_21_pre_process_func(
             )
         images = [_to_pil(im) for im in raw_image]
 
-        # One resize feeds both the text encoder and the VAE.
-        input_image_sizes = []
-        prompt_images = []
-        vae_images = []
-        for img in images:
-            image_width, image_height = img.size
-            input_width, input_height = calculate_dimensions(
-                OUTPUT_RESOLUTION * OUTPUT_RESOLUTION, image_width / image_height
-            )
-            input_image_sizes.append((input_width, input_height))
-            prompt_images.append(image_processor.resize(img, height=input_height, width=input_width))
-            vae_images.append(
-                vae_image_processor.preprocess(img.convert("RGBA"), height=input_height, width=input_width).unsqueeze(2)
-            )
-
         # The generated image derives its aspect ratio from the last condition image.
+        # It is settled first because the condition images are sized against it.
         last_width, last_height = images[-1].size
         calculated_width, calculated_height = calculate_dimensions(
             OUTPUT_RESOLUTION * OUTPUT_RESOLUTION, last_width / last_height
@@ -252,6 +304,24 @@ def get_qwen_image_21_pre_process_func(
         height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
         request.sampling_params.height = height
         request.sampling_params.width = width
+
+        # One resize feeds both the text encoder and the VAE, and it has to: every
+        # vision-language token of a condition image is the slot its 2x2 latent group
+        # is substituted into, so the two sizes must agree. An explicit
+        # `condition_resolution` pins every image; otherwise the areas follow the output
+        # size within the per-request budget (see `_allocate_condition_areas`).
+        condition_areas = _condition_areas(request, prompt, images, height * width)
+        input_image_sizes = []
+        prompt_images = []
+        vae_images = []
+        for img, area in zip(images, condition_areas):
+            image_width, image_height = img.size
+            input_width, input_height = calculate_dimensions(area, image_width / image_height)
+            input_image_sizes.append((input_width, input_height))
+            prompt_images.append(image_processor.resize(img, height=input_height, width=input_width))
+            vae_images.append(
+                vae_image_processor.preprocess(img.convert("RGBA"), height=input_height, width=input_width).unsqueeze(2)
+            )
 
         prompt["additional_information"]["prompt_image"] = prompt_images
         prompt["additional_information"]["vae_images"] = vae_images
