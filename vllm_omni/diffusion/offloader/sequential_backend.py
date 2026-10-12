@@ -681,7 +681,11 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 offload_dit_modules=selected_dits,
                 offload_encoder_modules=selected_encoders,
                 # Fixed DiT staging keeps decode-graph weight pointers valid;
-                # other platforms keep plain move semantics.
+                # Fixed DiT staging keeps decode-graph weight pointers valid;
+                # other platforms keep plain move semantics. (Deliberate
+                # deviation from upstream, which gates this on
+                # enable_cuda_graph_decode: ours is the superset "any CUDA
+                # device". Sync manual §5.4.)
                 persistent_dit_staging=self.device.type == "cuda",
             )
         except BaseException:

@@ -114,18 +114,6 @@ def _flush_remaining_codes(
     )
 
 
-def _is_codes_empty(codes: Any) -> bool:
-    """Check whether code_predictor_codes should be treated as empty / invalid."""
-    if codes is None:
-        return True
-    if isinstance(codes, torch.Tensor):
-        return codes.numel() == 0 or not codes.any()
-    if hasattr(codes, "__len__") and len(codes) == 0:
-        return True
-    t = torch.tensor(codes, dtype=torch.long) if not isinstance(codes, torch.Tensor) else codes
-    return not t.any()
-
-
 def _to_code_tensor(codes: Any) -> torch.Tensor | None:
     """Convert codes to a (B, 1, 8, 4) long tensor, or return None if shape is invalid."""
     code_tensor = codes.to(torch.long) if isinstance(codes, torch.Tensor) else torch.tensor(codes, dtype=torch.long)

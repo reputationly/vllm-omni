@@ -55,6 +55,8 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting):
     scheduler.requests = requests
     scheduler.running = running
     scheduler.waiting = waiting
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     return scheduler
 
 

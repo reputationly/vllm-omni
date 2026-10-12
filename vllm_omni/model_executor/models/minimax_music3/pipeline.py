@@ -36,7 +36,7 @@ MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID = 151670
 # characters, an order of magnitude past the 500-character serving default.
 # ``tts_args`` is a pipeline-level stage extra, not a deploy-YAML field: it
 # reaches the serving layer through ``StageConfig.yaml_extras``, which is where
-# ``ServingSpeech._compute_max_instructions_length`` reads it from.
+# ``OmniOpenAIServingSpeech._compute_max_instructions_length`` reads it from.
 _MAX_INSTRUCTIONS_LENGTH = 20_000
 
 MINIMAX_MUSIC3_PIPELINE = PipelineConfig(

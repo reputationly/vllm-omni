@@ -46,6 +46,8 @@ Two entries, for two different jobs:
 #
 # Net effect: launching without ``--deploy-config`` behaves exactly as before.
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -55,6 +57,7 @@ from vllm_omni.config.stage_config import (
 _PROCESSOR = "vllm_omni.model_executor.stage_input_processors.minimax_h3"
 _CHECKPOINT = "vllm_omni.model_executor.models.minimax_h3.checkpoint"
 _DIFFUSION_PIPELINE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3"
+_DECODER_PIPELINE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder"
 
 MINIMAX_H3_PIPELINE = PipelineConfig(
     model_type="minimax_h3_disaggregated",
@@ -125,6 +128,36 @@ MINIMAX_H3_DIT_PIPELINE = PipelineConfig(
             final_output_type="video",
             requires_multimodal_data=True,
             model_arch=_MINIMAX_H3_MODEL_ARCH,
+        ),
+    ),
+)
+
+
+# Upstream's disaggregated decode topology: encoder (stage 0), DiT (stage 1, not final),
+# separate VAE-decode (stage 2). Keyed ``minimax_h3_disaggregated_decode``, distinct from
+# our single-stage ``minimax_h3_dit`` above, so the two coexist (manual §5.1).
+MINIMAX_H3_DECODE_PIPELINE = PipelineConfig(
+    model_type="minimax_h3_disaggregated_decode",
+    default_deploy_config_name="minimax_h3_disaggregated_decode.yaml",
+    stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
+    model_arch="MiniMaxH3Encoder",
+    stages=(
+        replace(
+            MINIMAX_H3_PIPELINE.stages[0],
+            prompt_transform_func=f"{_PROCESSOR}.prepare_encoder_prompt_with_decoder",
+        ),
+        replace(MINIMAX_H3_PIPELINE.stages[1], final_output=False, final_output_type=None),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="vae_decode",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(1,),
+            final_output=True,
+            final_output_type="video",
+            model_arch="MiniMaxH3DecoderPipeline",
+            custom_process_input_func=f"{_PROCESSOR}.diffusion2decoder",
+            model_path_resolver=f"{_DECODER_PIPELINE}.resolve_minimax_h3_decoder_model_path",
+            inline_diffusion=True,
         ),
     ),
 )

@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: Qwen
-- Model: `Qwen/Qwen-Image-2.1`
+- Model: `Qwen/Qwen-Image-2.1`, `Qwen/Qwen-Image-2.1-Turbo` (8-step distilled)
 - Task: Text-to-image generation and image-conditioned generation (editing)
 - Mode: Offline inference and online serving with optional step-wise execution
 - Maintainer: Community
@@ -34,6 +34,51 @@ text-to-image.
   [`docs/user_guide/diffusion_features.md`](../../docs/user_guide/diffusion_features.md)
 - Sibling recipes: [`Qwen-Image.md`](./Qwen-Image.md),
   [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md)
+
+## Qwen-Image-2.1-Turbo (8-step distilled)
+
+`Qwen/Qwen-Image-2.1-Turbo` is the 8-step distilled variant of
+Qwen-Image-2.1 and runs through the same `QwenImage21Pipeline`. Keep these
+differences from the base checkpoint in mind:
+
+- **Do not pass `num_inference_steps`.** The Turbo checkpoint's
+  `model_index.json` ships a fixed `sample_sigmas` grid, which vLLM-Omni
+  loads automatically. An explicit `num_inference_steps` is overridden by
+  `sample_sigmas`, so omit it.
+- **Do not enable CFG.** As a distilled model it runs at CFG=1: leave
+  `true_cfg_scale` at its default (1.0); setting `true_cfg_scale > 1` (and a
+  `negative_prompt`) is not meaningful for the distilled weights.
+- **License:** Qwen Research License (not Apache-2.0) — check the checkpoint
+  card before commercial use.
+
+Offline:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image-2.1-Turbo \
+  --prompt "A ceramic teapot on a wooden table" \
+  --output qwen_image_21_turbo_t2i.png \
+  --cfg-scale 1.0
+```
+
+Online serving works the same as the base model
+(`vllm serve Qwen/Qwen-Image-2.1-Turbo --omni --port 8091`). The sampling
+grid can be overridden per request through the whitelisted `sigmas`
+extra-body parameter (both `/v1/chat/completions` and the multi-stage
+`/v1/images/generations` path). The default 8-step grid is
+`[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]`:
+
+```bash
+curl http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen-Image-2.1-Turbo",
+    "prompt": "A ceramic teapot on a wooden table",
+    "size": "1024x1024",
+    "seed": 42,
+    "sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+  }'
+```
 
 ## Offline Inference
 
@@ -65,7 +110,7 @@ python examples/offline_inference/image_to_image/image_edit.py \
 or via the bundled launcher:
 
 ```bash
-bash examples/offline_inference/image_to_image/run_qwen_image_21_edit.sh
+bash examples/offline_inference/image_to_image/run_qwen_image_21.sh
 ```
 
 Up to 4 condition images can be passed via `--image`:
@@ -106,37 +151,58 @@ vllm serve Qwen/Qwen-Image-2.1 --omni \
   --max-num-seqs 8
 ```
 
-Step execution batches compatible requests at the same KV-cache phase. Once
-running requests have completed their first denoising step, newly arriving
-requests wait for that batch to finish before starting their own prefill.
-`--max-num-seqs` controls batch capacity; mixed prefill/decode admission is not
-supported yet.
+Step execution batches compatible requests at the same KV-cache phase. The
+pipeline tags every request with a `batch_compatibility_key` (conditioning
+mode plus condition-image layout), so a newly arriving request that would
+otherwise join a batch already past its first denoising step is isolated by
+the scheduler and deferred until the in-flight batch drains — it no longer
+fails the whole batch. `--max-num-seqs` controls batch capacity.
 
 ### CUDA Graph decode
 
 Qwen-Image-2.1 automatically uses CUDA Graph for supported fixed-shape denoising
-decode steps when `enforce_eager=False` (the default). Prefill remains eager.
-This works with both request execution and `--step-execution`.
+decode steps when `enable_cuda_graph_decode=True` (the default) and
+`enforce_eager=False`. Prefill remains eager. This works with both request
+execution and `--step-execution`.
 
-To disable graph capture:
+To disable graph capture while keeping the rest of the compilation setup:
 
 ```bash
-vllm serve Qwen/Qwen-Image-2.1 --omni --enforce-eager --vae-use-tiling
+vllm serve Qwen/Qwen-Image-2.1 --omni --no-enable-cuda-graph-decode
 ```
 
-The same control is available as `Omni(..., enforce_eager=True)` and as
-`enforce_eager: true` on a stage in the deployment YAML. It disables both graph
-capture and automatic `torch.compile`. Otherwise, this transformer uses its
-model-specific decode graphs instead of automatic `torch.compile`.
+The same control is available as `Omni(..., enable_cuda_graph_decode=False)`
+and as `enable_cuda_graph_decode: false` on a stage in the deployment YAML.
+`--enforce-eager` / `enforce_eager: true` remains the broader switch: it
+disables both graph capture and automatic `torch.compile`. The two
+optimizations stack: the DiT blocks are regionally `torch.compile`'d and
+graph capture records the compiled (fused) kernels, while inductor's own
+cudagraphs stay disabled so the two graph layers never nest. Measured on a
+single H200 (1024×1024, 50 steps, seed 42, BF16, `true_cfg_scale=1.0`,
+warmup 1 + median of 3): compile+graph **5.93 s**, compile-only **6.88 s**,
+graph-only **9.52 s**, eager **8.28 s** end-to-end per image; combo and
+compile-only vs eager are **38.10 dB** PSNR (compile fusion drift), and
+graph-only vs eager is bit-identical.
 
-The autoregressive engine's `compilation_config.cudagraph_mode` does not control
-this diffusion path; use `enforce_eager` to force eager execution.
+The autoregressive engine's `compilation_config.cudagraph_mode` does not
+control this diffusion path; use `enable_cuda_graph_decode` (or
+`enforce_eager` for everything) to force eager decode execution.
 
-TP/SP/ring parallelism, HSDP, offload/cache hooks, compiled blocks, quantized
-KV caches, dynamic LoRA, and padded text masks fall back to eager decode.
-Graphs keep separate entries for different image layouts and copy request-owned
-prefix K/V into static buffers before replay. Those buffers require additional
-memory; graph entries are bounded by the transformer's cache limit.
+TP/SP/ring parallelism, HSDP, cache hooks, quantized KV caches,
+dynamic LoRA, padded text masks, and a second in-flight request whose cache
+aliases an already-owned graph key fall back to eager decode.
+Model-level CPU offload does not disable decode graphs while
+`enable_cuda_graph_decode` stays on (the default). DiT weights stay on fixed
+device storage so captured pointers remain valid, and that storage is not
+released while the text encoder runs. Pass `--no-enable-cuda-graph-decode`
+(or `enable_cuda_graph_decode: false`) for the eager offload path, which
+moves DiT weights off the device and frees that VRAM. Peak memory for the
+default graph-plus-offload combination was not re-measured in this PR.
+Graphs keep separate entries for different image layouts and copy
+request-owned prefix K/V into static buffers before replay; each graph key
+has a single live owner at a time, so concurrent same-shape requests never
+overwrite each other's prefix. Those buffers require additional memory; graph
+entries are bounded by the transformer's cache limit.
 
 ### Verification
 
@@ -214,21 +280,19 @@ timesteps across the trajectory, relative L2 of the noise prediction vs BF16)
 ranks the groups: `img_mlp` is the most sensitive (3.8% max error on its own,
 driven by `img_mlp.proj` 2.8% and `img_mlp.out` 2.5%), then `attn.to_out`
 (2.7%), then `attn.to_qkv` (1.6%); errors are largest at the late (low-sigma)
-steps. End-to-end on 4 fixed prompts at 1024x1024, 50 steps, seed 42
-(GB200, single GPU):
+steps. End-to-end on H200, single GPU, same prompt as Quality Comparison
+(`"A ceramic teapot on a wooden table"`, 1024×1024, 50 steps, seed 42,
+eager):
 
-| Config | Quantized block linears | Avg PSNR vs BF16 | Min PSNR | Steady-state time/image | Peak memory |
-| --- | --- | --- | --- | --- | --- |
-| BF16 | 0 / 160 | — | — | 7.2 s | 40.0 GB |
-| FP8 all layers | 160 / 160 | 26.1 dB | 19.1 dB | 8.4 s | 33.4 GB |
-| FP8, `ignored_layers=["img_mlp"]` | 64 / 160 | 29.7 dB | 21.6 dB | 8.8 s | 38.3 GB |
+| Config | Quantized block linears | PSNR vs BF16 | Steady-state time/image | Peak memory |
+| --- | --- | --- | --- | --- |
+| BF16 | 0 / 160 | — | **7.34 s** | **36.9 GB** |
+| FP8 all layers | 160 / 160 | **33.0 dB** | **6.06 s** | **30.4 GB** |
+| FP8, `ignored_layers=["img_mlp"]` | 64 / 160 | **34.3 dB** | **6.98 s** | **34.9 GB** |
 
-All-layer FP8 is usable but its composition can drift on some prompts
-(fine detail and layout shift, worst case ~19 dB); keeping `img_mlp` in BF16
-preserves composition noticeably better and is the recommended setting. On
-Blackwell (GB200) FP8 here is a memory optimization, not a speedup: dynamic
-per-token activation quantization costs more than the FP8 GEMM saves at these
-shapes, so BF16 remains the fastest option.
+Keeping `img_mlp` in BF16 is still the higher-fidelity DiT setting vs
+all-layer FP8. On H200, all-layer FP8 is both leaner and faster than BF16
+at this shape.
 
 ## Quantization
 
@@ -249,13 +313,12 @@ omni = Omni(
 )
 ```
 
-Either component can be quantized on its own. Measured on GB200 at 1024×1024
-(seed 42, 50 steps): text-encoder FP8 lowers peak GPU memory from ~41.0 GiB to
-~34.4 GiB (−6.6 GiB); adding DiT FP8 reaches ~28.1 GiB. Output quality stays
-close to BF16 (T2I PSNR vs BF16 ≈ 28–32 dB with text-encoder FP8; the
-image-conditioned edit path ≈ 36 dB). FP8 saves memory but does not speed up
-generation on this hardware. The edit path routes condition images through the
-BF16 vision tower, so it is unaffected by text-encoder FP8. See
+Either component can be quantized on its own. Measured on H200 at 1024×1024
+(seed 42, 50 steps, same teapot prompt, eager): text-encoder FP8 lowers peak
+GPU memory from **36.9 GB** (BF16) to **30.4 GB** (−6.5 GB); T2I PSNR vs BF16
+**32.1 dB**. DiT FP8-all is **30.4 GB** / **6.06 s**. Combined DiT+text-encoder
+FP8 was not re-measured on H200. The edit path routes condition images through
+the BF16 vision tower, so it is unaffected by text-encoder FP8. See
 [`docs/user_guide/quantization/fp8.md`](../../docs/user_guide/quantization/fp8.md)
 for the scope rules.
 
@@ -279,19 +342,18 @@ dtype — behavior unchanged). This is independent of
 `diffusion_kv_cache_dtype`, which quantizes attention Q/K/V *compute* per
 forward pass on supported backends.
 
-Measured on T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0, PSNR vs. the
-bf16 baseline): **`"fp8"` 34.9 dB**, **`"fp8_v"` 40.9 dB** — same composition
-and semantics, with texture-level drift in fine detail for `"fp8"`, and
-visually indistinguishable output for `"fp8_v"`. The error is dominated by
+Measured on one NVIDIA H200, T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0,
+eager, PSNR vs. the bf16 baseline on the same GPU): **`"fp8"` 34.2 dB**,
+**`"fp8_v"` 44.0 dB**. The error is dominated by
 K quantization: post-RoPE keys are the precision-sensitive half of the
-cache, so `"fp8_v"` buys back ~6 dB at 75% (instead of 50%) of the original
+cache, so `"fp8_v"` buys back about 9.8 dB at 75% (instead of 50%) of the original
 cache size. The residual error is inherent e4m3 precision accumulated
 coherently over the denoising trajectory; finer scale granularity
 (per-tensor/per-head/per-token were compared) or Hadamard-rotated V did not
-improve it. The saving scales with prefix length — at the limit
-(8192 text tokens + 4 condition images, ~24.6k prefix tokens) the prefix
-cache is ~12.9 GB per CFG branch in bf16, ~6.6 GB in `"fp8"` and ~9.7 GB in
-`"fp8_v"`, which is where this option matters. Treat it as an opt-in for
+improve it. The saving scales with prefix length. These sizes are calculated at the
+limit (8192 text tokens + 4 condition images, ~24.6k prefix tokens), not
+measured on the 1024 T2I run above: ~12.9 GB per CFG branch in bf16, ~6.6 GB
+in `"fp8"` and ~9.7 GB in `"fp8_v"`. That is where this option matters. Treat it as an opt-in for
 memory-bound long-prompt / multi-image workloads, not a free lunch;
 `"fp8_v"` is the better default trade-off when quality matters.
 
@@ -311,11 +373,88 @@ piecewise-span masking and Ulysses/CFG constraints, for no memory benefit over
 the per-request dense tensors. The FP8 storage above captures the actual
 memory win at ~1% of the integration cost.
 
+## Quality Comparison (head vs diffusers)
+
+The reference is the diffusers Qwen-Image 2.1 pipeline
+([huggingface/diffusers#14804](https://github.com/huggingface/diffusers/pull/14804)).
+Both sides must pin the same checkpoint, inputs, seed, precision (BF16), and
+hardware.
+
+vLLM-Omni (this recipe):
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image-2.1 \
+  --prompt "A ceramic teapot on a wooden table" \
+  --seed 42 \
+  --output qwen_image_21_vllm_omni.png \
+  --num-inference-steps 50 \
+  --cfg-scale 1.0
+```
+
+diffusers reference:
+
+```python
+import torch
+from diffusers import QwenImage21Pipeline  # diffusers PR #14804
+
+pipe = QwenImage21Pipeline.from_pretrained(
+    "Qwen/Qwen-Image-2.1", torch_dtype=torch.bfloat16
+).to("cuda")
+image = pipe(
+    prompt="A ceramic teapot on a wooden table",
+    num_inference_steps=50,
+    true_cfg_scale=1.0,
+    generator=torch.Generator(device="cuda").manual_seed(42),
+    height=1024,
+    width=1024,
+).images[0]
+image.save("qwen_image_21_diffusers.png")
+```
+
+| Metric | vLLM-Omni | diffusers (#14804) | Status |
+| --- | --- | --- | --- |
+| Output image (1024×1024, 50 steps, seed 42, BF16, H200) | generated (eager + default CUDA-graph) | generated | measured |
+| PSNR / LPIPS vs reference | eager vs Diffusers **47.17 dB**; **default compile+graph** vs Diffusers **38.02 dB**; **default compile+graph** vs eager **38.10 dB** | — | measured (H200) |
+| Latency (time/image, same GPU, H200) | **default compile+graph** **6.04 s** (120.8 ms/step); eager **7.31 s** (146.2 ms/step) | **7.74 s** (154.9 ms/step) | measured |
+
+The prefix KV cache changes the compute path (cached prefix vs. full recompute
+at every step), so exact numerical parity is not expected; match the cache
+setting on both sides or compare with PSNR/LPIPS rather than exact pixels.
+Eager stays numerically close to Diffusers (~47 dB). The **default** serving
+path stacks regional `torch.compile` with CUDA-graph decode; on H200 that
+combo lands at **~38.1 dB** vs eager (~1.21× on the Quality Comparison timed
+run). Graph-only vs eager is bit-identical; the ~38 dB drift is the compile
+fusion, not CUDA-graph replay. See "CUDA Graph decode" for the four-mode
+H200 breakdown (warmup 1 + median of 3).
+
+Parity / feature measurements (same prompt/seed/steps/CFG, BF16, eager decode
+unless noted; 4× NVIDIA H200):
+
+- [x] TP=2/4 output parity vs single-card — measured (1024×1024): TP1 vs TP2
+  **39.32 dB**, TP1 vs TP4 **38.37 dB**, TP2 vs TP4 **45.77 dB**. Latency:
+  TP1 **7.30 s**, TP2 **4.89 s**, TP4 **5.12 s** per image.
+- [x] VAE tiling vs non-tiled decode — measured: 1024×1024 nontile vs
+  `--vae-use-tiling` **43.55 dB** (peak mem ~37.7 GB → ~32.7 GB); 2048×2048
+  nontile vs tiled **44.14 dB** (peak mem ~57.9 GB → ~33.3 GB; gen ~36.8 s vs
+  ~37.1 s).
+- [x] CUDA-graph four-mode vs eager — measured on H200 (1024×1024, 50 steps,
+  seed 42, BF16, warmup 1 + median of 3): compile+graph **5.93 s**,
+  compile-only **6.88 s**, graph-only **9.52 s**, eager **8.28 s**. Combo /
+  compile-only vs eager **38.10 dB**; graph-only vs eager bit-identical.
+  Quality Comparison table uses a separate single-run A/B vs Diffusers
+  (compile+graph **6.04 s**, eager **7.31 s**).
+
 ## Known Limitations
 
 - Cache acceleration backends (`cache_dit`, `tea_cache`) are not supported;
   `QwenImage21Pipeline` is registered in `_NO_CACHE_ACCELERATION`.
-- Sequence parallelism supports Ulysses only; ring attention is not supported.
+- Ulysses sequence parallelism is wired; ring attention is not a supported path.
+  A short H200 smoke (1024×1024, 8 steps, seed 42, true CFG 1.0, eager) finished:
+  Ulysses SP=2 vs SP=1 is **46.5 dB**. That size's target length is divisible by 4,
+  so SP padding was not exercised, and this is not the 50-step parity next to the
+  TP tables. The features matrix therefore stays ❓. Ring SP=2 also ran, at
+  **29.9 dB** vs SP=1, which is why it stays unsupported.
 - Only true CFG is exposed; there is no `guidance_scale` knob.
 - VAE tiling (`--vae-use-tiling`, also implied by `--vae-patch-parallel-size > 1`)
   decodes in 512px tiles with 384px stride (32 latent pixels per tile at 16x

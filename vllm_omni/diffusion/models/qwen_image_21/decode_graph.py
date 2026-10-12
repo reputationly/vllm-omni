@@ -14,16 +14,26 @@ fixed-address graph buffers when the active prefix tensors change. Graphs
 are keyed by branch, batch, prefix length, complete image layout,
 dtype, device and backend, so equal token counts with different RoPE layouts stay separate.
 
+Each key admits a single live owner, tracked by a weak reference to the
+registering request's prefix K tensor. A second in-flight request whose cache
+aliases the same key is refused graph decode and stays eager until the
+owner's cache is released, so shared static buffers are never overwritten
+under a concurrent owner.
+
 Memory note: graph entries own an additional copy of the prefix K/V. Decode
 attention concatenates that prefix with target K/V inside the captured region;
 transient tensors use the graph memory pool.
 
+The model runner regionally torch.compile's the transformer blocks even when
+decode graphs are enabled, so capture records the compiled (fused) kernels;
+inductor's own cudagraphs stay off so the two graph layers never stack.
+
 Fallbacks (all logged, all eager): CUDA unavailable, model-level CPU offload
 without persistent weight staging, sequence/ring/tensor parallelism,
-HSDP/offload hooks, torch.compile'd blocks, KV-cache quantization, dynamic
-LoRA wrappers, padded text masks (the masked attention path branches on
-mask contents, which cannot be captured), unknown graph key at decode, and
-capture failure.
+HSDP/offload hooks, KV-cache quantization, dynamic LoRA wrappers, padded text
+masks (the masked attention path branches on mask contents, which cannot be
+captured), unknown graph key at decode, a second live request aliasing an
+owned graph key, and capture failure.
 """
 
 from __future__ import annotations
@@ -160,6 +170,10 @@ class QwenImage21DecodeGraphManager:
         self.max_entries = max_entries
         self.model_level_offload = model_level_offload
         self.entries: OrderedDict[tuple, QwenImage21DecodeGraphEntry | None] = OrderedDict()
+        # Key -> weak reference to the prefix K tensor of the request that owns
+        # the entry's static buffers. Dead references mean the owning request
+        # finished and its cache was released, so the key is free to adopt.
+        self._owners: dict[tuple, weakref.ReferenceType[torch.Tensor]] = {}
         self._static_eligible: bool | None = None
 
     # ── eligibility ──
@@ -213,9 +227,6 @@ class QwenImage21DecodeGraphManager:
                     reason = "tensor parallelism runs collectives inside the captured region"
             if reason is None:
                 for block in model.transformer_blocks:
-                    if getattr(block.forward, "_torchdynamo_orig_callable", None) is not None:
-                        reason = "transformer blocks are torch.compile'd"
-                        break
                     if hasattr(block, "_hook_registry") or hasattr(block, "_omni_original_forward"):
                         reason = "transformer blocks carry offload/cache hooks"
                         break
@@ -251,7 +262,12 @@ class QwenImage21DecodeGraphManager:
         joint_key_valid: torch.Tensor | None,
         dtype: torch.dtype,
     ) -> None:
-        """Prepare graph buffers without changing the request's prefix K/V."""
+        """Prepare graph buffers without changing the request's prefix K/V.
+
+        The first in-flight request to register a key owns its static buffers;
+        registrations for the same key from another live request are refused
+        so their decode stays eager until the owner completes.
+        """
         if not self.eligible() or torch.compiler.is_compiling():
             return
         if _dynamic_lora_wrappers_present(self.model):
@@ -297,6 +313,7 @@ class QwenImage21DecodeGraphManager:
         if key not in self.entries:
             while len(self.entries) >= self.max_entries:
                 evicted_key, evicted_entry = self.entries.popitem(last=False)
+                self._owners.pop(evicted_key, None)
                 del evicted_entry
                 logger.debug("Evicting decode graph entry %s (max_entries=%d)", evicted_key, self.max_entries)
             allocation_error = None
@@ -330,6 +347,20 @@ class QwenImage21DecodeGraphManager:
 
         entry = self.entries[key]
         if entry is not None:
+            owner = self._owners.get(key)
+            owner_prefix = owner() if owner is not None else None
+            if owner_prefix is not None and owner_prefix is not first["key"]:
+                # Another in-flight request still owns this entry's static
+                # buffers; refreshing them would overwrite that request's
+                # prefix mid-generation. This request decodes eagerly until
+                # the owner's cache is released and the weak reference dies.
+                logger.warning_once(
+                    "Qwen-Image-2.1 CUDA graph decode: entry key=%s is owned by another in-flight "
+                    "request; this request falls back to eager decode.",
+                    key,
+                )
+                return
+            self._owners[key] = weakref.ref(first["key"])
             entry.prefix_sources = []
 
         logger.debug(
@@ -383,6 +414,14 @@ class QwenImage21DecodeGraphManager:
             return None
         self.entries.move_to_end(key)
 
+        owner = self._owners.get(key)
+        owner_prefix = owner() if owner is not None else None
+        if owner_prefix is not None and owner_prefix is not cached_key:
+            # The entry is owned by a different in-flight request (see
+            # register_prefill); this request stays on the eager decode path
+            # until the owner's cache is released.
+            return None
+
         entry.hidden.copy_(hidden_states[:, -entry.target_tokens :])
         entry.timestep.copy_(timestep)
         # Graph buffers are scratch space; request caches must never alias them.
@@ -415,3 +454,4 @@ class QwenImage21DecodeGraphManager:
     def clear(self) -> None:
         """Drop all entries, freeing buffers and captured graphs."""
         self.entries.clear()
+        self._owners.clear()

@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -71,9 +72,9 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
     if value in _PREFIX_KV_FP8_ALIASES:
         return "fp8_e4m3"
     if value in _PREFIX_KV_FP8_V_ALIASES:
-        # V-only FP8 storage: K stays in the native dtype. Measured nearly lossless on this
-        # model (PSNR 40.9 dB vs bf16 vs 34.9 dB for K+V fp8) — post-RoPE K is the
-        # precision-sensitive half of the cache.
+        # V-only FP8 storage: K stays in the native dtype. On H200 T2I 1024
+        # (CFG 4, 50 steps) PSNR vs bf16 is 44.0 dB for V-only vs 34.2 dB for
+        # K+V fp8 — post-RoPE K is the precision-sensitive half of the cache.
         return _PREFIX_KV_FP8_V
     raise ValueError(
         f"Unknown prefix_kv_cache_dtype {value!r}; expected None, 'auto' or one of "
@@ -385,7 +386,16 @@ class QwenImage21Rope(nn.Module):
         height_index[image_pad_mask] = torch.tensor(image_height_index, dtype=torch.long, device=device)
         width_index[image_pad_mask] = torch.tensor(image_width_index, dtype=torch.long, device=device)
 
-        return torch.cat([self.freqs[0][frame_index], self.freqs[1][height_index], self.freqs[2][width_index]], dim=-1)
+        height_index = torch.where(height_index < 0, height_index + self.freqs[1].shape[0], height_index)
+        width_index = torch.where(width_index < 0, width_index + self.freqs[2].shape[0], width_index)
+        return torch.cat(
+            [
+                self.freqs[0].index_select(0, frame_index),
+                self.freqs[1].index_select(0, height_index),
+                self.freqs[2].index_select(0, width_index),
+            ],
+            dim=-1,
+        )
 
 
 def _enable_pattern_ignored_layers(quant_config: QuantizationConfig | None) -> QuantizationConfig | None:
@@ -898,19 +908,20 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # Module boundary where _sp_plan shards the target tokens + their RoPE freqs.
         self.sequence_prepare = QwenImage21SequencePrepare(self.img_in, self.pos_embed)
 
-        # Use decode graphs unless the caller requests eager execution.
-        # Model-level (sequential) offload registers its swap hook on this
-        # top-level module rather than on individual blocks; graphs stay
-        # eligible only when that hook keeps weights on persistent staging
-        # storage (see QwenImage21DecodeGraphManager._offload_reason).
-        self.enable_cuda_graph_decode = not od_config.enforce_eager
+        # Use decode graphs unless the caller disables them or requests eager
+        # execution. Model-level (sequential) offload registers its swap hook
+        # on this top-level module rather than on individual blocks; graphs
+        # stay eligible only when that hook keeps weights on persistent
+        # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
+        self.enable_cuda_graph_decode = (
+            getattr(od_config, "enable_cuda_graph_decode", True) and not od_config.enforce_eager
+        )
         self._decode_graph_manager = (
             QwenImage21DecodeGraphManager(
                 self,
                 max_entries=cuda_graph_max_decode_graphs,
-                model_level_offload=(
-                    od_config.enable_cpu_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
-                ),
+                model_level_offload=resolve_offload_strategy(od_config)
+                in {OffloadStrategy.MODEL_LEVEL, OffloadStrategy.DISTRIBUTED_LAYER_WISE},
             )
             if self.enable_cuda_graph_decode
             else None
@@ -1067,17 +1078,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
 
         sp_active = self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1
         ctx = get_forward_context() if is_forward_context_available() else None
-        sp_padding = 0
-        if sp_active:
+        if sp_active and ctx is not None:
             # The prefix is replicated across SP ranks for the Ulysses joint mechanism.
-            if ctx is not None:
-                ctx.split_text_embed_in_sp = False
-                if (
-                    getattr(self.parallel_config, "mask_sp_padding", False)
-                    and ctx.sp_original_seq_len is not None
-                    and ctx.sp_padding_size > 0
-                ):
-                    sp_padding = int(ctx.sp_padding_size)
+            ctx.split_text_embed_in_sp = False
 
         is_decode = kv_cache is not None and len(kv_cache) > 0 and "key" in kv_cache[0].get(cache_branch, {})
 
@@ -1104,6 +1107,19 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
             hidden_states, txt_hidden_states, layout, img_mask, is_decode
         )
+        # Read SP pad size after sequence_prepare: the auto-pad hook only writes
+        # ctx.sp_padding_size during the split inside that call (and once per
+        # context). Reading earlier always sees 0 while the local shard is already
+        # padded — same ordering as Cosmos3.
+        sp_padding = 0
+        if (
+            sp_active
+            and ctx is not None
+            and getattr(self.parallel_config, "mask_sp_padding", False)
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            sp_padding = int(ctx.sp_padding_size)
         # Local layout is always [prefix, target (shard)]: full sequence when SP is off.
         joint_hidden_states = torch.cat([prefix_hidden_states, target_hidden_states], dim=1)
         freqs = torch.cat([prefix_freqs, target_freqs], dim=0)

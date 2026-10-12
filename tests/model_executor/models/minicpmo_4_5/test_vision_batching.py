@@ -100,6 +100,8 @@ class _FakeVisionModel:
 
 
 class _FakeAudioModel:
+    _encode_audio_features = MiniCPMO45OmniLLMForConditionalGeneration._encode_audio_features
+
     def __init__(self, audio_encoder: _FakeAudioEncoder, audio_encoder_layer: int) -> None:
         self.config = _AudioConfig()
         self.apm = audio_encoder
