@@ -36,13 +36,23 @@ def test_process_funcs_resolve_to_the_pipeline_module():
     assert callable(getattr(pipeline_qwen_image_21, post_name))
 
 
-def test_multimodal_metadata_caps_condition_images_at_four():
+def test_multimodal_metadata_caps_condition_images_at_ten():
+    """DELIBERATE DEVIATION from upstream (sync manual \u00a75.2).
+
+    Upstream #8099 pins the cap at 4. We keep 10: the official model card allows 10,
+    and \u00a76.3's acceptance case exercises 10 condition images, so a cap of 4 would
+    make that case unrunnable. The cap is safe on our side because the
+    condition-budget patch (restored in this sync, see `_allocate_condition_areas`)
+    bounds the total condition area; upstream needs the lower cap precisely because
+    its per-image 1024-px resize has no budget at all. `model_metadata.py` records the
+    4xA100-40G measurements behind the number.
+    """
     from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_21_MAX_INPUT_IMAGES, get_diffusion_model_metadata
 
     metadata = get_diffusion_model_metadata("QwenImage21Pipeline")
 
     assert metadata.supports_multimodal_inputs
-    assert metadata.max_multimodal_image_inputs == 4
+    assert metadata.max_multimodal_image_inputs == 10
     assert metadata.max_multimodal_image_inputs == QWEN_IMAGE_21_MAX_INPUT_IMAGES
 
 
@@ -61,4 +71,7 @@ def test_model_index_resolves_and_enriches(tmp_path):
 
     assert config.model_class_name == "QwenImage21Pipeline"
     assert config.supports_multimodal_inputs
-    assert config.max_multimodal_image_inputs == 4
+    # DELIBERATE DEVIATION from upstream (sync manual §5.2): we keep the model
+    # card's 10-image cap, not upstream's 4. See the note on
+    # `test_multimodal_metadata_caps_condition_images_at_ten`.
+    assert config.max_multimodal_image_inputs == 10
