@@ -198,7 +198,13 @@ from .reference_image_geometry import (
     parse_reference_image_short_edge,
 )
 from .reference_video_frames import vae_chunk_frame_count
-from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
+from .request_noise import (
+    MINIMAX_H3_AUDIO_CHANNELS,
+    MINIMAX_H3_CONDITION_SHAPE_LEGACY,
+    MINIMAX_H3_PATCH_SIZE,
+    MINIMAX_H3_RNG_LEGACY,
+    MiniMaxH3RequestNoisePlan,
+)
 from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -1345,6 +1351,14 @@ class MiniMaxH3Pipeline(
 
     supports_step_execution: ClassVar[bool] = True
     load_vae_decoder: bool = True
+
+    # `__init__` overwrites both from the resolved strategy. They are also declared
+    # here because several tests assemble a pipeline with ``object.__new__`` plus
+    # ``nn.Module.__init__`` to exercise tensor helpers without loading weights, and
+    # those instances never run `__init__`. The values are the documented legacy
+    # pairing, which is what a pipeline without a strategy contract would use.
+    rng_mode: str = MINIMAX_H3_RNG_LEGACY
+    condition_noise_shape_mode: str = MINIMAX_H3_CONDITION_SHAPE_LEGACY
     supports_request_cancellation: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
@@ -3090,6 +3104,16 @@ class MiniMaxH3Pipeline(
             base_schedule=base_schedule,
         )
         condition_noise = None
+        # Resolve the condition-image shapes once, before the noise path is chosen:
+        # the guided and precomputed paths skip the request-noise draw below but the
+        # visual-condition augmentation further down still needs these shapes.
+        condition_shapes = None
+        if visual_condition is not None:
+            condition_shapes = visual_condition_shapes
+            if condition_shapes is None and visual_condition_shape is not None:
+                condition_shapes = [visual_condition_shape]
+            if not condition_shapes:
+                raise ValueError("visual condition shape is missing")
         if precomputed_initial_noise is not None:
             initial_video, initial_audio = precomputed_initial_noise
         elif guide_blocks:
@@ -3103,14 +3127,8 @@ class MiniMaxH3Pipeline(
             )
         else:
             # Non-guided requests always take OUR request-noise plan, so the seed
-            # contract stays bit-exact (manual §5.3).
-            condition_shapes = None
-            if visual_condition is not None:
-                condition_shapes = visual_condition_shapes
-                if condition_shapes is None and visual_condition_shape is not None:
-                    condition_shapes = [visual_condition_shape]
-                if not condition_shapes:
-                    raise ValueError("visual condition shape is missing")
+            # contract stays bit-exact (manual §5.3). `condition_shapes` was resolved
+            # above.
             condition_noise = (
                 noise_plan.draw_visual_condition_noise(condition_shapes, target_latent_t=latent_t)
                 if condition_shapes
