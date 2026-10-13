@@ -221,14 +221,23 @@ class VDNCheckpoint:
 
         Only a ``VDNH3_ATTN`` deployment resolves a Hub repository id, so another
         adapter's id is never downloaded here.
+
+        The backend also decides *ownership*: on any other backend ``--lora-path``
+        belongs to our own ``VDN_WINDOW_ATTN`` checkpoint (``vdn.VDNCheckpoint``),
+        so this class must not claim it. Our production artifacts do contain
+        VDN-shaped tensors, and `from_path` would happily recognise them; claiming
+        them here then fails `check_serving_contract`, which is what stopped the
+        ``VDN_WINDOW_ATTN`` production configs from starting after the merge.
         """
         path = getattr(od_config, "lora_path", None)
         if isinstance(path, (list, tuple)):
             path = path[0] if len(path) == 1 else None
         vdn_backend = _resolve_dit_attention_backend(od_config) == "VDNH3_ATTN"
-        root = _checkpoint_dir(path, from_hub=vdn_backend) if path else None
+        if not vdn_backend:
+            return None
+        root = _checkpoint_dir(path, from_hub=True) if path else None
         checkpoint = cls.from_path(root, head_dim=transformer.arch.attention_head_dim) if root is not None else None
-        if checkpoint is None and vdn_backend:
+        if checkpoint is None:
             raise ValueError(
                 f"VDNH3_ATTN runs VDN-H3 checkpoints: pass OpenVDN/vdn-minimax-h3 or its {VDN_CHECKPOINT} "
                 "directory with --lora-path"
