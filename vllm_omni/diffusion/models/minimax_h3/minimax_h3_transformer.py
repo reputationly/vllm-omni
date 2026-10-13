@@ -870,7 +870,11 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
-        if self.vdn is not None and vdn_window is None:
+        # Only the upstream VDNH3 branch consumes `vdn_window`; our VDN_WINDOW_ATTN
+        # branch derives its own geometry from `video_layout` below (see
+        # `self.vdn.plan_geometry`), so requiring the window for both classes would
+        # reject calls that our class handles correctly.
+        if isinstance(self.vdn, VDNH3HybridAttention) and vdn_window is None:
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The linear branch consumes the RAW projections -- pre-QK-norm, pre-RoPE -- so
         # it adds no projection cost and, under a merged LoRA, sees the adapted weights
