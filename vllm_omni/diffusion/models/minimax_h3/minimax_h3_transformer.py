@@ -467,7 +467,10 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         The sinusoidal embedding stays fp32 throughout and concatenates cosine
         values before sine values.
         """
-        if self.adaln_rank is not None:
+        # `adaln_cache.build_cache` assembles this module through ``__new__`` and
+        # sets only the dense-projection attributes, so `adaln_rank` can be absent
+        # there; treat that as "not pruned", which is what the builder wants.
+        if getattr(self, "adaln_rank", None) is not None:
             # The table already contains coordinates of the activated released
             # timestep curve.  Do not apply the released MLP or SiLU again.
             steps = self.table.shape[0] - 1
