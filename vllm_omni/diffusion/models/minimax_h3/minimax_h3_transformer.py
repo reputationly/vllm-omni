@@ -1156,13 +1156,18 @@ class MiniMaxH3AdalnProj(nn.Module):
             has to cover the bias add as well as the matmul; staging only around
             the linear leaves the bias on the host and the add fails.
             """
-            if self._weight_stager is None:
+            # `_weight_stager` is created by `_apply`, not by `__init__`, so a
+            # projector that has never been moved has no such attribute -- and the
+            # pruned branch used not to read it at all. getattr keeps both paths
+            # working before the first `.to()`.
+            stager = getattr(self, "_weight_stager", None)
+            if stager is None:
                 return compute()
-            self._weight_stager.load()
+            stager.load()
             try:
                 return compute()
             finally:
-                self._weight_stager.offload()
+                stager.offload()
 
         def project() -> torch.Tensor:
             if self.pruned:

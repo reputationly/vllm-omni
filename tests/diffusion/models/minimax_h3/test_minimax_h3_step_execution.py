@@ -583,7 +583,13 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     }
 
     pipeline = _step_pipeline(_SegmentMeanModel())
-    conditioning = object()
+    # The real handoff is a `MiniMaxH3EncoderConditioning`; the reference-order
+    # helper reads `.task` and `.ref_blocks` off it, so a bare `object()` is no
+    # longer a faithful stand-in. `fl2va` takes the early return, which is the
+    # path this test is about -- ctx seeding, not reference reordering.
+    from types import SimpleNamespace
+
+    conditioning = SimpleNamespace(task="fl2va", ref_blocks=[])
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_extract_encoder_conditioning",
