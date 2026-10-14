@@ -434,7 +434,26 @@ def _reject_explicit_text_encoder_quantization(quant_config: QuantizationConfig 
     """
     if not isinstance(quant_config, ComponentQuantizationConfig):
         return
-    scoped = [prefix for prefix in quant_config.component_configs if "text_encoder".startswith(prefix)]
+    # Two things the naive `"text_encoder".startswith(prefix)` got wrong:
+    #
+    # * a `None` value means "explicitly NOT quantized" -- it is the documented
+    #   spelling (`{"transformer": fp8_config, "vae": None}` in component_config.py)
+    #   and the factory keeps it verbatim, so `{"transformer": "fp8",
+    #   "text_encoder": None}` is the ordinary way to say "DiT quantized, text
+    #   encoder left alone". Rejecting that would refuse exactly the behaviour we
+    #   implement.
+    # * `resolve()` matches by longest prefix, so a *deeper* key such as
+    #   `text_encoder.text_model.layers` lands on text-encoder layers just as a
+    #   shorter one does. The match therefore has to run in both directions.
+    #
+    # `default` is not in here at all -- `_build_component_config` lifts it into
+    # `default_config` -- so a plain global config still passes straight through,
+    # which is what "quantize where applicable" should mean.
+    scoped = sorted(
+        prefix
+        for prefix, value in quant_config.component_configs.items()
+        if value is not None and (prefix.startswith("text_encoder") or (prefix and "text_encoder".startswith(prefix)))
+    )
     if not scoped:
         return
     raise ValueError(

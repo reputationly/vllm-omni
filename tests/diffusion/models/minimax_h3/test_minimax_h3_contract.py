@@ -1971,6 +1971,50 @@ def test_minimax_h3_fp8_component_selection():
     assert resolve_component_quant_config(encoder_only, "text_encoder").get_name() == "fp8"
 
 
+@pytest.mark.parametrize(
+    ("spec", "rejects"),
+    [
+        # A plain config is global: "quantize where applicable". The H3 text encoder
+        # is not applicable, which `resolve_encoder_quant_config` already encodes by
+        # returning None for pre-quantized methods. Must not raise.
+        ({"method": "fp8"}, False),
+        # Component config that never mentions the encoder.
+        ({"transformer": {"method": "fp8"}}, False),
+        # The documented spelling for "this one stays unquantized": a None value.
+        # `_build_component_config` keeps it verbatim and `component_config.py`'s own
+        # docstring uses exactly this shape. Rejecting it would refuse the behaviour
+        # we implement.
+        ({"transformer": {"method": "fp8"}, "text_encoder": None}, False),
+        # Explicitly asking for encoder quantization: nothing here can honour it.
+        ({"text_encoder": {"method": "fp8"}}, True),
+        # `ComponentQuantizationConfig.resolve` matches by longest prefix, so a deeper
+        # key lands on text-encoder layers just like a shorter one.
+        ({"text_encoder.text_model": {"method": "fp8"}}, True),
+    ],
+    ids=["global", "dit-only", "encoder-none", "encoder-fp8", "encoder-deeper-key"],
+)
+def test_only_an_explicit_text_encoder_quantization_is_rejected(spec, rejects):
+    """`_reject_explicit_text_encoder_quantization` fires on intent, not on key presence.
+
+    The encoder is not quantization-aware -- its linear layers take no `quant_config`
+    and INT8 comes from the checkpoint's own `weight_scale` -- so an explicit request
+    to quantize it cannot be honoured and must not be silently dropped. Everything
+    else has to pass, including the `None` spelling for "leave this one alone", which
+    is one key away from the case we do reject.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _reject_explicit_text_encoder_quantization,
+    )
+    from vllm_omni.quantization import build_quant_config
+
+    quant_config = build_quant_config(spec)
+    if rejects:
+        with pytest.raises(ValueError, match="text encoder quantization is not supported"):
+            _reject_explicit_text_encoder_quantization(quant_config)
+    else:
+        _reject_explicit_text_encoder_quantization(quant_config)
+
+
 def test_text_encoder_rejects_online_only_int8(tmp_path):
     """An int8 checkpoint with no serialized weights must be refused, not guessed at.
 
