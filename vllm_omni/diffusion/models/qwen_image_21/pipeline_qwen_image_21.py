@@ -80,6 +80,15 @@ OUTPUT_RESOLUTION = 1024
 # descriptive constant for validation without becoming the source of truth.
 MAX_QWEN_IMAGE_21_INPUT_IMAGES = QWEN_IMAGE_21_MAX_INPUT_IMAGES
 
+# Per-request ceiling on the summed condition-image area (in megapixels) used when
+# the request does not pin `condition_resolution`. Every condition image adds
+# area / 256 VAE tokens plus area / 1024 vision-language tokens to the cached
+# prefix, and that prefix is replicated on every sequence-parallel rank, so this is
+# the knob that bounds prefix memory. Measured on 4x A100-40G (SP4, W8A16, fp8 prefix
+# KV, expandable segments) at the largest 2K output, 2752x1536: every layout up to
+# 11.4 MP kept >= 3.5 GiB free per card, ~12.6 MP leaves ~2 GiB, and ~13.3 MP is the
+# cliff. The binding peak is the DiT prefill over the whole prefix, not the text
+# encoder. The default leaves a little room below 11.4 MP for long prompts.
 CONDITION_BUDGET_ENV = "VLLM_OMNI_QWEN_IMAGE_21_CONDITION_BUDGET_MPX"
 _DEFAULT_CONDITION_BUDGET_PIXELS = 11_000_000
 
