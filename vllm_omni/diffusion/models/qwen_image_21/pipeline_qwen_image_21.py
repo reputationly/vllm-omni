@@ -181,10 +181,11 @@ def _resolve_text_encoder_quant_config(
     return resolve_encoder_quant_config(resolved)
 
 
-# Subtrees of the HF Qwen3-VL text encoder that must stay in checkpoint
-# precision: the vision tower (condition-image encoding is numerically
-# sensitive) and the LM head (unused — the pipeline reads hidden states).
-_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES = ("model.visual", "lm_head")
+# Subtree of the HF Qwen3-VL text encoder that must stay in checkpoint precision:
+# the vision tower (condition-image encoding is numerically sensitive). The LM head
+# is deliberately left quantized: the pipeline reads hidden states and discards the
+# logits, so its precision never reaches the output.
+_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES = ("model.visual",)
 
 
 def _exclude_text_encoder_subtrees_from_quant(
@@ -192,24 +193,28 @@ def _exclude_text_encoder_subtrees_from_quant(
 ) -> "QuantizationConfig | None":
     """Keep the vision tower and LM head in checkpoint precision.
 
-    Uses the config's standard ``ignored_layers`` mechanism, with substring
-    matching so the prefixes cover whole subtrees (same convention as the
-    DiT's ``_enable_pattern_ignored_layers``).
+    Backends spell the exclusion list differently: the vLLM FP8 family uses
+    ``ignored_layers`` (with an opt-in substring match mode, same convention as
+    the DiT's ``_enable_pattern_ignored_layers``), while ``TorchAOConfig`` uses
+    ``skip_modules``, which already matches on whole dot-separated segments and
+    so covers a subtree as written.
     """
     if quant_config is None:
         return None
-    if not hasattr(quant_config, "ignored_layers"):
-        logger.warning(
-            "Quantization config %s has no ignored_layers; the Qwen3-VL vision tower "
-            "and LM head cannot be excluded from quantization.",
-            type(quant_config).__name__,
-        )
-        return quant_config
-    config = copy.copy(quant_config)
-    config.ignored_layers = [*config.ignored_layers, *_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES]
-    if hasattr(config, "ignored_layers_match_mode"):
-        config.ignored_layers_match_mode = "substring"
-    return config
+    for attr in ("ignored_layers", "skip_modules"):
+        if not hasattr(quant_config, attr):
+            continue
+        config = copy.copy(quant_config)
+        setattr(config, attr, [*(getattr(config, attr) or []), *_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES])
+        if attr == "ignored_layers" and hasattr(config, "ignored_layers_match_mode"):
+            config.ignored_layers_match_mode = "substring"
+        return config
+    logger.warning(
+        "Quantization config %s has neither ignored_layers nor skip_modules; the Qwen3-VL "
+        "vision tower and LM head cannot be excluded from quantization.",
+        type(quant_config).__name__,
+    )
+    return quant_config
 
 
 def get_qwen_image_21_pre_process_func(
@@ -719,10 +724,15 @@ class QwenImage21Pipeline(
             processor_kwargs["images"] = condition_pil_list
         model_inputs = self.processor(**processor_kwargs).to(self.device)
 
+        # Only the pre-norm last hidden state is used (captured by the hook below), so
+        # neither the per-layer hidden states nor the vocabulary logits are kept:
+        # `logits_to_keep=1` runs the LM head on one position instead of the whole
+        # sequence. With ten 1024^2 references that sequence is ~10k tokens, and the
+        # full-vocabulary logits alone are ~3 GB.
         forward_kwargs: dict[str, Any] = {
             "input_ids": model_inputs.input_ids,
             "attention_mask": model_inputs.attention_mask,
-            "output_hidden_states": True,
+            "logits_to_keep": 1,
         }
         if has_images and hasattr(model_inputs, "pixel_values"):
             forward_kwargs.update(
@@ -735,12 +745,18 @@ class QwenImage21Pipeline(
             forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
 
         text_model = getattr(self.text_encoder.model, "language_model", self.text_encoder.model)
-        handle = text_model.norm.register_forward_hook(lambda module, args, output: args[0])
+        captured: dict[str, torch.Tensor] = {}
+
+        def _capture_pre_norm(module, args, output):
+            captured["hidden_states"] = args[0]
+            return args[0]
+
+        handle = text_model.norm.register_forward_hook(_capture_pre_norm)
         try:
-            outputs = self.text_encoder(**forward_kwargs)
+            self.text_encoder(**forward_kwargs)
         finally:
             handle.remove()
-        hidden_states = outputs.hidden_states[-1]
+        hidden_states = captured["hidden_states"]
 
         split_hidden_states = list(self._extract_masked_hidden(hidden_states, model_inputs.attention_mask))
         split_hidden_states = [e[self._drop_idx :] for e in split_hidden_states]
