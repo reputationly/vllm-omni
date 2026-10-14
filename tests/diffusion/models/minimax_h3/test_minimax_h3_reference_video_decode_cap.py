@@ -151,17 +151,17 @@ def _request(num_frames):
 
 
 def test_the_route_asks_the_handler_and_uses_the_answer():
-    from vllm_omni.entrypoints.openai import api_server
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _reference_video_decode_spec
 
-    spec = api_server._reference_video_decode_spec(_request(120), None, _handler(_config("official_diffusers_v1")))
+    spec = _reference_video_decode_spec(_request(120), None, _handler(_config("official_diffusers_v1")))
     assert (spec.max_frames, spec.keep) == (124, "first")
 
 
 def test_the_route_without_a_handler_is_the_old_behaviour():
     """Every caller that never learned about this keeps working unchanged."""
-    from vllm_omni.entrypoints.openai import api_server
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _reference_video_decode_spec
 
-    spec = api_server._reference_video_decode_spec(_request(120), None)
+    spec = _reference_video_decode_spec(_request(120), None)
     assert spec.max_frames == 120
 
 
@@ -172,7 +172,8 @@ def test_a_model_that_answers_for_itself_still_wins(monkeypatch):
     in cannot have moved a model that was already answering.
     """
     from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
-    from vllm_omni.entrypoints.openai import api_server
+    from vllm_omni.entrypoints.openai.video.generation import helpers
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _reference_video_decode_spec
 
     class _Model:
         @classmethod
@@ -180,7 +181,9 @@ def test_a_model_that_answers_for_itself_still_wins(monkeypatch):
             del num_frames, extra_args
             return ReferenceVideoDecodeSpec(max_frames=17, keep="last")
 
-    monkeypatch.setattr(api_server, "_diffusion_model_classes", lambda _stage_configs: [_Model])
-    spec = api_server._reference_video_decode_spec(_request(120), None, _handler(_config("official_diffusers_v1")))
+    # helpers._reference_video_decode_spec reads this module global, so the patch
+    # has to land on helpers -- patching api_server never affected that call.
+    monkeypatch.setattr(helpers, "_diffusion_model_classes", lambda _stage_configs: [_Model])
+    spec = _reference_video_decode_spec(_request(120), None, _handler(_config("official_diffusers_v1")))
 
     assert (spec.max_frames, spec.keep) == (17, "last")

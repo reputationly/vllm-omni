@@ -609,9 +609,10 @@ def prepare_reference_videos_official(
         already-normalized ``audio`` (or None), in request order.
     """
     from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
-
-    from .reference_media_decode import open_reference_video
-    from .reference_video_frames import normalize_reference_video_stream
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
+    from vllm_omni.diffusion.models.minimax_h3.reference_video_frames import (
+        normalize_reference_video_stream,
+    )
 
     if isinstance(values, (str, os.PathLike)):
         values = [values]

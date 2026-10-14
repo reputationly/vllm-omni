@@ -83,7 +83,7 @@ def test_reference_image_has_no_area_cap_unlike_video_and_output():
 
     参考视频与输出画布都按 MINIMAX_H3_MAX_PIXELS = 768*1344 封顶，参考图没有。
     """
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import MINIMAX_H3_MAX_PIXELS
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import MINIMAX_H3_MAX_PIXELS
 
     # 比例上限 2.5（超过会被 _reference_image_shape 拒绝）。
     out_width, out_height = _shape(2560, 1024)
@@ -362,7 +362,7 @@ def test_area_cap_decouples_row_cost_from_aspect_ratio(monkeypatch, width, heigh
 
 def test_area_cap_matches_the_reference_video_ceiling(monkeypatch):
     """参考图封顶值与参考视频用的是同一个常量口径，不是另发明一个数。"""
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import MINIMAX_H3_MAX_PIXELS
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import MINIMAX_H3_MAX_PIXELS
 
     assert _ALIGNED_CAP == MINIMAX_H3_MAX_PIXELS
 
@@ -495,7 +495,7 @@ def test_worst_case_nine_images_within_validated_envelope(monkeypatch):
 )
 def test_reference_video_target_depends_only_on_aspect_ratio(width, height):
     """参考视频的目标尺寸只由宽高比推出，原分辨率被丢弃——所以小视频同样会被放大。"""
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import _reference_video_shape
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import _reference_video_shape
 
     # 16:9 一族（比例相同）无论输入多大多小，目标完全一致。
     assert _reference_video_shape(width, height) == _reference_video_shape(1344, 768)
@@ -503,7 +503,7 @@ def test_reference_video_target_depends_only_on_aspect_ratio(width, height):
 
 def test_reference_video_is_area_capped_unlike_reference_image():
     """参考视频有面积封顶，参考图没有——同一份代码里的不对称。"""
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         MINIMAX_H3_MAX_PIXELS,
         _reference_video_shape,
     )

@@ -601,7 +601,11 @@ def test_renamed_local_partition_is_used_directly(tmp_path):
     model_path = tmp_path / "MiniMax-H3-FL2VA-INT8"
     _write_partition_index(model_path, partition="fl2va", tasks=["t2va", "fl2va"])
 
-    model_root, selected_path = _resolve_minimax_h3_partition_path(str(model_path), None, "fl2va")
+    # An explicit local partition directory is used directly, so the
+    # encoder-loading question never reaches the resolver here.
+    model_root, selected_path = _resolve_minimax_h3_partition_path(
+        str(model_path), None, "fl2va", load_text_encoder=False
+    )
 
     assert model_root == tmp_path
     assert selected_path == model_path
@@ -1232,6 +1236,10 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     class FakeBackend:
         supports_prefix_kv_slicing = True
 
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
+
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
 
@@ -1341,6 +1349,10 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
 
     class FakeBackend:
         supports_prefix_kv_slicing = False
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
@@ -1892,15 +1904,33 @@ def test_minimax_h3_fp8_component_selection():
     assert resolve_component_quant_config(encoder_only, "text_encoder").get_name() == "fp8"
 
 
-def test_text_encoder_rejects_serialized_fp8():
-    from vllm_omni.diffusion.models.minimax_h3.encoder import _validate_encoder_quant_config
+def test_text_encoder_rejects_online_only_int8(tmp_path):
+    """An int8 checkpoint with no serialized weights must be refused, not guessed at.
 
-    config = SimpleNamespace(
-        get_name=lambda: "fp8",
-        is_checkpoint_fp8_serialized=True,
+    Rewritten from `test_text_encoder_rejects_serialized_fp8`, which imported
+    `_validate_encoder_quant_config` -- a symbol that has never existed on any
+    branch (verified with `git grep`), so that test never ran. The contract it was
+    reaching for is still enforced, by `_enable_int8_if_serialized`, which reads
+    the checkpoint's own config.json and refuses an int8 declaration that is not
+    `is_checkpoint_int8_serialized`: an Int8 checkpoint has no BF16 weights to fall
+    back to, so online quantization would silently produce garbage.
+    """
+    import json
+
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "int8", "is_checkpoint_int8_serialized": False}}),
+        encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="online FP8 only"):
-        _validate_encoder_quant_config(config)
+    encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.text_model = torch.nn.Sequential()
+
+    with pytest.raises(ValueError, match="online quantization is not supported here"):
+        encoder._enable_int8_if_serialized(str(tmp_path))
 
 
 def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
@@ -2548,7 +2578,7 @@ def test_ref2va_reference_count_validation_preserves_client_error_metadata():
 def test_r7_r8_ref2va_video_segment_matrix(
     monkeypatch, tmp_path, case, start_time, expected_duration, input_size, expected_size
 ):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     source = tmp_path / f"{case}.mp4"
     source.touch()
@@ -2587,7 +2617,7 @@ def test_r7_r8_ref2va_video_segment_matrix(
 
 
 def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -2640,7 +2670,7 @@ def test_prepared_reference_video_descriptor_rejects_unknown_fields():
 
 
 def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     decoded = np.arange(3 * 2 * 2 * 3, dtype=np.uint8).reshape(3, 2, 2, 3)
     decode_calls: list[Any] = []
@@ -2682,7 +2712,7 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     [([0, 12], 25), (None, 2)],
 )
 def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame_count):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
     observed = []
@@ -2714,7 +2744,7 @@ def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame
 
 
 def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.zeros((2, 2, 3, 3), dtype=np.uint8)
     decode_calls: list[Any] = []
@@ -2761,15 +2791,15 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     ],
 )
 def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     with pytest.raises(OmniClientError, match=message):
         reference_video_module._decode_video_frames_ffmpeg("prepared.mp4", **kwargs)
 
 
 def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     calls: list[Any] = []
     probe = {
@@ -2804,7 +2834,7 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
 
 
 def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     calls: list[Any] = []
     stream = {
@@ -2841,8 +2871,8 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
 
 
 def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     monkeypatch.setattr(
         reference_video_module.subprocess,
@@ -2860,7 +2890,7 @@ def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
 
 
 def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"
@@ -2914,8 +2944,8 @@ def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_p
 
 
 def test_ref2va_two_video_recipe_rejects_real_duration_overflow(monkeypatch, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"

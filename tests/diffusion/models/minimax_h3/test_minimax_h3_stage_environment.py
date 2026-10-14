@@ -232,7 +232,7 @@ def test_the_view_hands_out_plain_python_whatever_the_config_was_built_from():
     — rather than a hand-made ``DictConfig``, because the question is what the
     config layer produces and not what OmegaConf can produce.
     """
-    from vllm_omni.engine.async_omni_engine import _plain_config_value
+    from vllm_omni.engine.omni_engine_base import _plain_config_value
 
     engine_args = _shipped_h3_stage({_CONTRACT: "official_diffusers_v1"}).to_omegaconf().engine_args
     carried = getattr(engine_args, "diffusion_runtime_environ", None)

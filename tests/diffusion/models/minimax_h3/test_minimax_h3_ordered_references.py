@@ -118,7 +118,8 @@ def test_metadata_and_prompt_share_the_condition_label_vocabulary(monkeypatch):
     presentation again would leave the artifact correct while silently feeding
     different text to Qwen, and this test would fail.
     """
-    from vllm_omni.diffusion.models.minimax_h3 import ordered_references, presentation
+    from vllm_omni.diffusion.models.minimax_h3 import ordered_references
+    from vllm_omni.model_executor.models.minimax_h3 import preprocessing as presentation
 
     texts: list[str] = []
 
