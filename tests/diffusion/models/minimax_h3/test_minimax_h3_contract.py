@@ -428,13 +428,19 @@ def test_pipeline_import_registry_and_component_discovery():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_minimax_h3_postprocess_writes_owned_bitwise_equivalent_video(dtype):
-    from vllm_omni.diffusion.diffusion_engine import (
-        _numpy_owns_its_memory,
-        _reown_foreign_numpy,
-    )
+def test_video_output_quantizes_clamps_and_owns_its_bytes(dtype):
+    """The float->uint8 conversion lives in the worker now, not in post-process.
+
+    This block used to assert these properties on ``_minimax_h3_post_process``,
+    which since moved on: it now *requires* a uint8 ``(B, T, H, W, C)`` tensor and
+    only carries it across the process boundary, while the clamp/scale/quantize
+    step is ``_prepare_minimax_h3_video_output``. The properties worth pinning are
+    unchanged -- NaN and +-inf must not survive as garbage, ``-0.0`` must not round
+    *up* to 255 the way a floor-based conversion would, and the result must be a
+    contiguous uint8 tensor in the muxer's layout.
+    """
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-        _minimax_h3_post_process,
+        _prepare_minimax_h3_video_output,
     )
 
     video = (
@@ -448,19 +454,70 @@ def test_minimax_h3_postprocess_writes_owned_bitwise_equivalent_video(dtype):
     video[0, 0, 0, 0, 1] = float("inf")
     video[0, 0, 0, 0, 2] = float("-inf")
     video[0, 0, 0, 1, 0] = -0.0
+
+    # `_prepare_minimax_h3_video_output` quantizes *in place* (its docstring says
+    # so) and `video.float()` is a no-op for an fp32 input, so an oracle taken
+    # afterwards would read the already-mutated buffer.
+    expected = video.detach().float().clamp(0, 1).mul(255).round().to(torch.uint8).permute(0, 2, 3, 4, 1).contiguous()
+
+    out = _prepare_minimax_h3_video_output(video)
+
+    assert out.dtype == torch.uint8
+    assert out.shape == (2, 17, 2, 3, 3), "expected the muxer layout (B, T, H, W, C)"
+    assert out.is_contiguous()
+
+    # The four edited voxels. The input is (B, T, C, H, W); `_prepare_...`
+    # permutes to (B, C, H, W, T), so the last input axis becomes the first
+    # output axis after the leading two.
+    assert out[0, 0, 0, 0, 0].item() == 0, "NaN must not survive as garbage"
+    assert out[0, 0, 0, 1, 0].item() == 255, "+inf clamps to the top of the range"
+    assert out[0, 0, 0, 2, 0].item() == 0, "-inf clamps to the bottom"
+    assert out[0, 0, 1, 0, 0].item() == 0, "-0.0 must not floor to 255"
+
+    assert torch.equal(out, expected)
+
+
+def test_postprocess_carries_owned_uint8_frames_across_the_transfer():
+    """What post-process still owes: owned, contiguous, bit-identical bytes."""
+    from vllm_omni.diffusion.diffusion_engine import (
+        _numpy_owns_its_memory,
+        _reown_foreign_numpy,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+
+    video = torch.randint(0, 256, (2, 3, 17, 2, 3), dtype=torch.uint8)
     audio = torch.arange(24, dtype=torch.float32).reshape(1, 2, 12)
-    oracle = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
 
     result = _minimax_h3_post_process((video, audio))
 
     assert len(result["video"]) == 2
-    for expected, actual in zip(oracle, result["video"], strict=True):
-        assert actual.dtype == np.float32
-        assert actual.flags.c_contiguous
-        assert _numpy_owns_its_memory(actual)
-        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
-        assert _reown_foreign_numpy(actual) is actual
+    for frame, expected in zip(result["video"], video, strict=True):
+        assert isinstance(frame, np.ndarray)
+        assert frame.dtype == np.uint8
+        assert frame.flags.c_contiguous
+        np.testing.assert_array_equal(frame, expected.numpy())
+        # `output_type="np"` on a CPU tensor yields a *view* onto torch's buffer.
+        # Re-owning it is the engine's job (`_reown_foreign_numpy`) and is gated by
+        # `_REOWN_MIN_BYTES` (512 KiB), so for frames this small it deliberately
+        # does nothing. The old version of this test asserted the pipeline
+        # re-owned them -- true only of the float path it was written against.
+        assert _numpy_owns_its_memory(frame) is False, "expected a borrowed view at this size"
+        assert _reown_foreign_numpy(frame) is frame, "below the re-own threshold it must pass through"
     np.testing.assert_array_equal(result["audio"], audio.numpy())
+
+
+def test_postprocess_rejects_non_uint8_instead_of_muxing_black():
+    """A float or channel-first tensor must fail here, not reach the muxer."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+
+    floats = torch.zeros(2, 3, 17, 2, 3, dtype=torch.float32)
+    audio = torch.zeros(1, 2, 12, dtype=torch.float32)
+    with pytest.raises(ValueError, match="uint8"):
+        _minimax_h3_post_process((floats, audio))
 
 
 def test_diffusion_stage_has_only_dit_and_decoder_vaes_during_discovery():
