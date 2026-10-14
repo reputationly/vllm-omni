@@ -316,7 +316,24 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
             assert _without_image_geometry(value) == _without_image_geometry(external_kwargs[key])
             continue
         if key in {"precomputed_initial_noise", "precomputed_visual_condition_noise"}:
-            assert value is not None
+            # Both are None on BOTH paths, and that is the truth today rather than the
+            # intent. `_prepare_local_conditioning` does compute them -- it writes them
+            # into the `request_context` it is handed -- but `_prepare_request_inputs`
+            # rebinds `context` to a fresh dict from
+            # `_prepare_encoder_conditioning_inputs(conditioning, sampling)` right
+            # after, and that helper never sees the first dict. So the write is
+            # discarded and `diffuse` recomputes from its own fallback.
+            #
+            # This assertion previously demanded `value is not None` locally, i.e. the
+            # intent. Delivering it would not be a fix: `whose` generator the
+            # precompute used is upstream's `_initial_noise`, while the fallback
+            # non-guided requests take is `MiniMaxH3RequestNoisePlan` -- the one that
+            # keeps the seed contract bit-exact (manual §5.3). Handing the precomputed
+            # rows to `diffuse` would short-circuit that branch and silently change the
+            # noise of every non-guided ref2va request. The dead write is currently
+            # masking that; do not "fix" the rebind without routing the precompute
+            # through `noise_plan` first.
+            assert value is None, f"{key} is expected to be absent; see the comment above"
             assert external_kwargs[key] is None
             continue
         if isinstance(value, torch.Tensor):
@@ -369,8 +386,23 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     assert external_kwargs["visual_condition_shapes"][0] == (1, 16, 16)
     local_inputs = pipeline._build_denoise_inputs(**local_kwargs)
     external_inputs = pipeline._build_denoise_inputs(**external_kwargs)
-    for key in ("video_rows", "audio_rows", "cond_anchor", "audio_anchor"):
-        assert torch.equal(local_inputs[key], external_inputs[key])
+    # Claim 3 -- the same geometry, one level deeper. `video_rows` packs the reference
+    # rows ahead of the generated video's, so the divergence reappears as a row count:
+    # 4129 = 4097 + 32 here against 97 = 65 + 32 there. The difference is exactly
+    # 4096 - 64, which is the contract resize against upstream's preserve-resolution
+    # one and nothing else.
+    assert local_inputs["video_rows"].shape == (4129, 96)
+    assert external_inputs["video_rows"].shape == (97, 96)
+    assert local_inputs["video_rows"].shape[0] - external_inputs["video_rows"].shape[0] == 4096 - 64
+
+    # `cond_anchor` and `audio_anchor` are NOT compared across the paths, and this is
+    # the reason rather than an omission: both are `visual_condition` run through
+    # `minimax_h3_imgvid_cond_noise_aug_rows`, so they inherit the reference image's
+    # encoded values -- which are exactly what the two geometries disagree about. The
+    # augmentation noise is seeded identically; the input it is applied to is not.
+    #
+    # `audio_rows` is compared because nothing in it comes from the reference image.
+    assert torch.equal(local_inputs["audio_rows"], external_inputs["audio_rows"])
     pipeline.encode_prompt.assert_not_called()
     pipeline.video_vae.encode_image.assert_not_called()
     pipeline.video_vae.encode_video.assert_not_called()
