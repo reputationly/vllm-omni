@@ -3,7 +3,6 @@
 
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 
 import pytest
 import torch
@@ -139,32 +138,22 @@ def test_consumed_host_noise_is_released_before_denoising(pipeline, monkeypatch)
 
 
 @pytest.mark.parametrize("failure_stage", ["text", "media"])
-def test_encoder_failure_cancels_pending_noise_and_joins_worker(pipeline, monkeypatch, failure_stage):
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+def test_encoder_failure_leaves_no_noise_worker_and_an_untouched_context(pipeline, monkeypatch, failure_stage):
+    """Deliberate deviation from upstream #8577 -- see the producer site and manual §3.2.
 
-    pool = ThreadPoolExecutor(max_workers=1)
-    release = Event()
-    started = Event()
-    futures = []
-    submit = pool.submit
-    shutdown = pool.shutdown
+    Upstream prepares the Ref2VA initial/visual-condition noise on a worker thread inside
+    ``_prepare_local_conditioning``, so this test used to assert that two futures were
+    submitted and cancelled when the encoder failed (it also monkeypatched
+    ``module.ThreadPoolExecutor``, which no longer exists here).
 
-    def hold_worker():
-        started.set()
-        assert release.wait(10)
+    The producer is off because the rows it drew came from ``self._initial_noise`` while
+    ``diffuse``'s non-guided fallback draws from ``MiniMaxH3RequestNoisePlan``, and
+    `diffuse` tests the precomputed branch first -- so restoring it would silently change
+    the noise of every non-guided Ref2VA request (manual §5.3).
 
-    blocker = submit(hold_worker)
-    assert started.wait(10)
-
-    def record_submit(*args, **kwargs):
-        future = submit(*args, **kwargs)
-        futures.append(future)
-        return future
-
-    def release_and_shutdown(*, wait=True, cancel_futures=False):
-        shutdown(wait=False, cancel_futures=cancel_futures)
-        release.set()
-        shutdown(wait=wait)
+    What must still hold: the encoder failure propagates, no worker is left behind, and
+    nothing is written into the request context. Restoring the producer turns this red.
+    """
 
     def encode_prompt(prepared):
         if failure_stage == "text":
@@ -177,19 +166,14 @@ def test_encoder_failure_cancels_pending_noise_and_joins_worker(pipeline, monkey
     pipeline._fasth3 = None
     pipeline.supported_tasks = ("ref2va",)
     pipeline.od_config = OmniDiffusionConfig()
-    monkeypatch.setattr(pool, "submit", record_submit)
-    monkeypatch.setattr(pool, "shutdown", release_and_shutdown)
-    monkeypatch.setattr(module, "ThreadPoolExecutor", lambda **kwargs: pool)
     monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
     monkeypatch.setattr(pipeline, "_encode_local_media", fail_media)
     sampling = OmniDiffusionSamplingParams(height=64, width=64, seed=42, extra_args={"task": "ref2va", "duration": 4.4})
     prompt = {"prompt": "reference", "multi_modal_data": {"image": Image.new("RGB", (256, 256))}}
-    try:
-        with pytest.raises(RuntimeError, match=f"{failure_stage} encoder failed"):
-            pipeline._prepare_local_conditioning(prompt, sampling, request_context={})
-        assert len(futures) == 2
-        assert all(future.cancelled() for future in futures)
-        assert blocker.done()
-    finally:
-        release.set()
-        shutdown(wait=True, cancel_futures=True)
+    context: dict = {}
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} encoder failed"):
+        pipeline._prepare_local_conditioning(prompt, sampling, request_context=context)
+
+    assert "precomputed_initial_noise" not in context
+    assert "precomputed_visual_condition_noise" not in context

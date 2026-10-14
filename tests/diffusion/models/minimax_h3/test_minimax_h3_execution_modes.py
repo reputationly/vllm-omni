@@ -245,6 +245,14 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
         return kwargs
 
     pipeline.forward(request)
+    # Deviation pin (manual §3.2): upstream #8577's producer is disabled on this branch, so
+    # the request context must reach `diffuse` carrying no precomputed noise. Restoring the
+    # producer turns this red -- and restoring it is a §5.3 regression, because those rows
+    # would come from `self._initial_noise` rather than `MiniMaxH3RequestNoisePlan`.
+    # Read before `capture_denoise_kwargs`, which pops these keys.
+    forwarded_context = pipeline.diffuse.call_args.kwargs["request_context"]
+    assert "precomputed_initial_noise" not in forwarded_context
+    assert "precomputed_visual_condition_noise" not in forwarded_context
     local_kwargs = capture_denoise_kwargs()
 
     transformed = prepare_encoder_prompt(request.prompts[0], [request.sampling_params])

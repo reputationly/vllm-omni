@@ -8,7 +8,6 @@ import json
 import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
@@ -128,7 +127,6 @@ from .batched_packing import minimax_h3_batched_forward_kwargs
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
-    minimax_h3_imgvid_cond_noise_rows,
 )
 from .continuation import diffuse_continuation, plan_continuation_windows, resolve_continuation
 from .denoise_loop import (
@@ -1803,25 +1801,52 @@ class MiniMaxH3Pipeline(
         logger.info("MiniMax-H3 contract: %s", self.strategy.describe())
         if not self.load_text_encoder and _reference_image_geometry_overrides_upstream(self.strategy):
             # Say it out loud rather than let it be discovered from output. The
-            # contract's `reference_image_*` geometry is applied by
-            # `prepare_encoder_inputs`'s `reference_image_shape` callback, which only
-            # the diffusion pipeline passes; the encoder-stage bridge calls it without
-            # one, so a disaggregated deployment resizes references exactly as upstream
-            # does. An operator who set `VLLM_OMNI_H3_REF_IMAGE_*` or picked a contract
-            # for its reference-image behaviour would otherwise be reading a log that
-            # claims the contract while the pixels follow a different policy.
-            logger.warning(
-                "MiniMax-H3 contract %r sets a reference-image geometry, but this deployment runs the "
-                "text encoder in a separate stage: reference images follow the upstream resize "
-                "(preserve resolution, 32-pixel grid) and the contract's reference_image_* settings "
-                "(mode=%s, short_edge=%s, no_upscale=%s, max_pixels=%s) do not apply. "
-                "Reference-image geometry is contract-controlled only on a single-stage deployment.",
-                self.strategy.name,
-                self.strategy.reference_image_geometry_mode,
-                self.strategy.reference_image_short_edge,
-                self.strategy.reference_image_no_upscale,
-                self.strategy.reference_image_max_pixels,
+            # contract's `reference_image_*` geometry reaches `prepare_encoder_inputs`
+            # through its `reference_image_shape` callback, which only the diffusion
+            # pipeline passes; the encoder-stage bridge calls it without one, so the
+            # references the ENCODER STAGE sees are resized exactly as upstream does.
+            #
+            # How much of the request that covers depends on `load_vae_encoder`, because
+            # `_prepare_request_inputs` only runs `_prepare_local_conditioning` (and
+            # therefore the callback) when `load_text_encoder or load_vae_encoder`:
+            #
+            #   * neither local  -> everything is the stage's, so the whole geometry is
+            #                       upstream's and no `reference_image_*` setting applies;
+            #   * VAE local      -> the visual condition is encoded here at the contract
+            #                       geometry, while the TEXT conditioning was computed by
+            #                       the stage from an upstream-resized reference. The two
+            #                       halves of the request disagree about the reference.
+            #
+            # An operator who set `VLLM_OMNI_H3_REF_IMAGE_*` or picked a contract for its
+            # reference-image behaviour would otherwise read a log that claims the
+            # contract while part of the request follows a different policy.
+            geometry = (
+                f"mode={self.strategy.reference_image_geometry_mode}, "
+                f"short_edge={self.strategy.reference_image_short_edge}, "
+                f"no_upscale={self.strategy.reference_image_no_upscale}, "
+                f"max_pixels={self.strategy.reference_image_max_pixels}"
             )
+            if self.load_vae_encoder:
+                logger.warning(
+                    "MiniMax-H3 contract %r sets a reference-image geometry (%s), but the text encoder "
+                    "runs in a separate stage: the reference images the text conditioning was computed "
+                    "from follow the upstream resize (preserve resolution, 32-pixel grid) and do not use "
+                    "those settings. The visual condition IS encoded locally and does use them, so the "
+                    "two halves of this request disagree about the reference image. "
+                    "Reference-image geometry is contract-controlled for both halves only on a "
+                    "single-stage deployment.",
+                    self.strategy.name,
+                    geometry,
+                )
+            else:
+                logger.warning(
+                    "MiniMax-H3 contract %r sets a reference-image geometry (%s), but neither the text "
+                    "encoder nor the VAE encoder runs locally: reference images follow the upstream "
+                    "resize (preserve resolution, 32-pixel grid) and none of those settings apply. "
+                    "Reference-image geometry is contract-controlled only on a single-stage deployment.",
+                    self.strategy.name,
+                    geometry,
+                )
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -4155,28 +4180,36 @@ class MiniMaxH3Pipeline(
                     prepared = replace(prepared, prompt=prompts[0])
                     # External text belongs to the main prompt, not the first window.
                     text_conditioning = None
-                if request_context is not None and task == "ref2va" and continuation is None:
-                    initial_noise_params = {
-                        "seed": int(sampling.seed if sampling.seed is not None else 42),
-                        "latent_t": prepared.media.latent_t,
-                        "latent_h": prepared.media.height // 16,
-                        "latent_w": prepared.media.width // 16,
-                        "audio_t": prepared.media.audio_t,
-                    }
-                    # Guided requests draw per-condition noise over the merged
-                    # guide + reference rows, so only the target noise is reused.
-                    condition_shapes = (
-                        self._predict_visual_condition_shapes(prepared.media)
-                        if not prepared.media.timeline_guides
-                        else ()
-                    )
-                    if condition_shapes:
-                        visual_noise_params = {
-                            "condition_shapes": condition_shapes,
-                            "target_latent_t": prepared.media.latent_t,
-                            "imgvid_cond_num_frames": len(condition_shapes),
-                            "seed": initial_noise_params["seed"],
-                        }
+                # Upstream #8577 ("overlap Ref2VA CPU noise preparation", 681ae741d)
+                # precomputes the request's initial and visual-condition noise here on
+                # a worker thread and hands the rows to `diffuse` through the request
+                # context. It is DELIBERATELY OFF on this branch, and the reason is not
+                # performance:
+                #
+                # `diffuse` tests `if precomputed_initial_noise is not None:` first,
+                # which short-circuits its `MiniMaxH3RequestNoisePlan` branch -- and that
+                # plan is what keeps the seed contract bit-exact (manual §5.3). The rows
+                # this block produced came from upstream's `self._initial_noise`, a
+                # different generator, so handing them over silently changes the noise of
+                # every non-guided Ref2VA request.
+                #
+                # Note that upstream itself did not have this problem, and not because it
+                # solved it: upstream has no equivalent of the
+                # `context = self._prepare_encoder_conditioning_inputs(...)` rebound in
+                # `_prepare_request_inputs`, so its precompute reaches `diffuse`. The
+                # rebind is ours, and the two together made the write a no-op. The
+                # ineffectiveness is therefore accidental, and it is load-bearing
+                # accident -- repairing the rebind alone would introduce the §5.3
+                # regression described above.
+                #
+                # Re-enable only by routing the precompute through `noise_plan`, so the
+                # early draw and the fallback draw come from the same generator -- i.e.
+                # by moving the draw earlier, not by moving precomputed rows across.
+                # See the deviation entry in the sync manual (§3.2).
+                #
+                # The `precomputed_*` parameters and the branches that consume them are
+                # kept exactly as upstream has them, so a future sync sees one disabled
+                # producer rather than a rewritten consumer.
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
@@ -4184,23 +4217,9 @@ class MiniMaxH3Pipeline(
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
         reuse_text, initial_noise_params, visual_noise_params = header[0]
-        executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
-            if initial_noise_params is not None
-            else None
-        )
-        # Independent CPU generators preserve sampling; join the worker on request exit.
+        # `initial_noise_params` and `visual_noise_params` are always None here (see
+        # above), so there is no worker to start and nothing to join on exit.
         try:
-            initial_noise = (
-                executor.submit(self._initial_noise, **initial_noise_params)
-                if initial_noise_params is not None
-                else None
-            )
-            visual_noise = (
-                executor.submit(minimax_h3_imgvid_cond_noise_rows, **visual_noise_params)
-                if visual_noise_params is not None
-                else None
-            )
             if reuse_text:
                 hidden = _broadcast_tensor(
                     text_conditioning.hidden_states if rank == 0 else None,
@@ -4220,26 +4239,11 @@ class MiniMaxH3Pipeline(
                     window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
             report_phase(PHASE_ENCODE)
             media = self._encode_local_media(prepared.media if prepared is not None else None)
-            if initial_noise is not None:
-                assert request_context is not None
-                request_context["precomputed_initial_noise"] = initial_noise.result()
-            if visual_noise is not None:
-                assert request_context is not None
-                assert visual_noise_params is not None
-                predicted_shapes = visual_noise_params["condition_shapes"]
-                actual_shapes = tuple(media.visual_condition_shapes)
-                if predicted_shapes != actual_shapes:
-                    raise RuntimeError(
-                        "MiniMax H3 predicted visual condition shapes do not match encoded shapes: "
-                        f"predicted {predicted_shapes}, encoded {actual_shapes}"
-                    )
-                request_context["precomputed_visual_condition_noise"] = visual_noise.result()
             return MiniMaxH3EncoderConditioning.from_components(
                 MiniMaxH3TextConditioning(hidden, tags), media
             ), window_text
         finally:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
+            pass
 
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
         if (getattr(sampling, "extra_args", None) or {}).get(
