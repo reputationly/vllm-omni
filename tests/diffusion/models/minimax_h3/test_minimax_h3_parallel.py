@@ -98,6 +98,8 @@ def test_pruned_adaln_skips_silu_and_adds_folded_bias_in_fp32():
     projection._adaln_cache = None
     projection._offload_weights = False
     projection._cache_name = "test.linear"
+    projection._weight_stager = None
+    projection._host_signature = None
     projection.expand_ratio = 2
     projection.modality_num = 1
     projection.hidden_size = 1

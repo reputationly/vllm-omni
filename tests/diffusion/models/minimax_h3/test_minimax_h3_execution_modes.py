@@ -166,19 +166,18 @@ def test_invalid_legacy_text_is_not_ignored(pipeline):
     pipeline.video_vae.encode_image.assert_not_called()
 
 
-def test_text_weight_loading_preserves_encoder_specific_lifecycle(pipeline):
-    class Encoder(torch.nn.Module):
-        def load_weights(self, weights):
-            return {name for name, _ in weights}
+def test_text_encoder_owns_its_load_and_is_not_a_pipeline_weight_source(pipeline):
+    """The encoder must never be fed through ``MiniMaxH3Pipeline.load_weights``.
 
-    pipeline.text_encoder = Encoder()
-    pipeline.video_vae = torch.nn.Identity()
-    pipeline.audio_vae = torch.nn.Identity()
-    assert pipeline.load_weights([("text_encoder.layer.weight", torch.ones(1))]) == {"text_encoder.layer.weight"}
-    pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = False
-    pipeline.text_encoder = None
-    with pytest.raises(ValueError, match="disabled in this deployment"):
+    Upstream routes it as a ``weights_sources`` entry with
+    ``prefix="text_encoder."``. We do not: ``MiniMaxH3Qwen3VLEncoder`` reads its own
+    safetensors shards, which is what lets the INT8 text-encoder artifact ship
+    separately from the DiT. ``load_weights`` accepts only ``transformer.`` and
+    ``transformers_ref.``, so a ``text_encoder.*`` tensor has to be refused rather
+    than silently half-loaded -- and the refusal has to say which weight, because
+    the alternative is a deployment that starts and runs the wrong encoder.
+    """
+    with pytest.raises(ValueError, match="unexpected MiniMax-H3 weight 'text_encoder.layer.weight'"):
         pipeline.load_weights([("text_encoder.layer.weight", torch.ones(1))])
 
 

@@ -2057,9 +2057,12 @@ class MiniMaxH3Pipeline(
                 self._finish_adaln_sidecar(component)
             loaded_with_prefix.update(prefix + name for name in loaded)
         # Both VAEs load eagerly in ``__init__`` rather than through
-        # ``weights_sources``. The text encoder uses the shared component
-        # loader so online quantization and offload processing follow the same
-        # path as the DiT, so it is no longer in this list.
+        # ``weights_sources``, and so does the text encoder -- it reads its own
+        # safetensors shards (``MiniMaxH3Qwen3VLEncoder``, via
+        # ``model.safetensors.index.json``). This comment used to say the encoder
+        # went through the shared component loader "like the DiT"; that described
+        # upstream and contradicted ``source_prefix`` twenty lines above, which
+        # accepts only ``transformer.``/``transformers_ref.``.
         # ``latent_upscaler`` is the optional hi-res path (PR #8322): absent unless
         # ``latent_upscaler_path`` is configured, hence the None default.
         for component_name in ("video_vae", "audio_vae", "latent_upscaler"):

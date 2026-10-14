@@ -912,20 +912,30 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         assert pipeline.text_encoder_group is None
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
+    # Deliberate deviation from upstream (74ba8ab69), registered here so it is not
+    # "fixed" back: upstream appends a
+    # ``ComponentSource(subfolder="text_encoder", prefix="text_encoder.")`` when the
+    # encoder is loaded. Ours must not. ``MiniMaxH3Qwen3VLEncoder`` reads its own
+    # safetensors shards (encoder.py, ``model.safetensors.index.json``) and has no
+    # ``load_weights``; routing it through ``weights_sources`` would hand
+    # ``text_encoder.*`` names to ``MiniMaxH3Pipeline.load_weights``, whose
+    # ``source_prefix`` accepts only ``transformer.``/``transformers_ref.`` and
+    # raises ``unexpected MiniMax-H3 weight``. Owning the load is also what lets the
+    # INT8 text-encoder artifact be published separately from the DiT.
     assert [source.model_or_path for source in pipeline.weights_sources] == [
         *(str(tmp_path / partition_name) for partition_name in source_partitions),
-        *([str(component_path)] if expect_encoder else []),
     ]
     assert [source.subfolder for source in pipeline.weights_sources] == [
         *("transformer" for _ in source_partitions),
-        *(["text_encoder"] if expect_encoder else []),
     ]
     expected_prefixes = ["transformer."]
     if expected_dits == 2:
         expected_prefixes.append("transformers_ref.")
-    if expect_encoder:
-        expected_prefixes.append("text_encoder.")
     assert [source.prefix for source in pipeline.weights_sources] == expected_prefixes
+    assert "text_encoder." not in {source.prefix for source in pipeline.weights_sources}, (
+        "the text encoder owns its load; it must not be a weights_sources entry"
+    )
+    assert (pipeline.text_encoder is not None) is expect_encoder
     expected_patterns = pipeline_module.MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS[expected_partition]
     if expect_encoder:
         expected_patterns = (
