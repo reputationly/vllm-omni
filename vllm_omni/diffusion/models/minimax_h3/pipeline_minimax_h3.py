@@ -81,6 +81,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
+    _local_partition_from_release_metadata,
     is_minimax_h3_modular,
     resolve_minimax_h3_partition,
 )
@@ -120,7 +121,7 @@ from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
 )
 from vllm_omni.quantization.component_config import (
-    resolve_encoder_quant_config as _resolve_encoder_quant_config,
+    ComponentQuantizationConfig,
 )
 
 from .batched_packing import minimax_h3_batched_forward_kwargs
@@ -394,27 +395,55 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
 
 
 def _local_minimax_h3_partition(path: Path) -> str | None:
-    """Read a local partition from its release metadata, not its directory name."""
-    index_path = path / "model_index.json"
-    if not path.is_dir() or not index_path.is_file():
+    """Read a local partition from its release metadata, then its directory name.
+
+    The metadata read is `checkpoint._local_partition_from_release_metadata`, which
+    `resolve_minimax_h3_partition` also uses; the two resolvers having their own
+    copies of it is how they drifted apart in the first place. The directory-name
+    fallback stays here only, because it is the older convention that the metadata
+    is meant to replace -- `resolve_minimax_h3_partition` keeps it too, for a
+    release that predates `_minimax_h3.partition`.
+    """
+    if not path.is_dir():
         return None
-    try:
-        model_index = json.loads(index_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    partition = str((model_index.get("_minimax_h3") or {}).get("partition", "")).lower()
-    if partition in {"fl2va", "ref2va"}:
+    partition = _local_partition_from_release_metadata(path)
+    if partition is not None:
         return partition
     if path.name in {"FL2VA", "Ref2VA"}:
         return path.name.lower()
     return None
 
 
-def _resolve_minimax_h3_text_encoder_quant_config(
-    quant_config: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    resolved = _resolve_component_quant_config(quant_config, "text_encoder")
-    return _resolve_encoder_quant_config(resolved)
+def _reject_explicit_text_encoder_quantization(quant_config: QuantizationConfig | None) -> None:
+    """Refuse a quant config that explicitly scopes to the text encoder.
+
+    This replaces ``_resolve_minimax_h3_text_encoder_quant_config``, which had zero
+    callers on this branch *and* on origin/main -- it resolved a config for the
+    upstream encoder that accepted one. Ours does not: the three
+    ``MiniMaxH3Qwen3VL*Linear`` layers take no ``quant_config`` and switch INT8 on
+    after construction from the checkpoint's own ``weight_scale`` (see
+    ``_Int8WeightMixin``). So an explicit ``text_encoder`` entry could not be
+    honoured, and silently dropping it starts a deployment whose memory and latency
+    are not the ones the config asked for.
+
+    A *plain* config is a different matter and is left alone: it means "quantize
+    where applicable", and the H3 text encoder is simply not applicable --
+    ``resolve_encoder_quant_config`` already returns None for pre-quantized methods
+    for exactly that reason. Raising on it would break deployments that set a
+    global method for the DiT.
+    """
+    if not isinstance(quant_config, ComponentQuantizationConfig):
+        return
+    scoped = [prefix for prefix in quant_config.component_configs if "text_encoder".startswith(prefix)]
+    if not scoped:
+        return
+    raise ValueError(
+        "MiniMax-H3 text encoder quantization is not supported: the deployment sets "
+        f"quantization for {sorted(scoped)}, but this encoder is not quantization-aware. "
+        "It loads its own BF16/INT8 checkpoint and only the checkpoint's serialized "
+        "INT8 is applied. Remove the text_encoder entry from the quantization config, "
+        "or ship a pre-quantized text_encoder artifact."
+    )
 
 
 def _minimax_h3_partition_for_task(
@@ -1892,6 +1921,7 @@ class MiniMaxH3Pipeline(
                 )
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
+            _reject_explicit_text_encoder_quantization(od_config.quantization_config)
             self.text_encoder = MiniMaxH3Qwen3VLEncoder(
                 os.path.join(model_path, "text_encoder"),
                 device=self.device,

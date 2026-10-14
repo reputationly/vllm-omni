@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import Mock, create_autospec, patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -2000,38 +2000,41 @@ def test_text_encoder_rejects_online_only_int8(tmp_path):
         encoder._enable_int8_if_serialized(str(tmp_path))
 
 
-def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
+def test_text_encoder_linear_takes_no_quant_config_by_constructor():
+    """Deliberate deviation from upstream, registered here so it is not "restored".
+
+    Upstream's ``MiniMaxH3Qwen3VLMergedColumnParallelLinear`` takes a
+    ``quant_config`` and lets vLLM's factory resolve ``self.quant_method`` from it.
+    Ours does not: the constructor hard-codes ``quant_config=None``, so
+    ``LinearBase.__init__`` resolves the ``UnquantizedLinearMethod``, and INT8 is
+    switched on *after* construction by ``_Int8WeightMixin.enable_int8`` from the
+    checkpoint's own ``weight_scale`` tensors -- which is what lets the BF16 path
+    keep every signature and default it had, and what lets the INT8 artifact ship
+    separately.
+
+    Pinning the *absence* is the point: a ``quant_config`` reappearing in this
+    signature would silently change which method runs, and the repo has no call site
+    that passes one, so nothing else would catch it.
+    """
+    import inspect
+
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     import vllm_omni.diffusion.models.minimax_h3.encoder as encoder_module
 
-    group = SimpleNamespace(rank_in_group=0, world_size=1)
-    method = UnquantizedLinearMethod()
-    quant_config = create_autospec(QuantizationConfig, instance=True)
-    quant_config.online_quantization_config = None
-    quant_config.get_quant_method.return_value = method
-    # vLLM 0.30: no online quantization for this checkpoint-quantized layer
-    quant_config.online_quantization_config = None
-    prefix = "text_encoder.text_model.layers.0.mlp.gate_up_proj"
+    linear_cls = encoder_module.MiniMaxH3Qwen3VLMergedColumnParallelLinear
+    assert "quant_config" not in inspect.signature(linear_cls.__init__).parameters
 
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
     with (
         patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
         patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
     ):
-        linear = encoder_module.MiniMaxH3Qwen3VLMergedColumnParallelLinear(
-            group,
-            input_size=4,
-            intermediate_size=8,
-            dtype=torch.bfloat16,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
+        linear = linear_cls(group, input_size=4, intermediate_size=8, dtype=torch.bfloat16)
 
-    assert linear.quant_method is method
-    # vLLM 0.30 resolves the method through resolve_quant_method(), which calls
-    # get_quant_method(layer, prefix) POSITIONALLY; 0.29 passed prefix= by keyword.
-    quant_config.get_quant_method.assert_called_once_with(linear, prefix)
+    assert isinstance(linear.quant_method, UnquantizedLinearMethod), (
+        "the BF16 path must stay unquantized until enable_int8() is called"
+    )
 
 
 def test_no_offload_keeps_text_encoder_resident():

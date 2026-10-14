@@ -166,6 +166,20 @@ def test_invalid_legacy_text_is_not_ignored(pipeline):
     pipeline.video_vae.encode_image.assert_not_called()
 
 
+def test_disabled_component_is_refused_rather_than_skipped(pipeline):
+    """A weight for a component this deployment turned off must raise, not vanish.
+
+    `load_weights` had this path covered by the old text-encoder test; that test now
+    pins the refusal of `text_encoder.*` instead, so cover the same branch with a
+    prefix that *is* accepted by `source_prefix` and whose component is absent.
+    """
+    pipeline.transformers_ref = None
+    pipeline.load_text_encoder = False
+
+    with pytest.raises(ValueError, match="component 'transformers_ref' is disabled in this deployment"):
+        pipeline.load_weights([("transformers_ref.block.weight", torch.ones(1))])
+
+
 def test_text_encoder_owns_its_load_and_is_not_a_pipeline_weight_source(pipeline):
     """The encoder must never be fed through ``MiniMaxH3Pipeline.load_weights``.
 
