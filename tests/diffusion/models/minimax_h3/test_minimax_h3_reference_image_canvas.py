@@ -173,6 +173,13 @@ def _out_of_process_view(stage_configs, monkeypatch, model_class_name="MiniMaxH3
             self.model = "/models/MiniMax-H3"
             self.stage_configs = stage_configs
             self._diffusion_od_config_view = None
+            # `OmniEngineBase.__init__` always sets this (to None when the
+            # deployment has no pipeline config). The stub bypasses that ctor, and
+            # the no-diffusion-stage fallback reads `self.pipeline_config`
+            # directly, so without it the stub fails on an attribute every real
+            # engine has -- the same shape as the other `__new__` stubs in this
+            # directory.
+            self.pipeline_config = None
 
     return _Engine().get_diffusion_od_config()
 

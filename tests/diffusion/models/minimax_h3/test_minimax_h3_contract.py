@@ -2642,7 +2642,14 @@ def test_ref2va_reference_count_validation_preserves_client_error_metadata():
     ("case", "start_time", "expected_duration", "input_size", "expected_size"),
     [
         ("R7", None, 10.0, (3844, 2160), (1344, 768)),
-        ("R8", 4.0, 6.0, (640, 384), (640, 384)),
+        # R8's geometry is the *default* behaviour, which enlarges a below-canvas
+        # reference: (640, 384) -> (1280, 768). This row used to expect (640, 384),
+        # which is what `VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE=1` produces -- and this
+        # test never sets that variable. Both modes, and the fact that enlarging is
+        # the default, are pinned by
+        # `test_reference_video_no_upscale_switch_defaults_to_enlarging`; R8 is here
+        # for the temporal segment (start 4.0 / 6.0 s), not for the switch.
+        ("R8", 4.0, 6.0, (640, 384), (1280, 768)),
     ],
 )
 def test_r7_r8_ref2va_video_segment_matrix(
