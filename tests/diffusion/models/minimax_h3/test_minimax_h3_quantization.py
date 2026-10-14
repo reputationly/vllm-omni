@@ -243,13 +243,31 @@ def test_model_load_weights_accepts_diffusers_split_qkv_and_up_gate():
     model.blocks[0].attn.qkv_proj = _WeightTarget(qkv_loader)
     model.blocks[0].mlp = nn.Module()
     model.blocks[0].mlp.fc1 = _WeightTarget(fc1_loader)
+    # This test feeds Diffusers names, which `load_weights` only rewrites when the
+    # model was told the checkpoint is Diffusers-format. `__new__` skips the ctor
+    # that derives it, so without this every name falls through to the native path
+    # and is dropped as "not present in model" -- returning an empty set.
+    model._diffusers_weights = True
+    # Also derived in __init__; the Diffusers finalize step builds `rope.inv_freq`
+    # from it, so `__new__` has to seed it too.
+    model._rope_theta = 10000.0
+
+    # `load_weights` refuses a Diffusers QKV group that is not all three parts,
+    # and then reconstructs `rope.inv_freq` from the config, so both have to be
+    # satisfiable for the Diffusers path to be exercised at all.
+    model.rope = nn.Module()
+    model.rope.inv_freq = nn.Parameter(torch.empty(model.arch.rope_inv_freq_len))
 
     q = torch.arange(2, dtype=torch.float32).reshape(2, 1)
+    k = q + 100
+    v = q + 200
     # Diffusers stores the two SwiGLU halves as [up, gate].
     up_gate = torch.tensor([[10.0], [11.0], [20.0], [21.0]])
     loaded = model.load_weights(
         [
             ("transformer_blocks.0.attn.to_q.weight", q),
+            ("transformer_blocks.0.attn.to_k.weight", k),
+            ("transformer_blocks.0.attn.to_v.weight", v),
             ("transformer_blocks.0.ff.net.0.proj.weight", up_gate),
         ]
     )
@@ -257,8 +275,13 @@ def test_model_load_weights_accepts_diffusers_split_qkv_and_up_gate():
     assert loaded == {
         "blocks.0.attn.qkv_proj.weight",
         "blocks.0.mlp.fc1.weight",
+        "rope.inv_freq",
     }
-    assert [(shard_id, tensor[:, 0].tolist()) for shard_id, tensor in qkv_calls] == [("q", [0.0, 1.0])]
+    assert [(shard_id, tensor[:, 0].tolist()) for shard_id, tensor in qkv_calls] == [
+        ("q", [0.0, 1.0]),
+        ("k", [100.0, 101.0]),
+        ("v", [200.0, 201.0]),
+    ]
     assert [(shard_id, tensor[:, 0].tolist()) for shard_id, tensor in fc1_calls] == [
         (0, [20.0, 21.0]),
         (1, [10.0, 11.0]),

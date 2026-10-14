@@ -47,11 +47,17 @@ import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
+# ``engine/async_omni_engine.py`` used to be listed here as the fourth hop. It was
+# never true: `git log -S minimax_h3_inference_contract -- vllm_omni/engine/async_omni_engine.py`
+# is empty on every branch. The cross-process hop is real but *generic* -- the override
+# projection in ``config/omni_config.py`` builds its dict from ``fields(StageDeployConfig)``,
+# so a new contract field travels without being named anywhere. See
+# `test_the_deploy_value_survives_the_engine_override_hop`, which pins the behaviour a
+# string scan cannot.
 _HOPS = (
     "config/stage_config.py",
     "config/omni_config.py",
     "diffusion/data.py",
-    "engine/async_omni_engine.py",
 )
 
 _PREFIX = "minimax_h3_"
@@ -92,6 +98,31 @@ def test_every_hop_carries_the_same_contract_fields():
         "makes one layer answer for a contract another layer is running — which is what "
         "reference_images_bind_output_canvas and honours_explicit_reference_order both hit."
     )
+
+
+def test_the_deploy_value_survives_the_engine_override_hop():
+    """The name-based hop is generic, so only a behavioural check proves it.
+
+    The projection reads ``fields(StageDeployConfig)`` rather than a tuple of names,
+    which is why no file had to learn these two names when they were added. A value
+    set in the YAML must therefore come out of ``_stage_engine_overrides`` unchanged;
+    if that ever becomes a name list again, this fails.
+    """
+    from vllm_omni.config.omni_config import _stage_engine_overrides
+    from vllm_omni.config.stage_config import StageDeployConfig
+
+    stage = StageDeployConfig(
+        stage_id=0,
+        minimax_h3_inference_contract="official",
+        minimax_h3_admission_policy="strict",
+    )
+    overrides = _stage_engine_overrides(stage)
+
+    assert overrides["minimax_h3_inference_contract"] == "official"
+    assert overrides["minimax_h3_admission_policy"] == "strict"
+
+    # None is "unset", not "carry the literal None" -- the projection drops it.
+    assert "minimax_h3_inference_contract" not in _stage_engine_overrides(StageDeployConfig(stage_id=0))
 
 
 def test_the_fields_are_the_ones_resolve_strategy_actually_takes():
