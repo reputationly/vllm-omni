@@ -285,7 +285,36 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     pipeline.video_vae.encode_video.reset_mock()
     pipeline.forward(SimpleNamespace(prompts=[bridged], sampling_params=request.sampling_params))
     external_kwargs = capture_denoise_kwargs()
+
+    def _without_image_geometry(blocks):
+        """`ref_blocks` minus the image block's latent size, which is a geometry result.
+
+        The block list is compared between the paths for everything except this: the
+        reference image's encoded size is exactly what the two geometries disagree
+        about, and it is asserted on its own below.
+        """
+        return [
+            {key: value for key, value in block.items() if key not in ("latent_h", "latent_w")}
+            if block.get("kind") == "image"
+            else block
+            for block in blocks
+        ]
+
     for key, value in local_kwargs.items():
+        if key == "visual_condition":
+            # Deliberately not compared; the two paths are *supposed* to differ here.
+            # See the two claims below.
+            continue
+        if key == "visual_condition_shapes":
+            # Entry 0 is the reference image (the block order is pinned at the end of
+            # this test); it is the other half of the same geometry claim.
+            assert value[1:] == external_kwargs[key][1:]
+            continue
+        if key == "ref_blocks":
+            # Same reason, for the one field of the image block that is a geometry
+            # result; everything else about the block list must still agree.
+            assert _without_image_geometry(value) == _without_image_geometry(external_kwargs[key])
+            continue
         if key in {"precomputed_initial_noise", "precomputed_visual_condition_noise"}:
             assert value is not None
             assert external_kwargs[key] is None
@@ -294,6 +323,50 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
             torch.testing.assert_close(value, external_kwargs[key])
         else:
             assert value == external_kwargs[key]
+    # ---------------------------------------------------------------------------
+    # Registered deviation from upstream: reference-image geometry is
+    # contract-controlled only on the SINGLE-STAGE path, so these two are asserted
+    # separately instead of being required to agree.
+    #
+    # `prepare_encoder_inputs` resizes references through its `reference_image_shape`
+    # callback, and only the diffusion pipeline passes one
+    # (`pipeline_minimax_h3.py`, "the pipeline resolved the geometry, so honour it
+    # verbatim"). The encoder-stage bridge calls it without
+    # (`stage_input_processors/minimax_h3.py`), which lands on upstream's
+    # `resolve_minimax_h3_reference_image_shape(max_area=None)` -- preserve the
+    # reference's own resolution, rounded to the 32-pixel grid.
+    #
+    # Upstream has no such callback at all, so this test passes there by
+    # construction. Ours added it, which is what makes one path follow the contract
+    # and the other stay upstream-compatible.
+    #
+    # Both paths under test are controlled by this file, so the sizes are named here
+    # rather than derived: the strategy in force is legacy (short edge 2048,
+    # no_upscale off), and the reference is `Image.new("RGB", (256, 256))`.
+    # ---------------------------------------------------------------------------
+    # Claim 1 -- single stage: the contract's geometry applies. 256x256 is enlarged
+    # to the 2048 short edge, i.e. 64x64 patches of 32 pixels. The extra row is the
+    # mocked reference video (`encode_video` returns one row).
+    assert local_kwargs["visual_condition"].shape[0] == 64 * 64 + 1, (
+        "the single-stage path must encode the reference at the contract's short edge"
+    )
+    # Claim 2 -- encoder in its own stage: upstream's resize applies, so the 256x256
+    # reference stays 256x256 and contributes 8x8 patches, plus the same video row.
+    assert external_kwargs["visual_condition"].shape[0] == 8 * 8 + 1, (
+        "the disaggregated path must keep upstream's preserve-resolution resize"
+    )
+    assert local_kwargs["visual_condition"].shape[1] == external_kwargs["visual_condition"].shape[1] == 96
+
+    def _image_block(kwargs):
+        return next(block for block in kwargs["ref_blocks"] if block["kind"] == "image")
+
+    # The same divergence, seen where the denoise loop consumes it: the image block
+    # records the encoded size, and 2048/16 = 128 against 256/16 = 16 is the contract
+    # resize against upstream's preserve-resolution one.
+    assert (_image_block(local_kwargs)["latent_h"], _image_block(local_kwargs)["latent_w"]) == (128, 128)
+    assert (_image_block(external_kwargs)["latent_h"], _image_block(external_kwargs)["latent_w"]) == (16, 16)
+    assert local_kwargs["visual_condition_shapes"][0] == (1, 128, 128)
+    assert external_kwargs["visual_condition_shapes"][0] == (1, 16, 16)
     local_inputs = pipeline._build_denoise_inputs(**local_kwargs)
     external_inputs = pipeline._build_denoise_inputs(**external_kwargs)
     for key in ("video_rows", "audio_rows", "cond_anchor", "audio_anchor"):

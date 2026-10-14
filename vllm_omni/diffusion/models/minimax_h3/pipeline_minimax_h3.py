@@ -1120,6 +1120,27 @@ def _reference_image_shape_for_strategy(
     )
 
 
+def _reference_image_geometry_overrides_upstream(strategy: MiniMaxH3InferenceStrategy) -> bool:
+    """Whether this contract's reference-image geometry can differ from the upstream resize.
+
+    Upstream -- ``prepare_encoder_inputs`` without a ``reference_image_shape``
+    callback, which lands on ``resolve_minimax_h3_reference_image_shape(max_area=None)``
+    -- preserves each reference's own resolution rounded to the 32-pixel grid. It
+    never enlarges and never shrinks.
+
+    Each divergence is decidable from the strategy alone:
+      * ``match`` shrinks a reference larger than the request canvas;
+      * ``fixed_area`` shrinks one larger than the fixed budget;
+      * the plain short-edge branch, which is every other mode, *enlarges*
+        anything smaller than ``reference_image_short_edge`` whenever
+        ``no_upscale`` is off -- the legacy and official-v1 default, and the case
+        an operator is most likely to be surprised by.
+    """
+    if strategy.reference_image_geometry_mode in {"match", "fixed_area"}:
+        return True
+    return not strategy.reference_image_no_upscale
+
+
 def _reference_image_shape(
     image: Image.Image,
     *,
@@ -1780,6 +1801,27 @@ class MiniMaxH3Pipeline(
         self.rng_mode = self.strategy.rng_mode
         self.condition_noise_shape_mode = self.strategy.visual_condition_noise_shape_mode
         logger.info("MiniMax-H3 contract: %s", self.strategy.describe())
+        if not self.load_text_encoder and _reference_image_geometry_overrides_upstream(self.strategy):
+            # Say it out loud rather than let it be discovered from output. The
+            # contract's `reference_image_*` geometry is applied by
+            # `prepare_encoder_inputs`'s `reference_image_shape` callback, which only
+            # the diffusion pipeline passes; the encoder-stage bridge calls it without
+            # one, so a disaggregated deployment resizes references exactly as upstream
+            # does. An operator who set `VLLM_OMNI_H3_REF_IMAGE_*` or picked a contract
+            # for its reference-image behaviour would otherwise be reading a log that
+            # claims the contract while the pixels follow a different policy.
+            logger.warning(
+                "MiniMax-H3 contract %r sets a reference-image geometry, but this deployment runs the "
+                "text encoder in a separate stage: reference images follow the upstream resize "
+                "(preserve resolution, 32-pixel grid) and the contract's reference_image_* settings "
+                "(mode=%s, short_edge=%s, no_upscale=%s, max_pixels=%s) do not apply. "
+                "Reference-image geometry is contract-controlled only on a single-stage deployment.",
+                self.strategy.name,
+                self.strategy.reference_image_geometry_mode,
+                self.strategy.reference_image_short_edge,
+                self.strategy.reference_image_no_upscale,
+                self.strategy.reference_image_max_pixels,
+            )
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
