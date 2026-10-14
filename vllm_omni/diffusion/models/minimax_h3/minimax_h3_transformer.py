@@ -10,7 +10,7 @@ layout.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -1135,7 +1135,11 @@ class MiniMaxH3AdalnProj(nn.Module):
             # Re-snapshot on parameter replacement, in-place edits or moves.
             # The CPU master remains the registered parameter storage between
             # calls, so normal cache version checks and weight loaders apply.
-            self._weight_stager = PinnedModuleStager(self.linear, device, cache_retention=BoundedAllocatorCache(device))
+            # The whole projector is one staging group: `_apply`'s keep_on_host
+            # holds the pruned `folded_bias` buffer on the host too, and the
+            # pruned path adds it to the staged activation, so it has to move
+            # with the linear (§5.3).
+            self._weight_stager = PinnedModuleStager(self, device, cache_retention=BoundedAllocatorCache(device))
             self._host_signature = self._offload_signature()
 
     def _project(self, t_emb: torch.Tensor) -> torch.Tensor:
@@ -1143,21 +1147,39 @@ class MiniMaxH3AdalnProj(nn.Module):
 
         # The pruned table contains the coordinates of silu(time_embedder(t)),
         # whereas the released path still needs the activation here.
+        def staged(compute: Callable[[], torch.Tensor]) -> torch.Tensor:
+            """Run ``compute`` with the projector on the device when offloaded.
+
+            AdaLN offload keeps the whole projector — the column-parallel linear
+            and, on pruned checkpoints, the ``folded_bias`` buffer — on a pinned
+            CPU master. Both are read by one projection, so the staging envelope
+            has to cover the bias add as well as the matmul; staging only around
+            the linear leaves the bias on the host and the add fails.
+            """
+            if self._weight_stager is None:
+                return compute()
+            self._weight_stager.load()
+            try:
+                return compute()
+            finally:
+                self._weight_stager.offload()
+
         def project() -> torch.Tensor:
             if self.pruned:
                 # This order is part of the checkpoint semantics: the folded bias
                 # carries most of the modulation and must not be rounded to BF16
                 # before addition.
-                x = self.linear(t_emb.to(_BF16_DTYPE))[0]
-                return (x.float() + self.folded_bias).to(x.dtype)
+                def pruned() -> torch.Tensor:
+                    x = self.linear(t_emb.to(_BF16_DTYPE))[0]
+                    return (x.float() + self.folded_bias).to(x.dtype)
+
+                return staged(pruned)
             x = nn.functional.silu(t_emb)
-            if self._weight_stager is None:
+
+            def released() -> torch.Tensor:
                 return self.linear(x.to(_BF16_DTYPE))[0]
-            self._weight_stager.load()
-            try:
-                return self.linear(x.to(_BF16_DTYPE))[0]
-            finally:
-                self._weight_stager.offload()
+
+            return staged(released)
 
         return (
             project()
