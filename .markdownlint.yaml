@@ -15,3 +15,11 @@ MD033: false
 MD046: false
 MD052: false
 MD059: false
+# Deliberate divergence from the list above: MD060 (table column style) was introduced
+# in markdownlint v0.41, which this repo's pinned pre-commit hook now resolves to, while
+# the vLLM-aligned list above predates it. It is purely cosmetic -- it asks that table
+# pipes line up with the header row -- and the tree has 411 of them across 100+ files,
+# most of them upstream's. Reformatting those tables would add conflict surface to every
+# future sync for no readability gain, so the rule is off here rather than applied.
+# Revisit if upstream enables it, or when the hook's rev moves again.
+MD060: false
