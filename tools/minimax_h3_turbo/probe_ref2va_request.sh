@@ -28,10 +28,10 @@ echo "=== /v1/models ==="
 curl -sS "http://127.0.0.1:$PORT/v1/models"
 echo
 echo "=== POST /v1/tasks/video/ ==="
-curl -sS -o /tmp/probe_$TAG.body -w 'http_code=%{http_code}\n' \
+curl -sS -o "/tmp/probe_$TAG.body" -w 'http_code=%{http_code}\n' \
   -H 'Content-Type: application/json' \
   --data-binary @"$REQ" \
   "http://127.0.0.1:$PORT/v1/tasks/video/"
-cat /tmp/probe_$TAG.body
+cat "/tmp/probe_$TAG.body"
 echo
 echo "--- probe end $(date -Is) (engine left running on port $PORT) ---"

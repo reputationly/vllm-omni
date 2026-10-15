@@ -17,6 +17,10 @@ from vllm_omni.entrypoints.openai.protocol.image_tasks import (
     ImageTaskRequest,
 )
 
+# Marks for Buildkite collection: these are host-side assertions, no device
+# or model weights involved (same shape as the rest of this directory).
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _req(**kwargs) -> ImageTaskRequest:
     kwargs.setdefault("prompt", "a cat")

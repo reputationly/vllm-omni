@@ -28,6 +28,11 @@ PRODUCTION_SIGMA_CASES = [
 ]
 
 
+# Marks for Buildkite collection: these are host-side assertions, no device
+# or model weights involved (same shape as the rest of this directory).
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
 def _find_key(node: Any, key: str) -> Any:
     """Depth-first search for the first occurrence of ``key`` in parsed YAML."""
     if isinstance(node, dict):

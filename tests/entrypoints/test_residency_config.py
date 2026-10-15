@@ -16,6 +16,10 @@ from vllm_omni.entrypoints.openai.residency_config import (
     load_residency_config,
 )
 
+# Marks for Buildkite collection: these are host-side assertions, no device
+# or model weights involved (same shape as the rest of this directory).
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _write(tmp_path, body: str, *, deploy_names=("ar.yaml", "dit.yaml")) -> str:
     for name in deploy_names:

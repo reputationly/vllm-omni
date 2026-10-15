@@ -118,6 +118,10 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network host --shm-size 64g
   --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
   --diffusion-attention-backend FLASH_ATTN --disable-multithread-weight-load \
   --enable-diffusion-pipeline-profiler --init-timeout 3600 --stage-init-timeout 3600 \
+  # These are flag lists and MUST word-split: `compile_flags` holds two flags, and an
+  # empty `offload_flag` has to vanish rather than become an empty argument. Quoting
+  # either one would hand the CLI a single bogus token.
+  # shellcheck disable=SC2086
   $compile_flags \
   --allowed-local-media-path /nfs-output --host 0.0.0.0 --port "$PORT" --trust-remote-code
 

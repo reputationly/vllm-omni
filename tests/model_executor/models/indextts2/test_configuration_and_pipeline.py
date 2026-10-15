@@ -3,6 +3,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
@@ -11,6 +12,9 @@ from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     IndexTTS25Config,
 )
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS25_PIPELINE
+
+# Same marks as the rest of this directory: config/registry assertions only, no device.
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_indextts25_defaults_are_distinct_from_v2():
