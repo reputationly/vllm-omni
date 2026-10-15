@@ -197,20 +197,30 @@ def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, mo
 def test_replay_uses_active_request_and_layout(graph_case):
     manager, device, _ = graph_case
     first, second = make_cache(device, 1.0), make_cache(device, 5.0)
+    first_key = weakref.ref(first[0]["cond"]["key"])
     with torch.inference_mode():
         register(manager, first)
+        # A second live request aliasing the same key is refused: it keeps its
+        # own cache and decodes eagerly while the owner is in flight.
         register(manager, second)
-        for cache in (first, second, first):
-            output = decode(manager, cache)
-            expected = (
-                torch.ones_like(output).sin() + cache[0]["cond"]["key"].mean() + cache[0]["cond"]["value"].mean() + 2
-            )
-            torch.testing.assert_close(output, expected)
-        original = decode(manager, first).clone()
+        assert decode(manager, second) is None
+        output = decode(manager, first)
+        expected = torch.ones_like(output).sin() + first[0]["cond"]["key"].mean() + first[0]["cond"]["value"].mean() + 2
+        torch.testing.assert_close(output, expected)
+        # Once the owner's cache is released, the key is free to adopt.
+        del first
+        assert first_key() is None
+        register(manager, second)
+        output = decode(manager, second)
+        expected = (
+            torch.ones_like(output).sin() + second[0]["cond"]["key"].mean() + second[0]["cond"]["value"].mean() + 2
+        )
+        torch.testing.assert_close(output, expected)
+        original = decode(manager, second).clone()
         register(manager, second, (1, 1, 4))
         other = decode(manager, second, (1, 1, 4))
         torch.testing.assert_close(other, torch.ones_like(other).sin() + 5 + 6 + 1)
-        torch.testing.assert_close(decode(manager, first), original)
+        torch.testing.assert_close(decode(manager, second), original)
         assert all(entry.captures == 1 for entry in manager.entries.values())
 
 
@@ -294,7 +304,14 @@ def test_batch_changes_and_padding_do_not_reuse_stale_prefix(graph_case):
         assert result is not None and result.shape == (2, 4, 4)
         expected = torch.ones_like(result).sin() + torch.tensor([5.0, 11.0], device=device)[:, None, None]
         torch.testing.assert_close(result, expected)
-        kwargs["kv_cache"] = [{"cond": {part: tensor.flip(0) for part, tensor in merged[0]["cond"].items()}}]
+        # A rebuilt cache (e.g. reordered rows) is a different live cache
+        # aliasing the same key: decode refuses the shared entry until the
+        # previous owner's tensors are released.
+        flipped = [{"cond": {part: tensor.flip(0) for part, tensor in merged[0]["cond"].items()}}]
+        kwargs["kv_cache"] = flipped
+        assert manager.try_decode(**kwargs) is None
+        del merged
+        register(manager, flipped)
         torch.testing.assert_close(manager.try_decode(**kwargs), expected.flip(0))
         kwargs["encoder_hidden_states_mask"][1, 0] = False
         assert manager.try_decode(**kwargs) is None

@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import Mock, create_autospec, patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -138,7 +138,7 @@ def test_local_encoder_modes_preserve_validated_text_and_unified_handoff(task, t
         (image.height // 32) * (image.width // 32), 96
     )
     pipeline.audio_vae = Mock()
-    prompt = {"prompt": "A person waves."}
+    prompt: dict[str, Any] = {"prompt": "A person waves."}
     if task != "t2va":
         prompt["multi_modal_data"] = {"image": Image.new("RGB", (256, 256))}
     if text_key is not None:
@@ -428,13 +428,19 @@ def test_pipeline_import_registry_and_component_discovery():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_minimax_h3_postprocess_writes_owned_bitwise_equivalent_video(dtype):
-    from vllm_omni.diffusion.diffusion_engine import (
-        _numpy_owns_its_memory,
-        _reown_foreign_numpy,
-    )
+def test_video_output_quantizes_clamps_and_owns_its_bytes(dtype):
+    """The float->uint8 conversion lives in the worker now, not in post-process.
+
+    This block used to assert these properties on ``_minimax_h3_post_process``,
+    which since moved on: it now *requires* a uint8 ``(B, T, H, W, C)`` tensor and
+    only carries it across the process boundary, while the clamp/scale/quantize
+    step is ``_prepare_minimax_h3_video_output``. The properties worth pinning are
+    unchanged -- NaN and +-inf must not survive as garbage, ``-0.0`` must not round
+    *up* to 255 the way a floor-based conversion would, and the result must be a
+    contiguous uint8 tensor in the muxer's layout.
+    """
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-        _minimax_h3_post_process,
+        _prepare_minimax_h3_video_output,
     )
 
     video = (
@@ -448,19 +454,70 @@ def test_minimax_h3_postprocess_writes_owned_bitwise_equivalent_video(dtype):
     video[0, 0, 0, 0, 1] = float("inf")
     video[0, 0, 0, 0, 2] = float("-inf")
     video[0, 0, 0, 1, 0] = -0.0
+
+    # `_prepare_minimax_h3_video_output` quantizes *in place* (its docstring says
+    # so) and `video.float()` is a no-op for an fp32 input, so an oracle taken
+    # afterwards would read the already-mutated buffer.
+    expected = video.detach().float().clamp(0, 1).mul(255).round().to(torch.uint8).permute(0, 2, 3, 4, 1).contiguous()
+
+    out = _prepare_minimax_h3_video_output(video)
+
+    assert out.dtype == torch.uint8
+    assert out.shape == (2, 17, 2, 3, 3), "expected the muxer layout (B, T, H, W, C)"
+    assert out.is_contiguous()
+
+    # The four edited voxels. The input is (B, T, C, H, W); `_prepare_...`
+    # permutes to (B, C, H, W, T), so the last input axis becomes the first
+    # output axis after the leading two.
+    assert out[0, 0, 0, 0, 0].item() == 0, "NaN must not survive as garbage"
+    assert out[0, 0, 0, 1, 0].item() == 255, "+inf clamps to the top of the range"
+    assert out[0, 0, 0, 2, 0].item() == 0, "-inf clamps to the bottom"
+    assert out[0, 0, 1, 0, 0].item() == 0, "-0.0 must not floor to 255"
+
+    assert torch.equal(out, expected)
+
+
+def test_postprocess_carries_owned_uint8_frames_across_the_transfer():
+    """What post-process still owes: owned, contiguous, bit-identical bytes."""
+    from vllm_omni.diffusion.diffusion_engine import (
+        _numpy_owns_its_memory,
+        _reown_foreign_numpy,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+
+    video = torch.randint(0, 256, (2, 3, 17, 2, 3), dtype=torch.uint8)
     audio = torch.arange(24, dtype=torch.float32).reshape(1, 2, 12)
-    oracle = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
 
     result = _minimax_h3_post_process((video, audio))
 
     assert len(result["video"]) == 2
-    for expected, actual in zip(oracle, result["video"], strict=True):
-        assert actual.dtype == np.float32
-        assert actual.flags.c_contiguous
-        assert _numpy_owns_its_memory(actual)
-        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
-        assert _reown_foreign_numpy(actual) is actual
+    for frame, expected in zip(result["video"], video, strict=True):
+        assert isinstance(frame, np.ndarray)
+        assert frame.dtype == np.uint8
+        assert frame.flags.c_contiguous
+        np.testing.assert_array_equal(frame, expected.numpy())
+        # `output_type="np"` on a CPU tensor yields a *view* onto torch's buffer.
+        # Re-owning it is the engine's job (`_reown_foreign_numpy`) and is gated by
+        # `_REOWN_MIN_BYTES` (512 KiB), so for frames this small it deliberately
+        # does nothing. The old version of this test asserted the pipeline
+        # re-owned them -- true only of the float path it was written against.
+        assert _numpy_owns_its_memory(frame) is False, "expected a borrowed view at this size"
+        assert _reown_foreign_numpy(frame) is frame, "below the re-own threshold it must pass through"
     np.testing.assert_array_equal(result["audio"], audio.numpy())
+
+
+def test_postprocess_rejects_non_uint8_instead_of_muxing_black():
+    """A float or channel-first tensor must fail here, not reach the muxer."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+
+    floats = torch.zeros(2, 3, 17, 2, 3, dtype=torch.float32)
+    audio = torch.zeros(1, 2, 12, dtype=torch.float32)
+    with pytest.raises(ValueError, match="uint8"):
+        _minimax_h3_post_process((floats, audio))
 
 
 def test_diffusion_stage_has_only_dit_and_decoder_vaes_during_discovery():
@@ -601,7 +658,11 @@ def test_renamed_local_partition_is_used_directly(tmp_path):
     model_path = tmp_path / "MiniMax-H3-FL2VA-INT8"
     _write_partition_index(model_path, partition="fl2va", tasks=["t2va", "fl2va"])
 
-    model_root, selected_path = _resolve_minimax_h3_partition_path(str(model_path), None, "fl2va")
+    # An explicit local partition directory is used directly, so the
+    # encoder-loading question never reaches the resolver here.
+    model_root, selected_path = _resolve_minimax_h3_partition_path(
+        str(model_path), None, "fl2va", load_text_encoder=False
+    )
 
     assert model_root == tmp_path
     assert selected_path == model_path
@@ -784,6 +845,10 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         fake_download,
     )
 
+    # The pipeline download is mocked above; config normalization must not
+    # independently resolve the gated repository through the local HF cache.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
     od_config = OmniDiffusionConfig(
         model="MiniMaxAI/MiniMax-H3",
         trust_remote_code=trust_remote_code,
@@ -847,20 +912,30 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         assert pipeline.text_encoder_group is None
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
+    # Deliberate deviation from upstream (74ba8ab69), registered here so it is not
+    # "fixed" back: upstream appends a
+    # ``ComponentSource(subfolder="text_encoder", prefix="text_encoder.")`` when the
+    # encoder is loaded. Ours must not. ``MiniMaxH3Qwen3VLEncoder`` reads its own
+    # safetensors shards (encoder.py, ``model.safetensors.index.json``) and has no
+    # ``load_weights``; routing it through ``weights_sources`` would hand
+    # ``text_encoder.*`` names to ``MiniMaxH3Pipeline.load_weights``, whose
+    # ``source_prefix`` accepts only ``transformer.``/``transformers_ref.`` and
+    # raises ``unexpected MiniMax-H3 weight``. Owning the load is also what lets the
+    # INT8 text-encoder artifact be published separately from the DiT.
     assert [source.model_or_path for source in pipeline.weights_sources] == [
         *(str(tmp_path / partition_name) for partition_name in source_partitions),
-        *([str(component_path)] if expect_encoder else []),
     ]
     assert [source.subfolder for source in pipeline.weights_sources] == [
         *("transformer" for _ in source_partitions),
-        *(["text_encoder"] if expect_encoder else []),
     ]
     expected_prefixes = ["transformer."]
     if expected_dits == 2:
         expected_prefixes.append("transformers_ref.")
-    if expect_encoder:
-        expected_prefixes.append("text_encoder.")
     assert [source.prefix for source in pipeline.weights_sources] == expected_prefixes
+    assert "text_encoder." not in {source.prefix for source in pipeline.weights_sources}, (
+        "the text encoder owns its load; it must not be a weights_sources entry"
+    )
+    assert (pipeline.text_encoder is not None) is expect_encoder
     expected_patterns = pipeline_module.MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS[expected_partition]
     if expect_encoder:
         expected_patterns = (
@@ -1228,6 +1303,10 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     class FakeBackend:
         supports_prefix_kv_slicing = True
 
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
+
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
 
@@ -1337,6 +1416,10 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
 
     class FakeBackend:
         supports_prefix_kv_slicing = False
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
@@ -1559,19 +1642,39 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
     assert metadata.extra["valid_kv_length"] == 5
 
 
-def test_reference_image_resize_contract():
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ((1344, 768), (1344, 768)),
+        ((640, 384), (640, 384)),
+        ((2688, 1536), (2688, 1536)),
+        ((1536, 2688), (1536, 2688)),
+        ((3072, 3072), (3072, 3072)),
+        ((1080, 1440), (1088, 1440)),
+        ((648, 392), (640, 384)),
+    ],
+)
+def test_reference_image_resize_contract(size, expected):
     from PIL import Image
 
     from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
         resolve_minimax_h3_reference_image_shape,
     )
 
-    assert resolve_minimax_h3_reference_image_shape(Image.new("RGB", (1080, 1440))) == (
-        2048,
-        2720,
+    assert resolve_minimax_h3_reference_image_shape(Image.new("RGB", size)) == expected
+
+
+def test_reference_image_resize_rejects_invalid_input():
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        resolve_minimax_h3_reference_image_shape,
     )
+
     with pytest.raises(ValueError, match="aspect ratio"):
         resolve_minimax_h3_reference_image_shape(Image.new("RGB", (100, 501)))
+    with pytest.raises(ValueError, match="dimensions"):
+        resolve_minimax_h3_reference_image_shape(Image.new("RGB", (128, 128)))
 
 
 def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
@@ -1750,13 +1853,58 @@ def test_encoder_forward_forwards_video_inputs():
     )
 
 
-def test_reference_video_shape_uses_h3_adapt_shape_policy():
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ((640, 384), (640, 384)),
+        ((384, 640), (384, 640)),
+        ((1280, 720), (1280, 704)),
+        ((1344, 768), (1344, 768)),
+        ((1920, 1152), (1280, 768)),
+        ((1152, 1920), (768, 1280)),
+        ((3844, 2160), (1344, 768)),
+        ((2160, 3844), (768, 1344)),
+        ((2048, 2048), (768, 768)),
+    ],
+)
+def test_reference_video_shape_caps_large_inputs_without_enlarging_small_inputs(size, expected, monkeypatch):
+    # Upstream #8253's "do not enlarge small references" behaviour is opt-in in this
+    # fork (sync manual §5.0 P2): the deployed default keeps enlarging, so pin the
+    # switch on for these upstream expectations and leave the assertions untouched.
+    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE", "1")
     from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         _reference_video_shape,
     )
 
-    assert _reference_video_shape(1280, 720) == (1344, 768)
-    assert _reference_video_shape(3844, 2160) == (1344, 768)
+    assert _reference_video_shape(*size) == expected
+
+
+@pytest.mark.parametrize(
+    ("size", "expected_when_off", "expected_when_on"),
+    [
+        # Below the canvas: the two modes differ.
+        ((512, 288), (1344, 768), (512, 288)),
+        ((640, 384), (1280, 768), (640, 384)),
+        # At or above the canvas: capped either way.
+        ((1344, 768), (1344, 768), (1344, 768)),
+        ((1920, 1152), (1280, 768), (1280, 768)),
+        ((2048, 2048), (768, 768), (768, 768)),
+    ],
+)
+def test_reference_video_no_upscale_switch_defaults_to_enlarging(
+    monkeypatch, size, expected_when_off, expected_when_on
+):
+    """`VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE` defaults OFF, preserving the deployed contract."""
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+        MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV,
+        _reference_video_shape,
+    )
+
+    monkeypatch.delenv(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, raising=False)
+    assert _reference_video_shape(*size) == expected_when_off
+
+    monkeypatch.setenv(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, "1")
+    assert _reference_video_shape(*size) == expected_when_on
 
 
 def test_text_encoder_stub_constructs_without_group_or_weights():
@@ -1823,49 +1971,114 @@ def test_minimax_h3_fp8_component_selection():
     assert resolve_component_quant_config(encoder_only, "text_encoder").get_name() == "fp8"
 
 
-def test_text_encoder_rejects_serialized_fp8():
-    from vllm_omni.diffusion.models.minimax_h3.encoder import _validate_encoder_quant_config
+@pytest.mark.parametrize(
+    ("spec", "rejects"),
+    [
+        # A plain config is global: "quantize where applicable". The H3 text encoder
+        # is not applicable, which `resolve_encoder_quant_config` already encodes by
+        # returning None for pre-quantized methods. Must not raise.
+        ({"method": "fp8"}, False),
+        # Component config that never mentions the encoder.
+        ({"transformer": {"method": "fp8"}}, False),
+        # The documented spelling for "this one stays unquantized": a None value.
+        # `_build_component_config` keeps it verbatim and `component_config.py`'s own
+        # docstring uses exactly this shape. Rejecting it would refuse the behaviour
+        # we implement.
+        ({"transformer": {"method": "fp8"}, "text_encoder": None}, False),
+        # Explicitly asking for encoder quantization: nothing here can honour it.
+        ({"text_encoder": {"method": "fp8"}}, True),
+        # `ComponentQuantizationConfig.resolve` matches by longest prefix, so a deeper
+        # key lands on text-encoder layers just like a shorter one.
+        ({"text_encoder.text_model": {"method": "fp8"}}, True),
+    ],
+    ids=["global", "dit-only", "encoder-none", "encoder-fp8", "encoder-deeper-key"],
+)
+def test_only_an_explicit_text_encoder_quantization_is_rejected(spec, rejects):
+    """`_reject_explicit_text_encoder_quantization` fires on intent, not on key presence.
 
-    config = SimpleNamespace(
-        get_name=lambda: "fp8",
-        is_checkpoint_fp8_serialized=True,
+    The encoder is not quantization-aware -- its linear layers take no `quant_config`
+    and INT8 comes from the checkpoint's own `weight_scale` -- so an explicit request
+    to quantize it cannot be honoured and must not be silently dropped. Everything
+    else has to pass, including the `None` spelling for "leave this one alone", which
+    is one key away from the case we do reject.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _reject_explicit_text_encoder_quantization,
     )
-    with pytest.raises(ValueError, match="online FP8 only"):
-        _validate_encoder_quant_config(config)
+    from vllm_omni.quantization import build_quant_config
+
+    quant_config = build_quant_config(spec)
+    if rejects:
+        with pytest.raises(ValueError, match="text encoder quantization is not supported"):
+            _reject_explicit_text_encoder_quantization(quant_config)
+    else:
+        _reject_explicit_text_encoder_quantization(quant_config)
 
 
-def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
+def test_text_encoder_rejects_online_only_int8(tmp_path):
+    """An int8 checkpoint with no serialized weights must be refused, not guessed at.
+
+    Rewritten from `test_text_encoder_rejects_serialized_fp8`, which imported
+    `_validate_encoder_quant_config` -- a symbol that has never existed on any
+    branch (verified with `git grep`), so that test never ran. The contract it was
+    reaching for is still enforced, by `_enable_int8_if_serialized`, which reads
+    the checkpoint's own config.json and refuses an int8 declaration that is not
+    `is_checkpoint_int8_serialized`: an Int8 checkpoint has no BF16 weights to fall
+    back to, so online quantization would silently produce garbage.
+    """
+    import json
+
+    import torch
+
+    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "int8", "is_checkpoint_int8_serialized": False}}),
+        encoding="utf-8",
+    )
+    encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.text_model = torch.nn.Sequential()
+
+    with pytest.raises(ValueError, match="online quantization is not supported here"):
+        encoder._enable_int8_if_serialized(str(tmp_path))
+
+
+def test_text_encoder_linear_takes_no_quant_config_by_constructor():
+    """Deliberate deviation from upstream, registered here so it is not "restored".
+
+    Upstream's ``MiniMaxH3Qwen3VLMergedColumnParallelLinear`` takes a
+    ``quant_config`` and lets vLLM's factory resolve ``self.quant_method`` from it.
+    Ours does not: the constructor hard-codes ``quant_config=None``, so
+    ``LinearBase.__init__`` resolves the ``UnquantizedLinearMethod``, and INT8 is
+    switched on *after* construction by ``_Int8WeightMixin.enable_int8`` from the
+    checkpoint's own ``weight_scale`` tensors -- which is what lets the BF16 path
+    keep every signature and default it had, and what lets the INT8 artifact ship
+    separately.
+
+    Pinning the *absence* is the point: a ``quant_config`` reappearing in this
+    signature would silently change which method runs, and the repo has no call site
+    that passes one, so nothing else would catch it.
+    """
+    import inspect
+
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     import vllm_omni.diffusion.models.minimax_h3.encoder as encoder_module
 
-    group = SimpleNamespace(rank_in_group=0, world_size=1)
-    method = UnquantizedLinearMethod()
-    quant_config = create_autospec(QuantizationConfig, instance=True)
-    quant_config.online_quantization_config = None
-    quant_config.get_quant_method.return_value = method
-    # vLLM 0.30: no online quantization for this checkpoint-quantized layer
-    quant_config.online_quantization_config = None
-    prefix = "text_encoder.text_model.layers.0.mlp.gate_up_proj"
+    linear_cls = encoder_module.MiniMaxH3Qwen3VLMergedColumnParallelLinear
+    assert "quant_config" not in inspect.signature(linear_cls.__init__).parameters
 
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
     with (
         patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
         patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
     ):
-        linear = encoder_module.MiniMaxH3Qwen3VLMergedColumnParallelLinear(
-            group,
-            input_size=4,
-            intermediate_size=8,
-            dtype=torch.bfloat16,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
+        linear = linear_cls(group, input_size=4, intermediate_size=8, dtype=torch.bfloat16)
 
-    assert linear.quant_method is method
-    # vLLM 0.30 resolves the method through resolve_quant_method(), which calls
-    # get_quant_method(layer, prefix) POSITIONALLY; 0.29 passed prefix= by keyword.
-    quant_config.get_quant_method.assert_called_once_with(linear, prefix)
+    assert isinstance(linear.quant_method, UnquantizedLinearMethod), (
+        "the BF16 path must stay unquantized until enable_int8() is called"
+    )
 
 
 def test_no_offload_keeps_text_encoder_resident():
@@ -2470,20 +2683,29 @@ def test_ref2va_reference_count_validation_preserves_client_error_metadata():
 
 
 @pytest.mark.parametrize(
-    ("case", "start_time", "expected_duration"),
+    ("case", "start_time", "expected_duration", "input_size", "expected_size"),
     [
-        ("R7", None, 10.0),
-        ("R8", 4.0, 6.0),
+        ("R7", None, 10.0, (3844, 2160), (1344, 768)),
+        # R8's geometry is the *default* behaviour, which enlarges a below-canvas
+        # reference: (640, 384) -> (1280, 768). This row used to expect (640, 384),
+        # which is what `VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE=1` produces -- and this
+        # test never sets that variable. Both modes, and the fact that enlarging is
+        # the default, are pinned by
+        # `test_reference_video_no_upscale_switch_defaults_to_enlarging`; R8 is here
+        # for the temporal segment (start 4.0 / 6.0 s), not for the switch.
+        ("R8", 4.0, 6.0, (640, 384), (1280, 768)),
     ],
 )
-def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_time, expected_duration):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+def test_r7_r8_ref2va_video_segment_matrix(
+    monkeypatch, tmp_path, case, start_time, expected_duration, input_size, expected_size
+):
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     source = tmp_path / f"{case}.mp4"
     source.touch()
     metadata = {
-        "width": 1280,
-        "height": 720,
+        "width": input_size[0],
+        "height": input_size[1],
         "fps": 24.0,
         "frame_count": 240,
         "duration": 10.0,
@@ -2511,10 +2733,12 @@ def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_ti
     assert prepared[0]["start_time_seconds"] == pytest.approx(start_time or 0.0)
     assert transcode_calls[0][1]["duration_seconds"] == pytest.approx(expected_duration)
     assert transcode_calls[0][1]["target_frame_count"] == 209
+    assert (prepared[0]["width"], prepared[0]["height"]) == expected_size
+    assert (transcode_calls[0][1]["target_width"], transcode_calls[0][1]["target_height"]) == expected_size
 
 
 def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -2567,7 +2791,7 @@ def test_prepared_reference_video_descriptor_rejects_unknown_fields():
 
 
 def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     decoded = np.arange(3 * 2 * 2 * 3, dtype=np.uint8).reshape(3, 2, 2, 3)
     decode_calls: list[Any] = []
@@ -2609,7 +2833,7 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     [([0, 12], 25), (None, 2)],
 )
 def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame_count):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
     observed = []
@@ -2641,7 +2865,7 @@ def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame
 
 
 def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.zeros((2, 2, 3, 3), dtype=np.uint8)
     decode_calls: list[Any] = []
@@ -2688,15 +2912,15 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     ],
 )
 def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     with pytest.raises(OmniClientError, match=message):
         reference_video_module._decode_video_frames_ffmpeg("prepared.mp4", **kwargs)
 
 
 def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     calls: list[Any] = []
     probe = {
@@ -2731,7 +2955,7 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
 
 
 def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     calls: list[Any] = []
     stream = {
@@ -2768,8 +2992,8 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
 
 
 def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     monkeypatch.setattr(
         reference_video_module.subprocess,
@@ -2787,7 +3011,7 @@ def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
 
 
 def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"
@@ -2841,8 +3065,8 @@ def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_p
 
 
 def test_ref2va_two_video_recipe_rejects_real_duration_overflow(monkeypatch, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
     from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import reference_video as reference_video_module
 
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"
@@ -3584,7 +3808,7 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
     def prepare(*args):
         if cancel_phase == "prepare":
             registry.cancel(["request"])
-        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode}
+        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode, "height": 2, "width": 2}
 
     def diffuse(**kwargs):
         registry.cancel(["request"])

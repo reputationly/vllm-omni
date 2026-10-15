@@ -15,17 +15,20 @@ This guide explains how to calculate GPU memory requirements and properly config
 
 For each stage, vLLM-Omni calculates the requested memory as:
 
-```
+```text
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
-The system checks that:
+When other stages already occupy the same GPU, Omni caps this requested budget:
 
-```
-free_memory ≥ requested_memory
+```text
+requested_memory = min(requested_memory, free_memory)
 ```
 
-If this condition is not met, the stage will fail to initialize with an error message showing the memory requirements.
+The worker logs a warning when it caps the budget. Model and runtime allocations
+are subtracted from that budget when sizing the KV cache. Initialization can
+still fail if the remaining budget cannot hold the required cache. Raising
+`gpu_memory_utilization` does not increase a budget already capped to free memory.
 
 ### Memory Components
 
@@ -36,6 +39,20 @@ The total memory used by a stage includes:
 3. **Activation Memory**: Temporary memory for intermediate computations
 4. **System Overhead**: Memory used by CUDA, PyTorch, and other system components
 5. **Non-Torch Memory**: Memory allocated outside of PyTorch (e.g., CUDA graphs)
+
+When a stage captures CUDA graphs, the pool the runner captures through its
+CUDA-graph dispatcher is profiled during startup and subtracted from the KV cache
+budget, so `gpu_memory_utilization` covers those graphs as well. Set
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` to skip that profiling pass and leave the pool unreserved. A stage tuned
+before this reserve existed keeps its previous KV cache size by raising
+`gpu_memory_utilization` by the graph pool's share of the device. The startup log
+prints the value to use when the raised budget still fits in the memory free at
+startup, and otherwise says that no value restores the previous size, for example
+when co-located stages already hold part of the device. Graphs a model captures for
+itself after startup profiling — the talker MTP graphs in
+`GPUARModelRunner.capture_model` and model `capture_auxiliary_graphs` hooks — are
+not part of that estimate. Stages using these graphs need those pools free on top
+of their utilization.
 
 ### Example Calculation
 
@@ -84,7 +101,7 @@ Diffusion stages (like code2wav) typically need less memory:
 
 When multiple stages share the same GPU, you must ensure the sum of their `gpu_memory_utilization` values doesn't exceed 1.0.
 
-**Example: Two stages on GPU 0**
+#### Example: Two stages on GPU 0
 
 ```yaml
 stages:
@@ -104,7 +121,7 @@ stages:
 
 When using `tensor_parallel_size > 1`, the model is split across multiple GPUs, so each GPU needs less memory.
 
-**Example: 2-way tensor parallelism**
+#### Example: 2-way tensor parallelism
 
 ```yaml
 stages:
@@ -187,7 +204,7 @@ The KV cache size depends on:
 
 approximate Formula:
 
-```
+```text
 kv_cache_memory ≈ batch_size × seq_len × hidden_size × num_layers × 2 × dtype_size
 ```
 
@@ -195,7 +212,7 @@ kv_cache_memory ≈ batch_size × seq_len × hidden_size × num_layers × 2 × d
 
 ### Model Weight Memory
 
-```
+```text
 model_memory ≈ num_parameters × dtype_size
 ```
 

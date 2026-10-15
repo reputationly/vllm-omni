@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -27,6 +28,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
@@ -78,6 +80,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
+    _local_partition_from_release_metadata,
     is_minimax_h3_modular,
     resolve_minimax_h3_partition,
 )
@@ -98,6 +101,7 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     MINIMAX_H3_SUPPORTED_ASPECT_RATIOS,
     _align_multiple,
     build_minimax_h3_presentation,
+    load_minimax_h3_images,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
@@ -107,12 +111,16 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     prepare_reference_videos,
     prepare_reference_videos_official,
 )
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
+    MINIMAX_H3_TIMELINE_GUIDES_KEY,
+    resolve_guide_start,
+)
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
 )
 from vllm_omni.quantization.component_config import (
-    resolve_encoder_quant_config as _resolve_encoder_quant_config,
+    ComponentQuantizationConfig,
 )
 
 from .batched_packing import minimax_h3_batched_forward_kwargs
@@ -135,6 +143,15 @@ from .latent_mask import (
     minimax_h3_audio_edit_masks,
     minimax_h3_prepare_edit_rows,
     minimax_h3_video_edit_masks,
+)
+from .latent_upscaler import (
+    MiniMaxH3LatentRefineSpec,
+    MiniMaxH3LatentUpscalerError,
+    MiniMaxH3LatentUpscaleTarget,
+    parse_minimax_h3_latent_refine_request,
+    parse_minimax_h3_latent_upscale_request,
+    resolve_minimax_h3_latent_upscale_target,
+    resolve_minimax_h3_latent_upscaler,
 )
 from .lora import TurboSpec, load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
@@ -163,6 +180,7 @@ from .packed_sequence import (
     minimax_h3_packed_sequence_ref2va_blocks,
 )
 from .packed_tokens import (
+    minimax_h3_pack_audio_latent,
     minimax_h3_patchify_video_latent,
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
@@ -179,9 +197,15 @@ from .reference_image_geometry import (
     parse_reference_image_short_edge,
 )
 from .reference_video_frames import vae_chunk_frame_count
-from .request_noise import MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_PATCH_SIZE, MiniMaxH3RequestNoisePlan
+from .request_noise import (
+    MINIMAX_H3_AUDIO_CHANNELS,
+    MINIMAX_H3_CONDITION_SHAPE_LEGACY,
+    MINIMAX_H3_PATCH_SIZE,
+    MINIMAX_H3_RNG_LEGACY,
+    MiniMaxH3RequestNoisePlan,
+)
+from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
 from .strategy import MiniMaxH3InferenceStrategy, contract_environ, legacy_strategy, resolve_strategy
@@ -190,13 +214,12 @@ from .time_request import (
     minimax_h3_align_frame_count,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
 from .vdn import VDNCheckpoint, resolve_vdn_checkpoint
 from .vdn_hybrid import validate_hybrid_runtime
+from .vdnh3 import VDNCheckpoint as UpstreamVDNCheckpoint
 
 if TYPE_CHECKING:
-    from PIL import Image
-
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -370,27 +393,74 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
 
 
 def _local_minimax_h3_partition(path: Path) -> str | None:
-    """Read a local partition from its release metadata, not its directory name."""
-    index_path = path / "model_index.json"
-    if not path.is_dir() or not index_path.is_file():
+    """Read a local partition from its release metadata, then its directory name.
+
+    The metadata read is `checkpoint._local_partition_from_release_metadata`, which
+    `resolve_minimax_h3_partition` also uses; the two resolvers having their own
+    copies of it is how they drifted apart in the first place. The directory-name
+    fallback stays here only, because it is the older convention that the metadata
+    is meant to replace -- `resolve_minimax_h3_partition` keeps it too, for a
+    release that predates `_minimax_h3.partition`.
+    """
+    if not path.is_dir():
         return None
-    try:
-        model_index = json.loads(index_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    partition = str((model_index.get("_minimax_h3") or {}).get("partition", "")).lower()
-    if partition in {"fl2va", "ref2va"}:
+    partition = _local_partition_from_release_metadata(path)
+    if partition is not None:
         return partition
     if path.name in {"FL2VA", "Ref2VA"}:
         return path.name.lower()
     return None
 
 
-def _resolve_minimax_h3_text_encoder_quant_config(
-    quant_config: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    resolved = _resolve_component_quant_config(quant_config, "text_encoder")
-    return _resolve_encoder_quant_config(resolved)
+def _reject_explicit_text_encoder_quantization(quant_config: QuantizationConfig | None) -> None:
+    """Refuse a quant config that explicitly scopes to the text encoder.
+
+    This replaces ``_resolve_minimax_h3_text_encoder_quant_config``, which had zero
+    callers on this branch *and* on origin/main -- it resolved a config for the
+    upstream encoder that accepted one. Ours does not: the three
+    ``MiniMaxH3Qwen3VL*Linear`` layers take no ``quant_config`` and switch INT8 on
+    after construction from the checkpoint's own ``weight_scale`` (see
+    ``_Int8WeightMixin``). So an explicit ``text_encoder`` entry could not be
+    honoured, and silently dropping it starts a deployment whose memory and latency
+    are not the ones the config asked for.
+
+    A *plain* config is a different matter and is left alone: it means "quantize
+    where applicable", and the H3 text encoder is simply not applicable --
+    ``resolve_encoder_quant_config`` already returns None for pre-quantized methods
+    for exactly that reason. Raising on it would break deployments that set a
+    global method for the DiT.
+    """
+    if not isinstance(quant_config, ComponentQuantizationConfig):
+        return
+    # Two things the naive `"text_encoder".startswith(prefix)` got wrong:
+    #
+    # * a `None` value means "explicitly NOT quantized" -- it is the documented
+    #   spelling (`{"transformer": fp8_config, "vae": None}` in component_config.py)
+    #   and the factory keeps it verbatim, so `{"transformer": "fp8",
+    #   "text_encoder": None}` is the ordinary way to say "DiT quantized, text
+    #   encoder left alone". Rejecting that would refuse exactly the behaviour we
+    #   implement.
+    # * `resolve()` matches by longest prefix, so a *deeper* key such as
+    #   `text_encoder.text_model.layers` lands on text-encoder layers just as a
+    #   shorter one does. The match therefore has to run in both directions.
+    #
+    # `default` is not in here at all -- `_build_component_config` lifts it into
+    # `default_config` -- so a plain global config still passes straight through,
+    # which is what "quantize where applicable" should mean.
+    scoped = sorted(
+        prefix
+        for prefix, value in quant_config.component_configs.items()
+        if value is not None and (prefix.startswith("text_encoder") or (prefix and "text_encoder".startswith(prefix)))
+    )
+    if not scoped:
+        return
+    raise ValueError(
+        "MiniMax-H3 text encoder quantization is not supported: the deployment sets "
+        f"quantization for {sorted(scoped)}, but this encoder is not quantization-aware. "
+        "It loads its own BF16/INT8 checkpoint and only the checkpoint's serialized "
+        "INT8 is applied. Remove the text_encoder entry from the quantization config, "
+        "or ship a pre-quantized text_encoder artifact."
+    )
 
 
 def _minimax_h3_partition_for_task(
@@ -471,6 +541,7 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "visual_condition_shapes",
     "audio_condition_lengths",
     "keyframe_frame_indices",
+    "guide_blocks",
     "pad_seq_len",
     "locked_audio_rows",
     "video_edit_clean_rows",
@@ -481,10 +552,15 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "audio_edit_restore_mask_rows",
 )
 
+# Request-context key for the FL2VA keyframes re-encoded at the refine size.
+_REFINE_KEYFRAME_CONDITION = "minimax_h3_refine_keyframe_condition"
+
 # ``StepRequestState.extra`` keys owned by the step-execution path.
 _STEP_BRANCH = "minimax_h3_branch"
 _STEP_AUDIO_ROWS = "minimax_h3_audio_rows"
 _STEP_AUDIO_NOISE_PRED = "minimax_h3_audio_noise_pred"
+_STEP_VIDEO_SOLVER = "minimax_h3_video_solver"
+_STEP_AUDIO_SOLVER = "minimax_h3_audio_solver"
 _STEP_SIGMAS_VIDEO = "minimax_h3_sigmas_video"
 _STEP_SIGMAS_AUDIO = "minimax_h3_sigmas_audio"
 _STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
@@ -568,6 +644,16 @@ def resolve_minimax_h3_diffusion_model_path(
         return str(model_root)
     subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
     return str(model_root / subdir)
+
+
+def _minimax_h3_output_canvas(
+    shape: Mapping[str, Any],
+    target: MiniMaxH3LatentUpscaleTarget | None,
+) -> tuple[int, int]:
+    """The decoded frame size, which the upscaler moves when it runs."""
+    if target is None:
+        return int(shape["height"]), int(shape["width"])
+    return target.height, target.width
 
 
 def _minimax_h3_post_process(output, output_type: str = "np"):
@@ -1032,6 +1118,27 @@ def _reference_image_shape_for_strategy(
     )
 
 
+def _reference_image_geometry_overrides_upstream(strategy: MiniMaxH3InferenceStrategy) -> bool:
+    """Whether this contract's reference-image geometry can differ from the upstream resize.
+
+    Upstream -- ``prepare_encoder_inputs`` without a ``reference_image_shape``
+    callback, which lands on ``resolve_minimax_h3_reference_image_shape(max_area=None)``
+    -- preserves each reference's own resolution rounded to the 32-pixel grid. It
+    never enlarges and never shrinks.
+
+    Each divergence is decidable from the strategy alone:
+      * ``match`` shrinks a reference larger than the request canvas;
+      * ``fixed_area`` shrinks one larger than the fixed budget;
+      * the plain short-edge branch, which is every other mode, *enlarges*
+        anything smaller than ``reference_image_short_edge`` whenever
+        ``no_upscale`` is off -- the legacy and official-v1 default, and the case
+        an operator is most likely to be surprised by.
+    """
+    if strategy.reference_image_geometry_mode in {"match", "fixed_area"}:
+        return True
+    return not strategy.reference_image_no_upscale
+
+
 def _reference_image_shape(
     image: Image.Image,
     *,
@@ -1310,6 +1417,15 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    load_vae_decoder: bool = True
+
+    # `__init__` overwrites both from the resolved strategy. They are also declared
+    # here because several tests assemble a pipeline with ``object.__new__`` plus
+    # ``nn.Module.__init__`` to exercise tensor helpers without loading weights, and
+    # those instances never run `__init__`. The values are the documented legacy
+    # pairing, which is what a pipeline without a strategy contract would use.
+    rng_mode: str = MINIMAX_H3_RNG_LEGACY
+    condition_noise_shape_mode: str = MINIMAX_H3_CONDITION_SHAPE_LEGACY
     supports_request_cancellation: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
@@ -1345,6 +1461,8 @@ class MiniMaxH3Pipeline(
     _vdn_ref: VDNCheckpoint | None = None
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
+    # Set from --lora-path when it names a VDN-H3 checkpoint directory.
+    _vdn_upstream: UpstreamVDNCheckpoint | None = None
     _fasth3_checkpoint: FastH3CheckpointSpec | None = None
 
     def _load_diffusion_lora_adapter(
@@ -1557,6 +1675,11 @@ class MiniMaxH3Pipeline(
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
+        self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        if not self.load_vae_decoder and self.load_vae_encoder:
+            raise ValueError(
+                "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
+            )
         if self.load_vae_encoder is False and self.load_text_encoder is True:
             raise ValueError(
                 "MiniMax H3 does not support local text encoding with external media conditioning; "
@@ -1570,6 +1693,14 @@ class MiniMaxH3Pipeline(
         on_demand_component_paths = set(self._offload_plan.on_demand_component_paths)
         if not self.load_text_encoder:
             on_demand_component_paths.discard("text_encoder")
+        if not self.load_vae_decoder:
+            on_demand_component_paths.difference_update(("video_vae", "audio_vae"))
+            self._vae_modules = []
+            self._PROFILER_TARGETS = [
+                name
+                for name in self._PROFILER_TARGETS
+                if name not in {"decode", "video_vae.decode_latent", "audio_vae.decode_latent"}
+            ]
         self._offload_plan = replace(
             self._offload_plan,
             encoder_block_attrs=encoder_block_attrs,
@@ -1668,6 +1799,54 @@ class MiniMaxH3Pipeline(
         self.rng_mode = self.strategy.rng_mode
         self.condition_noise_shape_mode = self.strategy.visual_condition_noise_shape_mode
         logger.info("MiniMax-H3 contract: %s", self.strategy.describe())
+        if not self.load_text_encoder and _reference_image_geometry_overrides_upstream(self.strategy):
+            # Say it out loud rather than let it be discovered from output. The
+            # contract's `reference_image_*` geometry reaches `prepare_encoder_inputs`
+            # through its `reference_image_shape` callback, which only the diffusion
+            # pipeline passes; the encoder-stage bridge calls it without one, so the
+            # references the ENCODER STAGE sees are resized exactly as upstream does.
+            #
+            # How much of the request that covers depends on `load_vae_encoder`, because
+            # `_prepare_request_inputs` only runs `_prepare_local_conditioning` (and
+            # therefore the callback) when `load_text_encoder or load_vae_encoder`:
+            #
+            #   * neither local  -> everything is the stage's, so the whole geometry is
+            #                       upstream's and no `reference_image_*` setting applies;
+            #   * VAE local      -> the visual condition is encoded here at the contract
+            #                       geometry, while the TEXT conditioning was computed by
+            #                       the stage from an upstream-resized reference. The two
+            #                       halves of the request disagree about the reference.
+            #
+            # An operator who set `VLLM_OMNI_H3_REF_IMAGE_*` or picked a contract for its
+            # reference-image behaviour would otherwise read a log that claims the
+            # contract while part of the request follows a different policy.
+            geometry = (
+                f"mode={self.strategy.reference_image_geometry_mode}, "
+                f"short_edge={self.strategy.reference_image_short_edge}, "
+                f"no_upscale={self.strategy.reference_image_no_upscale}, "
+                f"max_pixels={self.strategy.reference_image_max_pixels}"
+            )
+            if self.load_vae_encoder:
+                logger.warning(
+                    "MiniMax-H3 contract %r sets a reference-image geometry (%s), but the text encoder "
+                    "runs in a separate stage: the reference images the text conditioning was computed "
+                    "from follow the upstream resize (preserve resolution, 32-pixel grid) and do not use "
+                    "those settings. The visual condition IS encoded locally and does use them, so the "
+                    "two halves of this request disagree about the reference image. "
+                    "Reference-image geometry is contract-controlled for both halves only on a "
+                    "single-stage deployment.",
+                    self.strategy.name,
+                    geometry,
+                )
+            else:
+                logger.warning(
+                    "MiniMax-H3 contract %r sets a reference-image geometry (%s), but neither the text "
+                    "encoder nor the VAE encoder runs locally: reference images follow the upstream "
+                    "resize (preserve resolution, 32-pixel grid) and none of those settings apply. "
+                    "Reference-image geometry is contract-controlled only on a single-stage deployment.",
+                    self.strategy.name,
+                    geometry,
+                )
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -1711,7 +1890,14 @@ class MiniMaxH3Pipeline(
                 diffusers_weights=modular,
             )
 
-        self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
+        # Upstream VDNH3_ATTN contract. Kept under its own attribute so it does not
+        # collide with our VDN_WINDOW_ATTN `self._vdn` below (manual §5.3).
+        self._vdn_upstream = UpstreamVDNCheckpoint.from_od_config(od_config, self.transformer)
+        if self._vdn_upstream is not None:
+            self._vdn_upstream.check_serving_contract(partition=self.partition, od_config=od_config)
+            # The hybrid modules must exist before the branch tensors stream in.
+            self.transformer.enable_vdn(self._vdn_upstream.config)
+        self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer) if self._vdn_upstream is None else None
         if self._fasth3 is not None and self._fasth3.requires_vsa:
             # The artifact assigns a compression gate per DiT block, so those
             # modules have to exist before load_weights streams them in. Only
@@ -1776,7 +1962,7 @@ class MiniMaxH3Pipeline(
             "minimax_h3_adaln_cache_path",
             expected_partition,
             self._fasth3.source if self._fasth3 is not None else None,
-            eligible=transformer_quant_config is None and not modular,
+            eligible=transformer_quant_config is None and not modular and self._vdn_upstream is None,
         )
         if ref2va_model_path is not None:
             self._configure_adaln_sidecar(
@@ -1821,6 +2007,7 @@ class MiniMaxH3Pipeline(
                 )
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
+            _reject_explicit_text_encoder_quantization(od_config.quantization_config)
             self.text_encoder = MiniMaxH3Qwen3VLEncoder(
                 os.path.join(model_path, "text_encoder"),
                 device=self.device,
@@ -1846,25 +2033,44 @@ class MiniMaxH3Pipeline(
         # so VAEs stay resident for new configurations.
         # 加到 CPU 才谈得上"用前上卡":上游只在 legacy 路径这么做,VAE 在新配置下直接进
         # 显存。我们的 env 把它拉回 CPU,再由 _component_on_device 逐次搬运。
+        # 我方的 _component_offload_requested() 优先于上游的 load_device。
         component_load_device = (
             torch.device("cpu") if legacy_manual_components or _component_offload_requested() else self.device
         )
-        self.video_vae = MiniMaxH3VideoVAE(
-            os.path.join(vae_model_path, "video_vae"),
-            device=self.device,
-            load_device=component_load_device,
-            decode_only=not self.load_vae_encoder,
-            trust_remote_code=od_config.trust_remote_code,
-        )
-        self.audio_vae = MiniMaxH3AudioVAE(
-            os.path.join(vae_model_path, "audio_vae"),
-            device=self.device,
-            load_device=component_load_device,
-            decode_only=not self.load_vae_encoder,
-            trust_remote_code=od_config.trust_remote_code,
-        )
+        self.video_vae = None
+        self.audio_vae = None
+        if self.load_vae_decoder:
+            self.video_vae = MiniMaxH3VideoVAE(
+                os.path.join(vae_model_path, "video_vae"),
+                device=self.device,
+                load_device=component_load_device,
+                decode_only=not self.load_vae_encoder,
+                trust_remote_code=od_config.trust_remote_code,
+            )
+            self.audio_vae = MiniMaxH3AudioVAE(
+                os.path.join(vae_model_path, "audio_vae"),
+                device=self.device,
+                load_device=component_load_device,
+                decode_only=not self.load_vae_encoder,
+                trust_remote_code=od_config.trust_remote_code,
+            )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        # Optional learned latent super-resolution, run between the denoise
+        # loop and the VAE. Absent unless --additional-config names a
+        # checkpoint, so a plain H3 deployment carries none of its weights.
+        # The upscaler works one normalization below the pipeline latent, so it
+        # needs the same per-channel statistics the VAE denormalizes with.
+        def _upscaler_latent_stats() -> tuple[list[float], list[float]]:
+            config = _load_component_config(os.path.join(vae_model_path, "video_vae"))
+            return config["latents_mean"], config["latents_std"]
+
+        self.latent_upscaler = resolve_minimax_h3_latent_upscaler(
+            od_config,
+            device=self.device,
+            latent_stats=_upscaler_latent_stats,
+        )
 
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
@@ -1942,6 +2148,8 @@ class MiniMaxH3Pipeline(
             if component is None:
                 raise ValueError(f"MiniMax-H3 component {prefix.removesuffix('.')!r} is disabled in this deployment")
             stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            if prefix == "transformer." and self._vdn_upstream is not None:
+                stream = self._vdn_upstream.apply(stream)
             if prefix == "transformer." and self._fasth3 is not None:
                 # Fuse before the model shards anything, which is also the only
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
@@ -1964,17 +2172,22 @@ class MiniMaxH3Pipeline(
                 component.post_load_weights()
                 self._finish_adaln_sidecar(component)
             loaded_with_prefix.update(prefix + name for name in loaded)
-        # The text encoder and both VAEs load eagerly in ``__init__`` rather
-        # than through ``weights_sources``. Record them for the runner's strict
-        # missing-parameter check. For the text encoder that report is exact
-        # because its loader raises on any unloaded parameter or partially filled
-        # fused parameter; weaken that and gaps here become invisible. The two
-        # VAEs carry no equivalent guarantee.
-        for component_name in ("text_encoder", "video_vae", "audio_vae"):
-            component = getattr(self, component_name)
+        # Both VAEs load eagerly in ``__init__`` rather than through
+        # ``weights_sources``, and so does the text encoder -- it reads its own
+        # safetensors shards (``MiniMaxH3Qwen3VLEncoder``, via
+        # ``model.safetensors.index.json``). This comment used to say the encoder
+        # went through the shared component loader "like the DiT"; that described
+        # upstream and contradicted ``source_prefix`` twenty lines above, which
+        # accepts only ``transformer.``/``transformers_ref.``.
+        # ``latent_upscaler`` is the optional hi-res path (PR #8322): absent unless
+        # ``latent_upscaler_path`` is configured, hence the None default.
+        for component_name in ("video_vae", "audio_vae", "latent_upscaler"):
+            component = getattr(self, component_name, None)
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
+        if self._vdn_upstream is not None:
+            self._vdn_upstream.validate(transformer_loaded, self.transformer.vdn_parameter_names())
         if self._fasth3 is not None:
             # load_weights only warns on a parameter the model does not have, so
             # close the adapter against what the DiT actually consumed.
@@ -1997,7 +2210,12 @@ class MiniMaxH3Pipeline(
     @property
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None or self._vdn is not None or self._vdn_ref is not None
+        return (
+            self._fasth3 is not None
+            or self._vdn is not None
+            or self._vdn_ref is not None
+            or self._vdn_upstream is not None
+        )
 
     def _configure_adaln_sidecar(
         self,
@@ -2018,12 +2236,6 @@ class MiniMaxH3Pipeline(
         if path is None or not transformer.adaln_cache.max_bytes:
             return
         try:
-            # Compiled blocks bypass projection reuse. Reject before reading the
-            # sidecar so load completion cannot move an unused payload to GPU.
-            if not self.od_config.enforce_eager:
-                raise ValueError(
-                    "offline sidecars require --enforce-eager; compiled H3 blocks bypass cached projections"
-                )
             if not eligible or get_tensor_model_parallel_world_size() != 1:
                 raise ValueError("offline sidecar uses native BF16 TP1 math; use the default runtime cache here")
             sidecar = MiniMaxH3AdalnCache(transformer.arch, path=path, model_variant=variant)
@@ -2413,20 +2625,33 @@ class MiniMaxH3Pipeline(
 
         components = ModuleDiscovery.discover(self)
         dits = components.dits
+        # This optional stage owns its own weight placement. Register it only
+        # with model-level sequential offload; generic VAE discovery would
+        # otherwise move it onto the GPU during unrelated layerwise setup.
+        upscaler = getattr(self, "latent_upscaler", None)
         stages = [*components.encoders, *components.vaes]
+        if upscaler is not None:
+            stages.append(upscaler)
         modules = [*dits, *stages]
+        # The upscaler normally parks its own weights on the host. Keep it as
+        # an execution stage so activating it evicts the DiT, but do not scan
+        # its parameters on every DiT step unless residency was requested.
+        selected_stages = [stage for stage in stages if stage is not upscaler or upscaler.resident]
         selection_options: dict[str, Any] = {}
         if offload_components is not None:
             if DIT_COMPONENT in offload_components and not dits:
                 raise ValueError("MiniMax-H3 has no loaded DiT for selected module offload")
             if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:
                 raise ValueError("MiniMax-H3 has no loaded text encoder for selected module offload")
+            selected_explicit_stages = [*components.encoders] if TEXT_ENCODER_COMPONENT in offload_components else []
+            if upscaler is not None and upscaler.resident:
+                selected_explicit_stages.append(upscaler)
             selection_options = {
                 "offload_dit_modules": dits if DIT_COMPONENT in offload_components else (),
-                "offload_encoder_modules": (
-                    components.encoders if TEXT_ENCODER_COMPONENT in offload_components else ()
-                ),
+                "offload_encoder_modules": selected_explicit_stages,
             }
+        elif upscaler is not None:
+            selection_options["offload_encoder_modules"] = selected_stages
         apply_sequential_offload(
             dit_modules=dits,
             encoder_modules=stages,
@@ -2526,22 +2751,26 @@ class MiniMaxH3Pipeline(
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
         _, rank, _ = _dit_rank_world()
+        # encode_image retains parallel tiling when there are enough tiles.
+        # Every VAE rank must finish its codec collectives before the latent
+        # broadcast, including when refinement enlarges the keyframe images.
+        encode_images = bool(images) and (rank == 0 or self.video_vae.is_distributed_enabled())
         # Keep image and video references in one residency window when both
         # appear in a request; otherwise the video branch would reload the VAE.
         # Encoding touches only the CNN encoder half, so the 9GB ViT decoder
         # stays off the device for the whole window.
-        needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
+        needs_video_vae = video_count > 0 or encode_images
         video_vae_context = (
             self._component_on_device(self.video_vae.encoder_component) if needs_video_vae else nullcontext()
         )
         with video_vae_context:
             if images:
                 image_rows = None
-                if rank == 0:
+                if encode_images:
                     image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
                 rows.append(
                     _broadcast_tensor(
-                        image_rows,
+                        image_rows if rank == 0 else None,
                         dtype=torch.float32,
                         device=self.device,
                     )
@@ -2863,6 +3092,43 @@ class MiniMaxH3Pipeline(
         )
         return video_rows, audio_rows
 
+    @staticmethod
+    def _renoise_rows(
+        init_latents: tuple[torch.Tensor, torch.Tensor],
+        *,
+        noise_video: torch.Tensor,
+        noise_audio: torch.Tensor,
+        sigma_video: float,
+        sigma_audio: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Put finished latents back on the flow at the given sigmas.
+
+        The rectified-flow forward process is ``x_s = (1 - s) * x0 + s * noise``
+        -- the interpolation :func:`minimax_h3_euler_eta0_step` walks back down
+        -- so this lands the latents exactly where a full pass would have been
+        at that sigma, which is what makes resuming mid-schedule in-distribution.
+        """
+        video_latent, audio_latent = init_latents
+        video_prior = minimax_h3_patchify_video_latent(
+            video_latent.detach().to(device="cpu", dtype=torch.float32),
+            patch_size=(1, 2, 2),
+        )
+        audio_prior = minimax_h3_pack_audio_latent(audio_latent.detach().to(device="cpu", dtype=torch.float32))
+        if video_prior.shape != noise_video.shape:
+            raise ValueError(
+                f"refine video rows {tuple(video_prior.shape)} do not match the "
+                f"target layout {tuple(noise_video.shape)}"
+            )
+        if audio_prior.shape != noise_audio.shape:
+            raise ValueError(
+                f"refine audio rows {tuple(audio_prior.shape)} do not match the "
+                f"target layout {tuple(noise_audio.shape)}"
+            )
+        return (
+            (1.0 - sigma_video) * video_prior + sigma_video * noise_video,
+            (1.0 - sigma_audio) * audio_prior + sigma_audio * noise_audio,
+        )
+
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled: bool = True):
         controller = getattr(self, "_dlo_residency_controller", None)
@@ -2898,6 +3164,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
         locked_audio_rows: torch.Tensor | None = None,
         temporal_offset: float = 0.0,
@@ -2908,21 +3175,57 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        sampler: str = "euler",
+        init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
+        refine: MiniMaxH3LatentRefineSpec | None = None,
+        precomputed_initial_noise: tuple[torch.Tensor, torch.Tensor] | None = None,
+        precomputed_visual_condition_noise: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
         Shared by request-mode :meth:`diffuse` and step-mode
         :meth:`prepare_encode` so both paths start from identical state.
+
+        ``init_latents`` and ``refine`` turn the pass into a second, partial
+        one: the rows start from those latents re-noised to the schedule
+        position ``refine`` selects, and the returned schedules begin there.
         """
         # One plan per request. The official contract consumes a single
         # generator in block order -- every visual condition, then the video
         # latent, then the audio rows -- so the conditioning noise has to be
         # drawn here, before the generated rows, not lazily further down.
+        #
+        # This replaces upstream's ``self._initial_noise(...)`` call. Upstream
+        # still computes the rows there, but every consumer below goes through
+        # ``noise_plan.draw_visual_condition_noise`` / ``noise_plan.initial_rows``,
+        # which would overwrite the result -- and drawing from a second generator
+        # on the way would desync seeded reproducibility.
         noise_plan = MiniMaxH3RequestNoisePlan(
             rng_mode=self.rng_mode,
             seed=seed,
             condition_shape_mode=self.condition_noise_shape_mode,
         )
+        # Upstream: res_multistep sampler plus the time-shifted sigma schedules.
+        sampler = normalize_h3_sampler(sampler)
+        if sampler != "euler" and base_schedule is not None:
+            raise ValueError(
+                "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
+                "use sampler='euler' for this schedule."
+            )
+        video_sigmas = minimax_h3_time_shift_sigmas(
+            num_steps=num_steps,
+            shift_scale=video_shift,
+            base_schedule=base_schedule,
+        )
+        audio_sigmas = minimax_h3_time_shift_sigmas(
+            num_steps=num_steps,
+            shift_scale=audio_shift,
+            base_schedule=base_schedule,
+        )
+        condition_noise = None
+        # Resolve the condition-image shapes once, before the noise path is chosen:
+        # the guided and precomputed paths skip the request-noise draw below but the
+        # visual-condition augmentation further down still needs these shapes.
         condition_shapes = None
         if visual_condition is not None:
             condition_shapes = visual_condition_shapes
@@ -2930,19 +3233,53 @@ class MiniMaxH3Pipeline(
                 condition_shapes = [visual_condition_shape]
             if not condition_shapes:
                 raise ValueError("visual condition shape is missing")
-        condition_noise = (
-            noise_plan.draw_visual_condition_noise(condition_shapes, target_latent_t=latent_t)
-            if condition_shapes
-            else None
-        )
-        initial_video, initial_audio = noise_plan.initial_rows(
-            latent_t=latent_t,
-            latent_h=latent_h,
-            latent_w=latent_w,
-            audio_t=audio_t,
-        )
-        if task == "ref2va":
-            if ref_blocks is None:
+        if precomputed_initial_noise is not None:
+            initial_video, initial_audio = precomputed_initial_noise
+        elif guide_blocks:
+            # Guided path: upstream's independent CPU generators.
+            initial_video, initial_audio = self._initial_noise(
+                seed=seed,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+            )
+        else:
+            # Non-guided requests always take OUR request-noise plan, so the seed
+            # contract stays bit-exact (manual §5.3). `condition_shapes` was resolved
+            # above.
+            condition_noise = (
+                noise_plan.draw_visual_condition_noise(condition_shapes, target_latent_t=latent_t)
+                if condition_shapes
+                else None
+            )
+            initial_video, initial_audio = noise_plan.initial_rows(
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+            )
+        if init_latents is not None:
+            if refine is None:
+                raise ValueError("init_latents needs a refine spec to place them on the schedule")
+            # Video and audio are shifted apart (12.0 against 3.0 by default),
+            # so the two schedules hold different sigmas at the same position.
+            # The loop steps them by index, so the pass has to resume at one
+            # index and re-noise each modality to its own sigma there.
+            start = refine.start_index(len(video_sigmas))
+            video_sigmas = video_sigmas[start:]
+            audio_sigmas = audio_sigmas[start:]
+            initial_video, initial_audio = self._renoise_rows(
+                init_latents,
+                noise_video=initial_video,
+                noise_audio=initial_audio,
+                sigma_video=video_sigmas[0],
+                sigma_audio=audio_sigmas[0],
+            )
+        if task == "ref2va" or guide_blocks:
+            # Timeline guides use the block layout for every task: guides pack
+            # first, then any references, and only the guides carry frame_index.
+            if ref_blocks is None and not guide_blocks:
                 if visual_condition_shape is None or ref_audio_t is None:
                     raise ValueError("ref2va condition metadata is missing")
                 _, ref_h, ref_w = visual_condition_shape
@@ -2956,7 +3293,8 @@ class MiniMaxH3Pipeline(
                 latent_h=latent_h,
                 latent_w=latent_w,
                 audio_t=audio_t,
-                ref_blocks=ref_blocks,
+                ref_blocks=ref_blocks or [],
+                guide_blocks=guide_blocks,
                 seq_len=pad_seq_len,
                 temporal_offset=temporal_offset,
                 media_time_origin=media_time_origin,
@@ -3005,6 +3343,8 @@ class MiniMaxH3Pipeline(
                 seed=seed,
                 noise_aug=MINIMAX_H3_IMGVID_COND_TIMESTEP,
                 noise=condition_noise,
+                precomputed_noise_rows=precomputed_visual_condition_noise,
+                guided=bool(guide_blocks),
             )
             full_video = torch.zeros(
                 branch.img_pos.shape[0],
@@ -3033,6 +3373,7 @@ class MiniMaxH3Pipeline(
                 condition_audio_t=condition_audio_t,
                 seed=seed,
                 noise_aug=MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+                guided=bool(guide_blocks),
             )
             full_audio = torch.zeros(
                 branch.audio_pos.shape[0],
@@ -3077,16 +3418,6 @@ class MiniMaxH3Pipeline(
                 audio_edit_restore_mask_rows,
             )
 
-        video_sigmas = minimax_h3_time_shift_sigmas(
-            num_steps=num_steps,
-            shift_scale=video_shift,
-            base_schedule=base_schedule,
-        )
-        audio_sigmas = minimax_h3_time_shift_sigmas(
-            num_steps=num_steps,
-            shift_scale=audio_shift,
-            base_schedule=base_schedule,
-        )
         return {
             "branch": branch,
             # The request-mode loop moves these onto the device itself; step mode
@@ -3099,6 +3430,7 @@ class MiniMaxH3Pipeline(
             "audio_anchor": (
                 None if audio_anchor is None else audio_anchor.to(device=self.device, dtype=torch.float32)
             ),
+            "sampler": sampler,
             "sigmas_video": video_sigmas,
             "sigmas_audio": audio_sigmas,
             "video_edit": video_edit,
@@ -3160,6 +3492,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
         locked_audio_rows: torch.Tensor | None = None,
         temporal_offset: float = 0.0,
@@ -3170,8 +3503,15 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        sampler: str = "euler",
+        init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
+        refine: MiniMaxH3LatentRefineSpec | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Consume request-owned noise here so caller keyword dictionaries cannot
+        # keep the host buffers alive throughout denoising.
         inputs = self._build_denoise_inputs(
+            sampler=sampler,
             task=task,
             text_embeddings=text_embeddings,
             text_tags=text_tags,
@@ -3193,6 +3533,7 @@ class MiniMaxH3Pipeline(
             visual_condition_shapes=visual_condition_shapes,
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
+            guide_blocks=guide_blocks,
             pad_seq_len=pad_seq_len,
             locked_audio_rows=locked_audio_rows,
             temporal_offset=temporal_offset,
@@ -3203,12 +3544,29 @@ class MiniMaxH3Pipeline(
             audio_edit_clean_rows=audio_edit_clean_rows,
             audio_edit_mask_rows=audio_edit_mask_rows,
             audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
+            init_latents=init_latents,
+            refine=refine,
+            precomputed_initial_noise=(
+                None if request_context is None else request_context.pop("precomputed_initial_noise", None)
+            ),
+            precomputed_visual_condition_noise=(
+                None if request_context is None else request_context.pop("precomputed_visual_condition_noise", None)
+            ),
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        # Each pass (including each output and hi-res refine) owns its cache.
+        # Refine can change both the packed shape and the schedule length.
+        registry = getattr(transformer, "_hook_registry", None)
+        if registry is not None:
+            registry.reset_hook(TeaCacheHook._HOOK_NAME)
+        cache_runtime = getattr(self, "_cache_dit_runtime", None)
+        if cache_runtime is not None:
+            cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
+                    sampler=inputs["sampler"],
                     model=transformer,
                     positive=branch,
                     initial_video_rows=inputs["video_rows"],
@@ -3334,6 +3692,188 @@ class MiniMaxH3Pipeline(
             audio = self.audio_vae.decode_latent(audio_latent)
         audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
+
+    def _resolve_latent_upscale(
+        self,
+        extra: Mapping[str, Any],
+        *,
+        latent_h: int,
+        latent_w: int,
+    ) -> MiniMaxH3LatentUpscaleTarget | None:
+        """Resolve the requested latent super-resolution target, if any.
+
+        A request opts in with ``extra_args['latent_upscale']``; a deployment
+        can set the same value under ``--additional-config`` to upscale every
+        request, which a request then overrides (``false`` opts back out).
+        Resolving here means an unserviceable size is rejected before the
+        denoise loop rather than after it.
+        """
+        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        raw = extra["latent_upscale"] if "latent_upscale" in extra else additional.get("latent_upscale")
+        try:
+            spec = parse_minimax_h3_latent_upscale_request(raw)
+            if spec is None:
+                return None
+            if self.latent_upscaler is None:
+                raise MiniMaxH3LatentUpscalerError(
+                    "latent_upscale needs a checkpoint: serve with "
+                    '--additional-config \'{"latent_upscaler_path": "<path>"}\''
+                )
+            target = resolve_minimax_h3_latent_upscale_target(
+                latent_height=latent_h,
+                latent_width=latent_w,
+                **spec,
+            )
+            if self._resolve_latent_refine(extra) is not None and (target.latent_height % 2 or target.latent_width % 2):
+                raise MiniMaxH3LatentUpscalerError(
+                    "latent_refine requires upscale latent height and width divisible by 2 "
+                    "(32 pixels); use align=32 or a compatible target size"
+                )
+        except MiniMaxH3LatentUpscalerError as exc:
+            raise OmniClientError(str(exc)) from exc
+        if (target.latent_height, target.latent_width) == (latent_h, latent_w):
+            return None
+        logger.info(
+            "MiniMax H3 latent upscale %dx%d -> %dx%d (scale %.3f)",
+            latent_w * 16,
+            latent_h * 16,
+            target.width,
+            target.height,
+            target.scale,
+        )
+        return target
+
+    def _resolve_latent_refine(self, extra: Mapping[str, Any]) -> MiniMaxH3LatentRefineSpec | None:
+        """Resolve the requested second denoise pass, if any.
+
+        Read like ``latent_upscale``: ``extra_args['latent_refine']`` wins over
+        an ``--additional-config`` default, and ``false`` opts back out.
+        """
+        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        raw = extra["latent_refine"] if "latent_refine" in extra else additional.get("latent_refine")
+        try:
+            return parse_minimax_h3_latent_refine_request(raw)
+        except MiniMaxH3LatentUpscalerError as exc:
+            raise OmniClientError(str(exc)) from exc
+
+    def _validate_refine_token_budget(
+        self,
+        *,
+        task: str,
+        target: MiniMaxH3LatentUpscaleTarget | None,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+        text_len: int,
+        keyframe_count: int,
+        ref_blocks: list[dict[str, Any]] | None,
+    ) -> None:
+        """Reject refine layouts known to exceed the tested per-rank limit.
+
+        Count the same rows as the packed layout without materializing its
+        large position tensors before the first denoise pass.
+        """
+        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        limit = additional.get("latent_refine_max_tokens_per_rank", 65_536)
+        if type(limit) is not int or limit < 0:
+            raise OmniClientError("latent_refine_max_tokens_per_rank must be a non-negative integer")
+        if limit == 0:
+            return
+        height = target.latent_height if target is not None else latent_h
+        width = target.latent_width if target is not None else latent_w
+        frame_rows = (height // 2) * (width // 2)
+        used = text_len + 2 * audio_t + latent_t * frame_rows
+        if task == "fl2va":
+            used += keyframe_count * frame_rows
+        elif task == "ref2va":
+            for block in ref_blocks or ():
+                kind = block["kind"]
+                if kind == "image":
+                    used += (block["latent_h"] // 2) * (block["latent_w"] // 2)
+                elif kind == "audio":
+                    used += 2 * block["ref_audio_t"]
+                else:
+                    used += 2 * block["ref_audio_t"]
+                    used += block["latent_t"] * (block["latent_h"] // 2) * (block["latent_w"] // 2)
+        padded = ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
+        parallel = getattr(self, "parallel_config", None)
+        degree = int(getattr(parallel, "ulysses_degree", 1))
+        per_rank = (padded + degree - 1) // degree
+        if per_rank > limit:
+            raise OmniClientError(
+                f"MiniMax H3 latent_refine needs about {per_rank:,} packed tokens per Ulysses rank "
+                f"(limit {limit:,}); reduce the target size or duration, increase --usp, "
+                "or adjust latent_refine_max_tokens_per_rank for a validated deployment"
+            )
+
+    def _refine_keyframe_condition(
+        self,
+        context: dict[str, Any],
+    ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
+        """Encode the FL2VA keyframes at the refine size, once per request.
+
+        The encode broadcasts across the DiT group, so every rank has to reach
+        it the same number of times; caching on the request context keeps that
+        true while sparing the repeat for each additional output.
+        """
+        cached = context.get(_REFINE_KEYFRAME_CONDITION)
+        if cached is None:
+            target = context["latent_upscale"]
+            cached = self._encode_visual_conditions(
+                [
+                    image.resize((target.width, target.height), Image.Resampling.LANCZOS)
+                    for image in context["keyframe_images"]
+                ],
+                None,
+                video_count=0,
+            )
+            context[_REFINE_KEYFRAME_CONDITION] = cached
+        return cached
+
+    def _refined_latents(
+        self,
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        *,
+        context: dict[str, Any],
+        seed: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Re-denoise finished latents at their current size.
+
+        This is the second half of the hi-res route: the first pass generates
+        at a cheap size, the upscaler moves the latent, and this pass resumes
+        the schedule at the target size to put back the detail the upscaler can
+        only approximate. Without an upscale it is an ordinary detail pass.
+        """
+        refine = context["latent_refine"]
+        target = context["latent_upscale"]
+        kwargs = dict(self._denoise_kwargs(context))
+        kwargs["seed"] = seed
+        if target is not None:
+            kwargs["latent_h"] = target.latent_height
+            kwargs["latent_w"] = target.latent_width
+            # A pinned pad_seq_len sizes the first pass's layout. This pass packs
+            # several times as many video rows, so carrying the pin over would
+            # fail the seq_len >= used check with an error that names neither
+            # the refine pass nor the size that outgrew it.
+            kwargs["pad_seq_len"] = None
+            if context["task"] == "fl2va":
+                condition, shapes = self._refine_keyframe_condition(context)
+                kwargs["visual_condition"] = condition
+                kwargs["visual_condition_shapes"] = shapes
+                kwargs["visual_condition_shape"] = shapes[0] if len(shapes) == 1 else None
+        return self.diffuse(**kwargs, init_latents=(video_latent, audio_latent), refine=refine)
+
+    def _upscaled_latent(
+        self,
+        video_latent: torch.Tensor,
+        target: MiniMaxH3LatentUpscaleTarget | None,
+    ) -> torch.Tensor:
+        if target is None:
+            return video_latent
+        with self._component_on_device(self.latent_upscaler):
+            return self.latent_upscaler.upscale(video_latent, target)
 
     @staticmethod
     def _extract_prompt(raw_prompt: Any) -> tuple[str, dict[str, Any]]:
@@ -3474,6 +4014,8 @@ class MiniMaxH3Pipeline(
             "video_edit_mask",
             "audio_edit_clean_rows",
             "audio_edit_mask",
+            "guide_visual_condition",
+            "guide_audio_condition",
         )
         header = [None]
         if rank == 0:
@@ -3532,12 +4074,23 @@ class MiniMaxH3Pipeline(
             raise error
         return self._broadcast_media_conditioning(conditioning)
 
+    def _predict_visual_condition_shapes(
+        self,
+        media: MiniMaxH3EncoderMediaInput,
+    ) -> tuple[tuple[int, int, int], ...]:
+        shapes = [(1, int(image.shape[0]) // 16, int(image.shape[1]) // 16) for image in media.images]
+        for video in media.videos:
+            frames = np.asarray(video.detach().cpu().to(torch.uint8).contiguous().numpy())
+            shapes.append(self.video_vae.predict_video_latent_shape(frames))
+        return tuple(shapes)
+
     def _prepare_local_conditioning(
         self,
         raw_prompt: Any,
         sampling: Any,
         *,
         require_external_text: bool = False,
+        request_context: dict[str, Any] | None = None,
     ) -> tuple[MiniMaxH3EncoderConditioning, list[tuple[torch.Tensor, torch.Tensor]] | None]:
         """Prepare media once and encode either shared text or each window's text.
 
@@ -3547,10 +4100,14 @@ class MiniMaxH3Pipeline(
         group, rank, world_size = _dit_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
         prepared = text_conditioning = None
+        initial_noise_params = None
+        visual_noise_params = None
         error = None
         if rank == 0:
             try:
                 _, multi_modal_data = self._extract_prompt(raw_prompt)
+                if multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None and not self.load_vae_encoder:
+                    raise OmniClientError("MiniMax H3 timeline guides require a VAE encoder in the diffusion stage")
                 turbo_spec = self._active_turbo_spec(sampling)
                 has_native_lora = self._has_active_native_lora(sampling)
                 task = self._resolve_task(
@@ -3576,6 +4133,8 @@ class MiniMaxH3Pipeline(
                         video_shift=self.default_video_shift,
                         audio_shift=self.default_audio_shift,
                     )
+                if self._vdn_upstream is not None:
+                    self._vdn_upstream.check_request(sampling, task)
                 text_conditioning = self._extract_text_conditioning(raw_prompt)
                 if require_external_text and text_conditioning is None:
                     raise OmniClientError(
@@ -3598,12 +4157,14 @@ class MiniMaxH3Pipeline(
                         output_height=canvas_h,
                     ),
                 )
-                if prompts is not None:
+                continuation = None
+                if prompts is not None or (request_context is not None and task == "ref2va"):
                     continuation = resolve_continuation(
                         sampling.extra_args or {},
                         task=task,
                         step_execution=bool(getattr(self.od_config, "step_execution", False)),
                     )
+                if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
                         raise OmniClientError(
                             "continuation_prompts requires continuation mode with a local text encoder"
@@ -3619,32 +4180,70 @@ class MiniMaxH3Pipeline(
                     prepared = replace(prepared, prompt=prompts[0])
                     # External text belongs to the main prompt, not the first window.
                     text_conditioning = None
+                # Upstream #8577 ("overlap Ref2VA CPU noise preparation", 681ae741d)
+                # precomputes the request's initial and visual-condition noise here on
+                # a worker thread and hands the rows to `diffuse` through the request
+                # context. It is DELIBERATELY OFF on this branch, and the reason is not
+                # performance:
+                #
+                # `diffuse` tests `if precomputed_initial_noise is not None:` first,
+                # which short-circuits its `MiniMaxH3RequestNoisePlan` branch -- and that
+                # plan is what keeps the seed contract bit-exact (manual §5.3). The rows
+                # this block produced came from upstream's `self._initial_noise`, a
+                # different generator, so handing them over silently changes the noise of
+                # every non-guided Ref2VA request.
+                #
+                # Note that upstream itself did not have this problem, and not because it
+                # solved it: upstream has no equivalent of the
+                # `context = self._prepare_encoder_conditioning_inputs(...)` rebound in
+                # `_prepare_request_inputs`, so its precompute reaches `diffuse`. The
+                # rebind is ours, and the two together made the write a no-op. The
+                # ineffectiveness is therefore accidental, and it is load-bearing
+                # accident -- repairing the rebind alone would introduce the §5.3
+                # regression described above.
+                #
+                # Re-enable only by routing the precompute through `noise_plan`, so the
+                # early draw and the fallback draw come from the same generator -- i.e.
+                # by moving the draw earlier, not by moving precomputed rows across.
+                # See the deviation entry in the sync manual (§3.2).
+                #
+                # The `precomputed_*` parameters and the branches that consume them are
+                # kept exactly as upstream has them, so a future sync sees one disabled
+                # producer rather than a rewritten consumer.
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
-        reuse_text = [text_conditioning is not None]
+        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
         if world_size > 1:
-            dist.broadcast_object_list(reuse_text, src=0, group=group)
-        if reuse_text[0]:
-            hidden = _broadcast_tensor(
-                text_conditioning.hidden_states if rank == 0 else None,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            tags = _broadcast_tensor(
-                text_conditioning.token_tags if rank == 0 else None, dtype=torch.long, device=self.device
-            )
-        else:
-            hidden, tags = self.encode_prompt(prepared)
-        window_text = None
-        if prompts is not None:
-            window_text = [(hidden, tags)]
-            for index, prompt in enumerate(prompts[1:], start=2):
-                logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
-                window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
-        report_phase(PHASE_ENCODE)
-        media = self._encode_local_media(prepared.media if prepared is not None else None)
-        return MiniMaxH3EncoderConditioning.from_components(MiniMaxH3TextConditioning(hidden, tags), media), window_text
+            dist.broadcast_object_list(header, src=0, group=group)
+        reuse_text, initial_noise_params, visual_noise_params = header[0]
+        # `initial_noise_params` and `visual_noise_params` are always None here (see
+        # above), so there is no worker to start and nothing to join on exit.
+        try:
+            if reuse_text:
+                hidden = _broadcast_tensor(
+                    text_conditioning.hidden_states if rank == 0 else None,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                tags = _broadcast_tensor(
+                    text_conditioning.token_tags if rank == 0 else None, dtype=torch.long, device=self.device
+                )
+            else:
+                hidden, tags = self.encode_prompt(prepared)
+            window_text = None
+            if prompts is not None:
+                window_text = [(hidden, tags)]
+                for index, prompt in enumerate(prompts[1:], start=2):
+                    logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
+                    window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
+            report_phase(PHASE_ENCODE)
+            media = self._encode_local_media(prepared.media if prepared is not None else None)
+            return MiniMaxH3EncoderConditioning.from_components(
+                MiniMaxH3TextConditioning(hidden, tags), media
+            ), window_text
+        finally:
+            pass
 
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
         if (getattr(sampling, "extra_args", None) or {}).get(
@@ -3657,16 +4256,35 @@ class MiniMaxH3Pipeline(
         # idle right up until sampling starts.
         report_phase(PHASE_PREPARE)
         window_text = None
+        context: dict[str, Any] = {}
         if self.load_text_encoder or self.load_vae_encoder:
             conditioning, window_text = self._prepare_local_conditioning(
                 raw_prompt,
                 sampling,
                 require_external_text=not self.load_text_encoder,
+                request_context=context,
             )
         else:
             conditioning = self._extract_encoder_conditioning(raw_prompt)
         context = self._prepare_encoder_conditioning_inputs(conditioning, sampling)
+        # Task-disjoint with the fl2va branch below: _apply_reference_order()
+        # returns immediately for anything that is not ref2va.
         context = self._apply_reference_order(raw_prompt, conditioning, context)
+        # Upstream hi-res path: the fl2va latent_refine pass re-encodes the
+        # original keyframes, so the raw images have to travel in the context.
+        if (
+            context.get("latent_refine") is not None
+            and context.get("latent_upscale") is not None
+            and context["task"] == "fl2va"
+        ):
+            if not self.load_vae_encoder:
+                raise OmniClientError("MiniMax H3 FL2VA latent_refine with upscale requires a local VAE encoder")
+            _, media = self._extract_prompt(raw_prompt)
+            images = media.get("image")
+            images = list(images) if isinstance(images, (list, tuple)) else [images] if images is not None else []
+            context["keyframe_images"] = load_minimax_h3_images(images)
+            if len(context["keyframe_images"]) != len(context["keyframe_frame_indices"] or ()):
+                raise OmniClientError("MiniMax H3 latent_refine requires the original FL2VA keyframe images")
         if window_text is not None:
             context["continuation_text_conditioning"] = window_text
         return context
@@ -3805,6 +4423,8 @@ class MiniMaxH3Pipeline(
                 video_shift=self.default_video_shift,
                 audio_shift=self.default_audio_shift,
             )
+        if self._vdn_upstream is not None:
+            self._vdn_upstream.check_request(sampling, task)
 
         if conditioning.height % 32 or conditioning.width % 32:
             raise OmniClientError(
@@ -3884,6 +4504,12 @@ class MiniMaxH3Pipeline(
 
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
+        sampler = normalize_h3_sampler(extra.get("sampler"))
+        if sampler != "euler" and base_schedule is not None:
+            raise ValueError(
+                "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
+                "use sampler='euler' for this schedule."
+            )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
@@ -3911,9 +4537,54 @@ class MiniMaxH3Pipeline(
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
+        upscale_target = self._resolve_latent_upscale(
+            extra, latent_h=conditioning.height // 16, latent_w=conditioning.width // 16
+        )
+        latent_refine = self._resolve_latent_refine(extra)
+        if latent_refine is not None:
+            if continuation is not None:
+                raise OmniClientError("MiniMax H3 latent_refine does not support latent-tail continuation")
+            if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
+                raise OmniClientError("MiniMax H3 latent_refine does not support latent-mask editing")
+            self._validate_refine_token_budget(
+                task=task,
+                target=upscale_target,
+                latent_t=conditioning.latent_t,
+                latent_h=conditioning.height // 16,
+                latent_w=conditioning.width // 16,
+                audio_t=conditioning.audio_t,
+                text_len=int(conditioning.hidden_states.shape[0]),
+                keyframe_count=len(conditioning.keyframe_frame_indices),
+                ref_blocks=list(conditioning.ref_blocks) or None,
+            )
+        visual_condition = conditioning.visual_condition
+        ref_blocks = list(conditioning.ref_blocks) or None
+        keyframe_frame_indices = list(conditioning.keyframe_frame_indices) or None
+        guide_blocks = None
+        if conditioning.guide_blocks:
+            # Continuation, latent-mask editing and audio_mode=lock_source are
+            # rejected by prepare_encoder_inputs before any guide is decoded;
+            # guides are only produced there, from this request's extra_args.
+            if latent_refine is not None or upscale_target is not None:
+                raise OmniClientError("MiniMax H3 timeline guides do not support latent refine/upscale")
+            self._validate_timeline_guide_sampling(
+                sampling,
+                task,
+                cache_dit=quality_plan.cache_dit,
+                turbo=turbo_spec is not None,
+                native_lora=has_native_lora,
+            )
+            guide_blocks, visual_condition, visual_shapes, audio_condition, audio_lengths, ref_blocks = (
+                self._merge_timeline_guides(
+                    conditioning, visual_condition, visual_shapes, audio_condition, audio_lengths
+                )
+            )
         return {
             "continuation": continuation,
             "task": task,
+            "latent_upscale": upscale_target,
+            "latent_refine": latent_refine,
+            "keyframe_images": [],
             "height": conditioning.height,
             "width": conditioning.width,
             "num_frames": conditioning.num_frames,
@@ -3923,21 +4594,19 @@ class MiniMaxH3Pipeline(
             "audio_t": conditioning.audio_t,
             "text_embeddings": conditioning.hidden_states.to(device=self.device, dtype=torch.bfloat16),
             "text_tags": conditioning.token_tags.to(device=self.device, dtype=torch.long),
-            "visual_condition": (
-                conditioning.visual_condition.to(device=self.device)
-                if conditioning.visual_condition is not None
-                else None
-            ),
+            "visual_condition": (visual_condition.to(device=self.device) if visual_condition is not None else None),
             "visual_condition_shape": visual_shapes[0] if visual_shapes and len(visual_shapes) == 1 else None,
             "audio_condition": (audio_condition.to(device=self.device) if audio_condition is not None else None),
             "ref_audio_t": audio_lengths[0] if audio_lengths and len(audio_lengths) == 1 else None,
-            "ref_blocks": list(conditioning.ref_blocks) or None,
+            "ref_blocks": ref_blocks,
             "visual_condition_shapes": visual_shapes,
             "audio_condition_lengths": audio_lengths,
             "locked_audio_rows": locked_audio_rows,
-            "keyframe_frame_indices": list(conditioning.keyframe_frame_indices) or None,
+            "keyframe_frame_indices": keyframe_frame_indices,
+            "guide_blocks": guide_blocks,
             "pad_seq_len": _resolve_pad_seq_len(extra.get("pad_seq_len")),
             "seed": int(sampling.seed if sampling.seed is not None else 42),
+            "sampler": sampler,
             "num_steps": num_steps,
             "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
             "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
@@ -3957,10 +4626,96 @@ class MiniMaxH3Pipeline(
             **latent_edit,
         }
 
+    def _validate_timeline_guide_sampling(
+        self,
+        sampling: Any,
+        task: str,
+        *,
+        cache_dit: Any,
+        turbo: bool,
+        native_lora: bool,
+    ) -> None:
+        """Guides are validated against base weights and the full schedule only."""
+        if cache_dit is not None:
+            raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
+        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        if cache_backend not in ("none", "cache_dit"):
+            raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
+        if self._fasth3 is not None or self._fasth3_checkpoint is not None:
+            raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3")
+        active_lora = sampling.lora_request is not None and not math.isclose(float(sampling.lora_scale), 0.0)
+        if turbo or native_lora or active_lora:
+            raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
+        if self._sigma_schedule_for_request(sampling, task) is not None:
+            raise OmniClientError("MiniMax H3 timeline guides do not support distilled schedules")
+
+    def _merge_timeline_guides(
+        self,
+        conditioning: MiniMaxH3EncoderConditioning,
+        visual_condition: torch.Tensor | None,
+        visual_shapes: list[tuple[int, int, int]] | None,
+        audio_condition: torch.Tensor | None,
+        audio_lengths: list[int] | None,
+    ) -> tuple[
+        list[dict[str, Any]],
+        torch.Tensor | None,
+        list[tuple[int, int, int]] | None,
+        torch.Tensor | None,
+        list[int] | None,
+        list[dict[str, Any]] | None,
+    ]:
+        """Put guide rows ahead of reference rows for each modality.
+
+        FL2VA keyframes become trailing still-image guides, so a guided request
+        packs every clean visual condition through one block layout.
+        """
+        guide_blocks = [dict(block) for block in conditioning.guide_blocks]
+        guide_shapes = [
+            (int(block["latent_t"]), int(block["latent_h"]), int(block["latent_w"]))
+            for block in guide_blocks
+            if block["kind"] != "audio"
+        ]
+        guide_lengths = [
+            int(block["ref_audio_t"]) for block in guide_blocks if block["kind"] in ("audio", "video_audio")
+        ]
+        ref_blocks = list(conditioning.ref_blocks)
+        if conditioning.task == "fl2va":
+            for index, shape in zip(conditioning.keyframe_frame_indices, visual_shapes or (), strict=True):
+                guide_blocks.append(
+                    {
+                        "kind": "image",
+                        "frame_index": resolve_guide_start(int(index), conditioning.num_frames),
+                        "latent_h": shape[1],
+                        "latent_w": shape[2],
+                    }
+                )
+            ref_blocks = []
+        visual_parts = [
+            part.to(device=self.device)
+            for part in (conditioning.guide_visual_condition, visual_condition)
+            if part is not None
+        ]
+        audio_parts = [
+            part.to(device=self.device)
+            for part in (conditioning.guide_audio_condition, audio_condition)
+            if part is not None
+        ]
+        return (
+            guide_blocks,
+            torch.cat(visual_parts) if visual_parts else None,
+            (guide_shapes + list(visual_shapes or ())) or None,
+            torch.cat(audio_parts) if audio_parts else None,
+            (guide_lengths + list(audio_lengths or ())) or None,
+            ref_blocks or None,
+        )
+
     @staticmethod
     def _denoise_kwargs(context: dict[str, Any]) -> dict[str, Any]:
         """Select the denoise-input arguments from a prepared request context."""
-        return {key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS}
+        return {
+            **{key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS},
+            "sampler": context.get("sampler", "euler"),
+        }
 
     @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
@@ -3974,6 +4729,9 @@ class MiniMaxH3Pipeline(
         check_request_cancellation()
         denoise_kwargs = self._denoise_kwargs(context)
         num_outputs = context["num_outputs"]
+        upscale_target = context.get("latent_upscale")
+        latent_refine = context.get("latent_refine")
+        height, width = _minimax_h3_output_canvas(context, upscale_target)
         videos = []
         audios = []
         # Entering sampling; minimax_h3_denoise_loop reports the per-step detail.
@@ -3982,7 +4740,10 @@ class MiniMaxH3Pipeline(
             check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
             if context.get("continuation") is None:
-                video_latent, audio_latent = self.diffuse(**output_kwargs)
+                video_latent, audio_latent = self.diffuse(
+                    **output_kwargs,
+                    request_context=context,
+                )
             else:
                 window_frames, overlap_frames = context["continuation"]
                 video_latent, audio_latent = diffuse_continuation(
@@ -3994,13 +4755,26 @@ class MiniMaxH3Pipeline(
                 )
             report_phase(PHASE_DECODE)
             check_request_cancellation()
+            if upscale_target is not None:
+                video_latent = self._upscaled_latent(video_latent, upscale_target)
+            if latent_refine is not None:
+                video_latent, audio_latent = self._refined_latents(
+                    video_latent,
+                    audio_latent,
+                    context=context,
+                    seed=output_seed,
+                )
+            if not self.load_vae_decoder:
+                videos.append(video_latent)
+                audios.append(audio_latent)
+                continue
             if context["preencode_mp4"]:
                 videos.append(
                     self.decode_to_mp4(
                         video_latent,
                         audio_latent,
-                        height=context["height"],
-                        width=context["width"],
+                        height=height,
+                        width=width,
                         video_codec_options=context["video_codec_options"],
                         batch_frames=context["preencode_batch_frames"],
                     )
@@ -4010,8 +4784,8 @@ class MiniMaxH3Pipeline(
                 video, audio = self.decode(
                     video_latent,
                     audio_latent,
-                    height=context["height"],
-                    width=context["width"],
+                    height=height,
+                    width=width,
                 )
                 # Rebind rather than append the expression: the local would
                 # otherwise keep the decoded frames' device storage alive for the
@@ -4026,6 +4800,8 @@ class MiniMaxH3Pipeline(
                 del video
                 self._release_stage_cache()
                 audios.append(audio)
+        if not self.load_vae_decoder:
+            return self._decoder_stage_output(videos, audios, {**context, "height": height, "width": width})
         if videos and isinstance(videos[0], bytes):
             video = videos[0] if len(videos) == 1 else videos
             audio = None
@@ -4034,7 +4810,31 @@ class MiniMaxH3Pipeline(
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
+            video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
+            stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+        )
+
+    def _decoder_stage_output(
+        self,
+        video_latents: list[torch.Tensor],
+        audio_latents: list[torch.Tensor],
+        shape: dict[str, Any],
+    ) -> DiffusionOutput:
+        # Move latents to CPU at the process boundary; the decoder owns its parallel group.
+        decode_options = {
+            "height": shape["height"],
+            "width": shape["width"],
+            "preencode_mp4": shape.get("preencode_mp4", False),
+            "video_codec_options": shape.get("video_codec_options"),
+            "preencode_batch_frames": shape.get("preencode_batch_frames", 17),
+        }
+        return DiffusionOutput(
+            output={
+                "payload": {"trajectory": {"latents": {"video": video_latents, "audio": audio_latents}}},
+                "metadata": {"minimax_h3_decode": decode_options},
+            },
+            to_cpu=True,
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
 
@@ -4098,11 +4898,26 @@ class MiniMaxH3Pipeline(
                 "co-batched requests would reuse incompatible cache state. Drop --step-execution "
                 "or omit quality=high."
             )
+        # A refine pass is a second denoise loop, at its own resolution and over
+        # its own truncated schedule. The step contract gives the scheduler one
+        # latent and one schedule per request, so there is nowhere to put it.
+        # Latent upscaling alone has no such problem and stays supported: it
+        # runs once in ``post_decode``.
+        if self._resolve_latent_refine(getattr(state.sampling, "extra_args", None) or {}) is not None:
+            raise OmniClientError(
+                "MiniMax H3 step execution does not support latent_refine; it is a second denoise "
+                "loop and the step contract carries one schedule per request. Drop --step-execution, "
+                "or keep latent_upscale without latent_refine."
+            )
         context = self._prepare_request_inputs(
             state.prompt,
             state.sampling,
         )
-        inputs = self._build_denoise_inputs(**self._denoise_kwargs(context))
+        inputs = self._build_denoise_inputs(
+            **self._denoise_kwargs(context),
+            precomputed_initial_noise=context.pop("precomputed_initial_noise", None),
+            precomputed_visual_condition_noise=context.pop("precomputed_visual_condition_noise", None),
+        )
 
         sigmas_video = inputs["sigmas_video"]
         sigmas_audio = inputs["sigmas_audio"]
@@ -4143,6 +4958,8 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ROWS: audio_rows,
                 _STEP_COND_ANCHOR: cond_anchor,
                 _STEP_AUDIO_ANCHOR: audio_anchor,
+                _STEP_VIDEO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_video),
+                _STEP_AUDIO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_audio),
                 _STEP_SIGMAS_VIDEO: sigmas_video,
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
@@ -4157,6 +4974,7 @@ class MiniMaxH3Pipeline(
                     "preencode_mp4": context.get("preencode_mp4", False),
                     "preencode_batch_frames": context.get("preencode_batch_frames", 17),
                     "video_codec_options": context.get("video_codec_options"),
+                    "latent_upscale": context.get("latent_upscale"),
                 },
             }
         )
@@ -4295,7 +5113,7 @@ class MiniMaxH3Pipeline(
         return video_velocity
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
-        """Apply one Euler-eta0 update to this request's video and audio rows."""
+        """Apply one request-local solver update to the video and audio rows."""
         del kwargs
         # denoise_step() stages the audio half of this step's velocity; popping
         # it keeps a second step_scheduler() call from reusing a stale one.
@@ -4324,12 +5142,7 @@ class MiniMaxH3Pipeline(
                 noise_pred.float()[update],
                 schedule["t_video"],
             )
-        new_video = minimax_h3_euler_eta0_step(
-            video_rows[update],
-            x0_video,
-            sigma_curr=schedule["sigma_video"],
-            sigma_next=schedule["sigma_video_next"],
-        )
+        new_video = state.extra[_STEP_VIDEO_SOLVER].step(video_rows[update], x0_video, state.step_index)
         video_rows = video_rows.clone()
         video_rows[update] = new_video
         if cond_anchor is not None:
@@ -4348,12 +5161,7 @@ class MiniMaxH3Pipeline(
                 audio_noise_pred.float()[audio_update],
                 schedule["t_audio"],
             )
-        new_audio = minimax_h3_euler_eta0_step(
-            audio_rows[audio_update],
-            x0_audio,
-            sigma_curr=schedule["sigma_audio"],
-            sigma_next=schedule["sigma_audio_next"],
-        )
+        new_audio = state.extra[_STEP_AUDIO_SOLVER].step(audio_rows[audio_update], x0_audio, state.step_index)
         audio_rows = audio_rows.clone()
         audio_rows[audio_update] = new_audio if branch.locked_audio_rows is None else branch.locked_audio_rows
         if audio_anchor is not None:
@@ -4376,12 +5184,20 @@ class MiniMaxH3Pipeline(
             latent_w=shape["latent_w"],
             audio_t=shape["audio_t"],
         )
+        upscale_target = shape.get("latent_upscale")
+        if upscale_target is not None:
+            video_latent = self._upscaled_latent(video_latent, upscale_target)
+        height, width = _minimax_h3_output_canvas(shape, upscale_target)
+        if not self.load_vae_decoder:
+            return self._decoder_stage_output(
+                [video_latent], [audio_latent], {**shape, "height": height, "width": width}
+            )
         if shape.get("preencode_mp4", False):
             video = self.decode_to_mp4(
                 video_latent,
                 audio_latent,
-                height=shape["height"],
-                width=shape["width"],
+                height=height,
+                width=width,
                 video_codec_options=shape.get("video_codec_options"),
                 batch_frames=shape.get("preencode_batch_frames", 17),
             )
@@ -4390,13 +5206,14 @@ class MiniMaxH3Pipeline(
             video, audio = self.decode(
                 video_latent,
                 audio_latent,
-                height=shape["height"],
-                width=shape["width"],
+                height=height,
+                width=width,
             )
             video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
             self._release_stage_cache()
         return DiffusionOutput(
             output=(video, audio),
+            video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )

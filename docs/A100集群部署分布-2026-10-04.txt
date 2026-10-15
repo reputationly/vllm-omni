@@ -1,0 +1,121 @@
+vLLM-Omni A100 集群部署分布（55 台 x 4 卡 = 220 卡位）
+采集时间 2026-10-04 18:25   括号内 = 该卡实测显存占用   `.` = 空闲
+显存随已服务请求数增长（空闲新实例基线 ~0.5G/卡），横向比较请看实例名而非显存
+
+设备     卡0                             卡1                             卡2                             卡3
+-----------------------------------------------------------------------------------------------------------------------------------
+gpu1   qwen-image-pro (30G)           qwen-image-pro (30G)           qwen-image-pro (30G)           qwen-image-pro (30G)
+gpu2   qwen-image-pro (30G)           qwen-image-pro (30G)           qwen-image-pro (30G)           qwen-image-pro (30G)
+gpu3   qwen-image-pro (31G)           qwen-image-pro (31G)           qwen-image-pro (31G)           qwen-image-pro (31G)
+gpu4   .                              .                              z-image (20G)                  kr2 (22G)
+gpu5   .                              .                              z-image (20G)                  kr2 (22G)
+gpu6   .                              .                              z-image (20G)                  kr2 (22G)
+gpu7   .                              .                              z-image (20G)                  .
+gpu8   .                              .                              .                              .
+gpu9   .                              .                              .                              .
+gpu10  .                              .                              .                              .
+gpu11  .                              .                              minimax-music3 (33G)           indextts-2.5 (17G)
+gpu12  .                              .                              minimax-music3 (33G)           indextts-2.5 (17G)
+gpu13  .                              .                              minimax-music3 (37G)           indextts-2.5 (17G)
+gpu14  .                              .                              .                              .
+gpu15  ace-step (23G)                 ace-step (23G)                 breeze-tts-2 (28G)             breeze-tts-2 (28G)
+gpu16  ace-step (23G)                 ace-step (23G)                 breeze-tts-2 (28G)             breeze-tts-2 (28G)
+gpu17  seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)
+gpu18  seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)
+gpu19  seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)
+gpu20  seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)                   seedvr2 (1G)
+gpu21  .                              .                              .                              .
+gpu22  .                              .                              .                              .
+gpu23  minimax-h3-fl2va (7G)          minimax-h3-fl2va (7G)          minimax-h3-fl2va (7G)          minimax-h3-fl2va (7G)
+gpu24  minimax-h3-fl2va (6G)          minimax-h3-fl2va (6G)          minimax-h3-fl2va (6G)          minimax-h3-fl2va (6G)
+gpu25  minimax-h3-fl2va (6G)          minimax-h3-fl2va (6G)          minimax-h3-fl2va (6G)          minimax-h3-fl2va (6G)
+gpu26  .                              .                              .                              .
+gpu27  .                              .                              .                              .
+gpu28  .                              .                              .                              .
+gpu29  .                              .                              .                              .
+gpu30  .                              .                              .                              .
+gpu31  .                              .                              .                              .
+gpu32  .                              .                              .                              .
+gpu33  minimax-h3-ref2va (6G)         minimax-h3-ref2va (6G)         minimax-h3-ref2va (6G)         minimax-h3-ref2va (6G)
+gpu34  minimax-h3-ref2va (7G)         minimax-h3-ref2va (7G)         minimax-h3-ref2va (7G)         minimax-h3-ref2va (7G)
+gpu35  minimax-h3-ref2va (543M)       minimax-h3-ref2va (543M)       minimax-h3-ref2va (543M)       minimax-h3-ref2va (543M)
+gpu36  .                              .                              .                              .
+gpu37  .                              .                              .                              .
+gpu38  .                              .                              .                              .
+gpu39  .                              .                              .                              .
+gpu40  .                              .                              .                              .
+gpu41  .                              .                              .                              .
+gpu42  .                              .                              .                              .
+gpu43  .                              .                              .                              .
+gpu44  .                              .                              .                              .
+gpu45  .                              .                              .                              .
+gpu46  .                              .                              .                              .
+gpu47  .                              .                              .                              .
+gpu48  .                              .                              .                              .
+gpu49  .                              .                              .                              .
+gpu50  .                              .                              .                              .
+gpu51  Zhongsen-Text-8b (36G)         qwen3guard (37G)               shieldgemma2 (38G)             shieldgemma2 (38G)
+gpu52  Zhongsen-Text-8b (36G)         qwen3guard (37G)               shieldgemma2 (38G)             shieldgemma2 (38G)
+gpu53  Zhongsen-Text-8b (36G)         Zhongsen-Text-8b (36G)         shieldgemma2 (38G)             shieldgemma2 (38G)
+gpu54  Zhongsen-Text-8b (36G)         Zhongsen-Text-8b (36G)         shieldgemma2 (38G)             shieldgemma2 (38G)
+gpu55  .                              .                              .                              .
+
+==============================================================================================================
+实例清单（共 50 个，GPUStack 状态全部 RUNNING）
+==============================================================================================================
+设备     实例名                         端口      创建日期        占用卡    运行时
+gpu1   qwen-image-pro-xn426        40010   2026-09-28  [0, 1, 2, 3]vLLM-Omni
+gpu2   qwen-image-pro-i1dzm        40057   2026-09-28  [0, 1, 2, 3]vLLM-Omni
+gpu3   qwen-image-pro-6k4h3        40011   2026-09-28  [0, 1, 2, 3]vLLM-Omni
+gpu4   kr2-81wgi                   40060   2026-09-28  [3]    vLLM-Omni
+gpu4   z-image-zimv3               40007   2026-09-08  [2]    vLLM-Omni
+gpu5   kr2-xkc4b                   40058   2026-09-28  [3]    vLLM-Omni
+gpu5   z-image-k0d2h               40062   2026-09-08  [2]    vLLM-Omni
+gpu6   kr2-anl50                   40059   2026-09-28  [3]    vLLM-Omni
+gpu6   z-image-8rpqh               40056   2026-09-08  [2]    vLLM-Omni
+gpu7   z-image-wmo28               40014   2026-09-08  [2]    vLLM-Omni
+gpu11  indextts-2.5-v09rj          40037   2026-09-28  [3]    vLLM-Omni
+gpu11  minimax-music3-zbmkm        40053   2026-09-28  [2]    vLLM-Omni
+gpu12  indextts-2.5-8p4yu          40015   2026-09-28  [3]    vLLM-Omni
+gpu12  minimax-music3-xrr9f        40048   2026-09-28  [2]    vLLM-Omni
+gpu13  indextts-2.5-dg34s          40002   2026-09-28  [3]    vLLM-Omni
+gpu13  minimax-music3-gegto        40058   2026-09-28  [2]    vLLM-Omni
+gpu15  ace-step-5kbfi              40048   2026-09-30  [1]    vLLM-Omni
+gpu15  ace-step-aeldg              40033   2026-09-30  [0]    vLLM-Omni
+gpu15  breeze-tts-2-i0ihe          40058   2026-09-28  [2]    vLLM-Omni
+gpu15  breeze-tts-2-q0r37          40018   2026-09-28  [3]    vLLM-Omni
+gpu16  ace-step-0299t              40029   2026-09-30  [0]    vLLM-Omni
+gpu16  ace-step-0v2wx              40013   2026-09-30  [1]    vLLM-Omni
+gpu16  breeze-tts-2-i5pkp          40011   2026-09-28  [3]    vLLM-Omni
+gpu16  breeze-tts-2-zpkff          40054   2026-09-28  [2]    vLLM-Omni
+gpu17  seedvr2-lvyts               40051   2026-09-18  [0, 1, 2, 3]LightX2V
+gpu18  seedvr2-liik2               40054   2026-09-18  [0, 1, 2, 3]LightX2V
+gpu19  seedvr2-orvo8               40035   2026-09-18  [0, 1, 2, 3]LightX2V
+gpu20  seedvr2-kj71f               40006   2026-09-18  [0, 1, 2, 3]LightX2V
+gpu23  minimax-h3-fl2va-2awci      40039   2026-09-30  [0, 1, 2, 3]vLLM-Omni
+gpu24  minimax-h3-fl2va-z473x      40029   2026-09-30  [0, 1, 2, 3]vLLM-Omni
+gpu25  minimax-h3-fl2va-b326e      40001   2026-09-30  [0, 1, 2, 3]vLLM-Omni
+gpu33  minimax-h3-ref2va-a9xxg     40016   2026-09-30  [0, 1, 2, 3]vLLM-Omni
+gpu34  minimax-h3-ref2va-9nzgl     40009   2026-09-30  [0, 1, 2, 3]vLLM-Omni
+gpu35  minimax-h3-ref2va-28ign     40026   2026-10-04  [0, 1, 2, 3]vLLM-Omni
+gpu51  Zhongsen-Text-8b-w8lip      40033   2026-09-20  [0]    vLLM-Omni
+gpu51  qwen3guard-xdyf7            40047   2026-09-21  [1]    vLLM-Omni
+gpu51  shieldgemma2-ef8aw          40016   2026-09-20  [3]    vLLM-Omni
+gpu51  shieldgemma2-yoxr8          40018   2026-09-20  [2]    vLLM-Omni
+gpu52  Zhongsen-Text-8b-qgk0z      40013   2026-09-20  [0]    vLLM-Omni
+gpu52  qwen3guard-l0i8n            40043   2026-09-21  [1]    vLLM-Omni
+gpu52  shieldgemma2-nu62g          40047   2026-09-20  [2]    vLLM-Omni
+gpu52  shieldgemma2-o2xac          40018   2026-09-20  [3]    vLLM-Omni
+gpu53  Zhongsen-Text-8b-2bj6p      40062   2026-09-20  [1]    vLLM-Omni
+gpu53  Zhongsen-Text-8b-gim40      40029   2026-09-20  [0]    vLLM-Omni
+gpu53  shieldgemma2-tqfxk          40025   2026-09-10  [2]    vLLM-Omni
+gpu53  shieldgemma2-zs3ig          40041   2026-09-10  [3]    vLLM-Omni
+gpu54  Zhongsen-Text-8b-l6nyj      40029   2026-09-20  [1]    vLLM-Omni
+gpu54  Zhongsen-Text-8b-tbh7q      40032   2026-09-20  [0]    vLLM-Omni
+gpu54  shieldgemma2-dxblu          40011   2026-09-20  [2]    vLLM-Omni
+gpu54  shieldgemma2-osm3w          40038   2026-09-20  [3]    vLLM-Omni
+
+4 卡实例 13 个 / 单卡实例 37 个
+占用卡位 89 / 220 (40%)，空置 131
+整台空闲 29 台: gpu8 gpu9 gpu10 gpu14 gpu21 gpu22 gpu26 gpu27 gpu28 gpu29 gpu30 gpu31 gpu32 gpu36 gpu37 gpu38 gpu39 gpu40 gpu41 gpu42 gpu43 gpu44 gpu45 gpu46 gpu47 gpu48 gpu49 gpu50 gpu55
+部分空闲 7 台: gpu4 gpu5 gpu6 gpu7 gpu11 gpu12 gpu13

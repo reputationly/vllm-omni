@@ -16,6 +16,9 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.models.minimax_h3.reference_audio import MINIMAX_H3_AUDIO_RESAMPLE_OFFICIAL
+from vllm_omni.diffusion.models.minimax_h3.reference_image_geometry import (
+    parse_reference_image_no_upscale,
+)
 from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY = "minimax_h3_prepared_reference_videos"
@@ -68,11 +71,15 @@ def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[st
 MINIMAX_H3_FPS = 24.0
 MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
 MINIMAX_H3_QWEN_TEMPORAL_PATCH = 2
+MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_BASE_SHORT_EDGE = 768
 MINIMAX_H3_MAX_PIXELS = 768 * 1344
-MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MIN_REFERENCE_DIMENSION = 256
 MINIMAX_H3_MAX_REFERENCE_DIMENSION = 5760
+# Opt-in for upstream #8253 behaviour: stop enlarging reference videos smaller
+# than the canvas. Default OFF keeps the pre-#8253 deployed behaviour (sync
+# manual §5.0 P2). Parsed at call time so monkeypatch.setenv takes effect.
+MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV = "VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE"
 MINIMAX_H3_MIN_REFERENCE_FPS = 23.976
 MINIMAX_H3_MAX_REFERENCE_FPS = 60.0
 MINIMAX_H3_MIN_REFERENCE_DURATION = 2.0
@@ -353,6 +360,14 @@ def validate_reference_audio_waveforms(values: list[tuple[torch.Tensor, int]]) -
 
 
 def _reference_video_shape(width: int, height: int) -> tuple[int, int]:
+    """Fit large references to the video canvas.
+
+    Upstream #8253 stopped enlarging inputs whose area is below the canvas.
+    We keep the pre-#8253 behaviour by default (the deployed contract), and
+    let ``VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE`` opt into upstream's version.
+    The switch is read here, at call time, so ``monkeypatch.setenv`` works.
+    """
+    no_upscale = parse_reference_image_no_upscale(os.environ.get(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, ""))
     if (
         min(width, height) < MINIMAX_H3_MIN_REFERENCE_DIMENSION
         or max(width, height) > MINIMAX_H3_MAX_REFERENCE_DIMENSION
@@ -372,10 +387,14 @@ def _reference_video_shape(width: int, height: int) -> tuple[int, int]:
         scale = math.sqrt(MINIMAX_H3_MAX_PIXELS / area)
         target_width *= scale
         target_height *= scale
-    return (
-        _nearest_multiple(target_width, MINIMAX_H3_CANVAS_MULTIPLE),
-        _nearest_multiple(target_height, MINIMAX_H3_CANVAS_MULTIPLE),
-    )
+    canvas_width = _nearest_multiple(target_width, MINIMAX_H3_CANVAS_MULTIPLE)
+    canvas_height = _nearest_multiple(target_height, MINIMAX_H3_CANVAS_MULTIPLE)
+    if no_upscale and width * height < canvas_width * canvas_height:
+        return (
+            _nearest_multiple(width, MINIMAX_H3_CANVAS_MULTIPLE),
+            _nearest_multiple(height, MINIMAX_H3_CANVAS_MULTIPLE),
+        )
+    return canvas_width, canvas_height
 
 
 def _transcode_reference_video(
@@ -590,9 +609,10 @@ def prepare_reference_videos_official(
         already-normalized ``audio`` (or None), in request order.
     """
     from vllm_omni.diffusion.models.minimax_h3.reference_audio import normalize_reference_audio
-
-    from .reference_media_decode import open_reference_video
-    from .reference_video_frames import normalize_reference_video_stream
+    from vllm_omni.diffusion.models.minimax_h3.reference_media_decode import open_reference_video
+    from vllm_omni.diffusion.models.minimax_h3.reference_video_frames import (
+        normalize_reference_video_stream,
+    )
 
     if isinstance(values, (str, os.PathLike)):
         values = [values]
@@ -930,6 +950,9 @@ def load_audio_file(path: str) -> tuple[torch.Tensor, int]:
             return _soundfile_to_waveform(wav)
 
 
+_AUDIO_EXTRACTION_TIMEOUT_SECONDS = 120
+
+
 def load_video_audio(
     path: str,
     *,
@@ -960,11 +983,12 @@ def load_video_audio(
         if duration_seconds is not None:
             command.extend(["-t", f"{float(duration_seconds):.6f}"])
         command.append(output)
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, timeout=_AUDIO_EXTRACTION_TIMEOUT_SECONDS)
         return load_audio_file(output)
 
 
 __all__ = [
+    "MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV",
     "load_audio_file",
     "load_video_audio",
     "load_video_frames",

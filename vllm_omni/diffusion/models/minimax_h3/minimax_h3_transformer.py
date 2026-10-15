@@ -10,7 +10,8 @@ layout.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     PackedPaddingMetadata,
     VideoTokenLayout,
 )
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -62,10 +64,13 @@ from vllm_omni.diffusion.models.minimax_h3.vdn_hybrid import (
     VDNHybridAttention,
     combine_hybrid_output,
 )
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
+from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
 from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .fasth3 import _resolve_native_target
+from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -462,7 +467,10 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         The sinusoidal embedding stays fp32 throughout and concatenates cosine
         values before sine values.
         """
-        if self.adaln_rank is not None:
+        # `adaln_cache.build_cache` assembles this module through ``__new__`` and
+        # sets only the dense-projection attributes, so `adaln_rank` can be absent
+        # there; treat that as "not pruned", which is what the builder wants.
+        if getattr(self, "adaln_rank", None) is not None:
             # The table already contains coordinates of the activated released
             # timestep curve.  Do not apply the released MLP or SiLU again.
             steps = self.table.shape[0] - 1
@@ -569,6 +577,9 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        # VDN-H3 hybrid attention; built by enable_vdn for a VDN checkpoint.
+        self.vdn: VDNH3HybridAttention | None = None
+        self._prefix = prefix
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
         # VDN-H3 hybrid extras, built the same way and for the same reason: they exist
@@ -613,7 +624,7 @@ class MiniMaxH3Attention(nn.Module):
         nn.init.zeros_(self.to_gate_compress.weight)
 
     def enable_vdn_branch(self, **window_config: Any) -> None:
-        """Build the VDN hybrid extras this attention would otherwise lack.
+        """Build the VDN hybrid extras this attention would otherwise lack (our VDN_WINDOW_ATTN).
 
         Called before ``load_weights`` so the checkpoint's branch tensors have
         parameters to land on, exactly like ``enable_vsa_gate``. It also flips
@@ -640,6 +651,20 @@ class MiniMaxH3Attention(nn.Module):
             **window_config,
         )
         self.out_proj.reduce_results = False
+
+    def enable_vdn(self, config: VDNConfig) -> None:
+        """Attach the learned half of VDN-H3 hybrid attention (see ``vdnh3.py``)."""
+        backend = self.attention.attn_backend.get_name()
+        if backend != "VDNH3_ATTN":
+            raise ValueError(f"VDN-H3 attention needs the VDNH3_ATTN backend, but {self._prefix} resolved {backend}")
+        self.vdn = VDNH3HybridAttention(
+            self._gate_hidden_size,
+            self.total_num_heads,
+            self.head_dim,
+            config,
+            quant_config=self._gate_quant_config,
+            prefix=f"{self._prefix}.vdn",
+        )
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -668,6 +693,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
+        vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -761,6 +787,8 @@ class MiniMaxH3Attention(nn.Module):
                     if gate_compress is not None and video_layout is not None and video_layout.video_spans
                     else {}
                 ),
+                # The VDNH3_ATTN frame window; every other backend ignores it.
+                **({"vdn_window": vdn_window} if vdn_window is not None else {}),
             },
             video_layout=video_layout,
         )
@@ -814,6 +842,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        vdn_window: VDNLayout | None = None,
         vdn_text_span: tuple[int, int] | torch.Tensor | None = None,
         sp_row_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
@@ -841,11 +870,19 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
+        # Only the upstream VDNH3 branch consumes `vdn_window`; our VDN_WINDOW_ATTN
+        # branch derives its own geometry from `video_layout` below (see
+        # `self.vdn.plan_geometry`), so requiring the window for both classes would
+        # reject calls that our class handles correctly.
+        if isinstance(self.vdn, VDNH3HybridAttention) and vdn_window is None:
+            raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The linear branch consumes the RAW projections -- pre-QK-norm, pre-RoPE -- so
         # it adds no projection cost and, under a merged LoRA, sees the adapted weights
         # for free. Holding the references is safe because the fused kernel declares
         # ``mutates_args=[]`` and the unfused path is out-of-place too.
         qkv_raw = (q, k, v) if self.vdn is not None else None
+        # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
+        q_raw, k_raw = q, k
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -885,12 +922,22 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            vdn_window=vdn_window,
         )
         if self.vdn is None:
             out = out.reshape(total, self.num_heads * self.head_dim)
             out, _ = self.out_proj(out)
             return out
 
+        if isinstance(self.vdn, VDNH3HybridAttention):
+            # Upstream VDNH3_ATTN: gate the softmax half, then add the learned linear half.
+            out = self.vdn.gate_softmax(out, x)
+            out = out.reshape(total, self.num_heads * self.head_dim)
+            out, _ = self.out_proj(out)
+            out = self.vdn.add_linear(out, x, q_raw, k_raw, v, vdn_window)
+            return out
+
+        # Our VDN_WINDOW_ATTN path (vdn_hybrid.VDNHybridAttention).
         # `used_len` the same way _run_packed_attention and the window backend derive
         # it, so all three agree on where the packing's alignment padding starts.
         used_len = min(max_seqlen, packed_total if packed_total is not None else total)
@@ -1018,20 +1065,28 @@ class MiniMaxH3AdalnProj(nn.Module):
                 f"adaln out_features mismatch: {out_features} != {expand_ratio}*{arch.hidden_size}*{modality_num}"
             )
         self._adaln_cache = adaln_cache
+        self._offload_weights = adaln_cache is not None and adaln_cache.offload_weights
+        self._weight_stager: PinnedModuleStager | None = None
+        self._host_signature: tuple[Any, ...] | None = None
+        if self._offload_weights and quant_config is not None:
+            raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
         self._cache_name = prefix + ".linear"
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
         self.pruned = arch.adaln_rank is not None
-        self.linear = ColumnParallelLinear(
-            arch.adaln_rank if self.pruned else arch.time_embed_dim,
-            out_features,
-            bias=not self.pruned,
-            gather_output=True,
-            params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear",
-        )
+        # Allocate host weights from the start: moving them after construction
+        # would still require enough VRAM for the complete resident model.
+        with torch.device("cpu") if self._offload_weights else nullcontext():
+            self.linear = ColumnParallelLinear(
+                arch.adaln_rank if self.pruned else arch.time_embed_dim,
+                out_features,
+                bias=not self.pruned,
+                gather_output=True,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear",
+            )
         if self.pruned:
             self.register_buffer(
                 "folded_bias",
@@ -1039,26 +1094,112 @@ class MiniMaxH3AdalnProj(nn.Module):
                 persistent=True,
             )
 
-    def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
+    def _apply(self, fn, recurse=True):
+        self._weight_stager = None
+        self._host_signature = None
+        if self._adaln_cache is not None:
+            self._adaln_cache.clear()
+        if not self._offload_weights:
+            return super()._apply(fn, recurse=recurse)
+
+        def keep_on_host(tensor):
+            result = fn(tensor)
+            return result if result.is_meta else result.cpu()
+
+        return super()._apply(keep_on_host, recurse=recurse)
+
+    def _offload_signature(self) -> tuple[Any, ...] | None:
+        assert self._adaln_cache is not None
+        try:
+            return self._adaln_cache._signature(self.linear)
+        except RuntimeError:
+            # Weights created in inference_mode have no version counter.
+            # Re-snapshot on every miss instead of trusting an immutable master.
+            return None
+
+    def _prepare_weight_stager(self, device: torch.device) -> None:
+        if not self._offload_weights:
+            return
+        if device.type != "cuda" or torch.is_grad_enabled() or torch.compiler.is_compiling():
+            raise RuntimeError("MiniMax H3 AdaLN offload requires eager CUDA inference")
+        assert self._adaln_cache is not None
+        if self._adaln_cache._has_forward_hooks(self.linear):
+            raise RuntimeError("MiniMax H3 AdaLN offload does not support projection forward hooks")
+        signature = self._offload_signature()
+        if (
+            signature is None
+            or self._weight_stager is None
+            or self._weight_stager.device != device
+            or self._host_signature != signature
+        ):
+            # Re-snapshot on parameter replacement, in-place edits or moves.
+            # The CPU master remains the registered parameter storage between
+            # calls, so normal cache version checks and weight loaders apply.
+            # The whole projector is one staging group: `_apply`'s keep_on_host
+            # holds the pruned `folded_bias` buffer on the host too, and the
+            # pruned path adds it to the staged activation, so it has to move
+            # with the linear (§5.3).
+            self._weight_stager = PinnedModuleStager(self, device, cache_retention=BoundedAllocatorCache(device))
+            self._host_signature = self._offload_signature()
+
+    def _project(self, t_emb: torch.Tensor) -> torch.Tensor:
+        self._prepare_weight_stager(t_emb.device)
 
         # The pruned table contains the coordinates of silu(time_embedder(t)),
         # whereas the released path still needs the activation here.
+        def staged(compute: Callable[[], torch.Tensor]) -> torch.Tensor:
+            """Run ``compute`` with the projector on the device when offloaded.
+
+            AdaLN offload keeps the whole projector — the column-parallel linear
+            and, on pruned checkpoints, the ``folded_bias`` buffer — on a pinned
+            CPU master. Both are read by one projection, so the staging envelope
+            has to cover the bias add as well as the matmul; staging only around
+            the linear leaves the bias on the host and the add fails.
+            """
+            if self._weight_stager is None:
+                return compute()
+            self._weight_stager.load()
+            try:
+                return compute()
+            finally:
+                self._weight_stager.offload()
+
         def project() -> torch.Tensor:
-            x = t_emb if self.pruned else nn.functional.silu(t_emb)
-            x = self.linear(x.to(_BF16_DTYPE))[0]
             if self.pruned:
                 # This order is part of the checkpoint semantics: the folded bias
                 # carries most of the modulation and must not be rounded to BF16
                 # before addition.
-                x = (x.float() + self.folded_bias).to(x.dtype)
-            return x
+                def pruned() -> torch.Tensor:
+                    x = self.linear(t_emb.to(_BF16_DTYPE))[0]
+                    return (x.float() + self.folded_bias).to(x.dtype)
 
-        x = (
+                return staged(pruned)
+            x = nn.functional.silu(t_emb)
+
+            def released() -> torch.Tensor:
+                return self.linear(x.to(_BF16_DTYPE))[0]
+
+            return staged(released)
+
+        return (
             project()
             if self._adaln_cache is None
             else self._adaln_cache.project(self._cache_name, self.linear, t_emb, project)
         )
+
+    @torch.compiler.disable
+    def _project_cached(self, t_emb: torch.Tensor) -> torch.Tensor:
+        # Cache decisions, TP hit voting and CPU storage rebinding are host
+        # control flow. Keep this small boundary eager while the surrounding
+        # norms, attention projections and MLP remain eligible for compilation.
+        return self._project(t_emb)
+
+    def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
+        use_cache_boundary = self._adaln_cache is not None and (
+            self._adaln_cache.max_bytes > 0 or self._offload_weights
+        )
+        x = self._project_cached(t_emb) if use_cache_boundary else self._project(t_emb)
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
         return tuple(x.chunk(self.expand_ratio, dim=-1))
@@ -1195,6 +1336,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        vdn_window: VDNLayout | None = None,
         vdn_text_span: tuple[int, int] | torch.Tensor | None = None,
         sp_row_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
@@ -1233,6 +1375,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            vdn_window=vdn_window,
             vdn_text_span=vdn_text_span,
             sp_row_span=sp_row_span,
         )
@@ -1350,6 +1493,8 @@ class MiniMaxH3DiTModel(nn.Module):
     )
     _repeated_blocks = ["MiniMaxH3DiTBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]
+    # Set by enable_vdn for a VDN-H3 checkpoint.
+    vdn_config: VDNConfig | None = None
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
@@ -1457,7 +1602,38 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         if type(enabled) is not bool:
             raise ValueError("minimax_h3_adaln_cache must be a boolean")
-        self.adaln_cache = MiniMaxH3RuntimeAdalnCache(max_bytes=256 * 1024**2 if enabled else 0)
+        offload = resolve_offload(od_config)
+        conflicting_offload = (
+            offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
+        ) or getattr(od_config.parallel_config, "use_hsdp", False)
+        # Limit automatic offload to the validated SM120 deployment. Other
+        # CUDA architectures keep their resident weights unless opted in.
+        # Use the worker's current device, not logical device zero.
+        default_offload_adaln = (
+            enabled
+            and current_omni_platform.is_cuda()
+            and quant_config is None
+            and not conflicting_offload
+            and current_omni_platform.get_device_capability(torch.accelerator.current_device_index()) == (12, 0)
+        )
+        offload_adaln = (
+            cache_config.get("minimax_h3_adaln_offload", default_offload_adaln)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_adaln_offload", default_offload_adaln)
+        )
+        if type(offload_adaln) is not bool:
+            raise ValueError("minimax_h3_adaln_offload must be a boolean")
+        if offload_adaln:
+            if not current_omni_platform.is_cuda():
+                raise ValueError("MiniMax H3 AdaLN offload requires CUDA")
+            if quant_config is not None:
+                raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
+            if conflicting_offload:
+                raise ValueError("MiniMax H3 AdaLN offload cannot be combined with DiT offload or HSDP")
+            logger.info("MiniMax H3 AdaLN weights remain on CPU; projections stage on cache misses only")
+        self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
+            max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
+        )
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.hidden_size = arch.hidden_size
@@ -1574,7 +1750,7 @@ class MiniMaxH3DiTModel(nn.Module):
         self.vsa_gates_enabled = True
 
     def enable_vdn_branches(self, **window_config: Any) -> None:
-        """Give every DiT block's attention its VDN hybrid extras.
+        """Give every DiT block's attention its VDN hybrid extras (our VDN_WINDOW_ATTN).
 
         The branch tensors name parameters the base transformer does not have, so the
         modules must exist before the weight stream reaches them; ``load_weights`` only
@@ -1584,6 +1760,28 @@ class MiniMaxH3DiTModel(nn.Module):
         """
         for block in self.blocks:
             block.attn.enable_vdn_branch(**window_config)
+
+    def enable_vdn(self, config: VDNConfig) -> None:
+        """Convert every DiT block to VDN-H3 hybrid attention before loading (upstream VDNH3_ATTN).
+
+        The token refiner attends over text only and stays dense.
+        """
+        for block in self.blocks:
+            block.attn.enable_vdn(config)
+        self.vdn_config = config
+        self._mark_missing_params_required()
+
+    def vdn_parameter_names(self) -> set[str]:
+        """VDN parameters the checkpoint supplies; quantization fills its scales after loading."""
+        return {name for name, _ in self.named_parameters() if ".attn.vdn." in name and not name.endswith("_scale")}
+
+    def _vdn_window(self, layout: VideoTokenLayout | None, *, text_len: int, num_requests: int) -> VDNLayout:
+        if num_requests != 1 or layout is None or layout.used_len is None:
+            raise ValueError("VDN-H3 attention needs one packed request with its video layout per forward")
+        target = next(span for span in reversed(layout.video_spans) if span.role == "target")
+        return self.vdn_config.window(
+            used=layout.used_len, text_len=text_len, video_start=target.start, grid=target.latent_grid
+        )
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1939,6 +2137,10 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
+        vdn_window = None
+        if self.vdn_config is not None:
+            # Text rows lead the packed document.
+            vdn_window = self._vdn_window(video_layout, text_len=int(text_pos.shape[0]), num_requests=num_requests)
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -2020,6 +2222,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                vdn_window=vdn_window,
                 vdn_text_span=vdn_text_span,
                 # None unless the rows really are split: the branch's sharded path costs
                 # collectives, and on the unsharded path local_span is the whole sequence.

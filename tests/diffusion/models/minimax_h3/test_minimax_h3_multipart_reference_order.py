@@ -62,7 +62,7 @@ def _audio(name="a.wav") -> _Upload:
 
 
 def _persist(uploads):
-    from vllm_omni.entrypoints.openai.api_server import _persist_uploaded_media_references
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _persist_uploaded_media_references
 
     images, videos, audios, order = asyncio.run(_persist_uploaded_media_references(uploads))
     for path in list(videos) + list(audios):
@@ -160,7 +160,7 @@ def _handler(honours):
 
 
 def test_an_official_instance_gets_the_upload_order_attached():
-    from vllm_omni.entrypoints.openai.api_server import _multipart_reference_order
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _multipart_reference_order
 
     attached = _multipart_reference_order(_handler(True), [("video", 0), ("image", 0)])
     assert [(entry.type, entry.index) for entry in attached] == [("video", 0), ("image", 0)]
@@ -169,7 +169,7 @@ def test_an_official_instance_gets_the_upload_order_attached():
 def test_a_legacy_instance_gets_none_because_it_would_refuse_one():
     """Legacy raises on an explicit order, so this is the difference between a
     silently reordered request and a request that cannot be made at all."""
-    from vllm_omni.entrypoints.openai.api_server import _multipart_reference_order
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _multipart_reference_order
 
     assert _multipart_reference_order(_handler(False), [("video", 0), ("image", 0)]) is None
 
@@ -177,7 +177,7 @@ def test_a_legacy_instance_gets_none_because_it_would_refuse_one():
 def test_an_empty_order_attaches_nothing_rather_than_an_empty_list():
     """An empty ``reference_order`` is a *requested* order of zero references,
     not the absence of one, and the validator would then reject the media."""
-    from vllm_omni.entrypoints.openai.api_server import _multipart_reference_order
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _multipart_reference_order
 
     assert _multipart_reference_order(_handler(True), []) is None
 
@@ -185,7 +185,7 @@ def test_an_empty_order_attaches_nothing_rather_than_an_empty_list():
 def test_a_handler_that_cannot_answer_is_treated_as_able():
     """Every model that reaches this branch supports mixed references, which no
     non-H3 pipeline does; a missing probe is a test double, not a deployment."""
-    from vllm_omni.entrypoints.openai.api_server import _multipart_reference_order
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _multipart_reference_order
 
     attached = _multipart_reference_order(SimpleNamespace(), [("image", 0)])
     assert [(entry.type, entry.index) for entry in attached] == [("image", 0)]
@@ -193,8 +193,8 @@ def test_a_handler_that_cannot_answer_is_treated_as_able():
 
 def test_the_attached_entries_are_what_the_request_schema_accepts():
     """Typed at the boundary, so a bad modality is a 400 and not a KeyError."""
-    from vllm_omni.entrypoints.openai.api_server import _multipart_reference_order
     from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _multipart_reference_order
 
     order = _multipart_reference_order(_handler(True), [("audio", 0), ("image", 1)])
     request = VideoGenerationRequest(prompt="p", reference_order=order)
@@ -205,7 +205,7 @@ def test_the_attached_entries_are_what_the_request_schema_accepts():
 
 
 def _completed(order, *, num_audios):
-    from vllm_omni.entrypoints.openai.api_server import _order_with_separate_audio
+    from vllm_omni.entrypoints.openai.video.generation.helpers import _order_with_separate_audio
 
     return _order_with_separate_audio(order, num_audios=num_audios)
 

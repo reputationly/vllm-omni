@@ -166,19 +166,32 @@ def test_invalid_legacy_text_is_not_ignored(pipeline):
     pipeline.video_vae.encode_image.assert_not_called()
 
 
-def test_text_weight_loading_preserves_encoder_specific_lifecycle(pipeline):
-    class Encoder(torch.nn.Module):
-        def load_weights(self, weights):
-            return {name for name, _ in weights}
+def test_disabled_component_is_refused_rather_than_skipped(pipeline):
+    """A weight for a component this deployment turned off must raise, not vanish.
 
-    pipeline.text_encoder = Encoder()
-    pipeline.video_vae = torch.nn.Identity()
-    pipeline.audio_vae = torch.nn.Identity()
-    assert pipeline.load_weights([("text_encoder.layer.weight", torch.ones(1))]) == {"text_encoder.layer.weight"}
+    `load_weights` had this path covered by the old text-encoder test; that test now
+    pins the refusal of `text_encoder.*` instead, so cover the same branch with a
+    prefix that *is* accepted by `source_prefix` and whose component is absent.
+    """
+    pipeline.transformers_ref = None
     pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = False
-    pipeline.text_encoder = None
-    with pytest.raises(ValueError, match="disabled in this deployment"):
+
+    with pytest.raises(ValueError, match="component 'transformers_ref' is disabled in this deployment"):
+        pipeline.load_weights([("transformers_ref.block.weight", torch.ones(1))])
+
+
+def test_text_encoder_owns_its_load_and_is_not_a_pipeline_weight_source(pipeline):
+    """The encoder must never be fed through ``MiniMaxH3Pipeline.load_weights``.
+
+    Upstream routes it as a ``weights_sources`` entry with
+    ``prefix="text_encoder."``. We do not: ``MiniMaxH3Qwen3VLEncoder`` reads its own
+    safetensors shards, which is what lets the INT8 text-encoder artifact ship
+    separately from the DiT. ``load_weights`` accepts only ``transformer.`` and
+    ``transformers_ref.``, so a ``text_encoder.*`` tensor has to be refused rather
+    than silently half-loaded -- and the refusal has to say which weight, because
+    the alternative is a deployment that starts and runs the wrong encoder.
+    """
+    with pytest.raises(ValueError, match="unexpected MiniMax-H3 weight 'text_encoder.layer.weight'"):
         pipeline.load_weights([("text_encoder.layer.weight", torch.ones(1))])
 
 
@@ -213,6 +226,7 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     )
     monkeypatch.setattr(processing, "load_video_audio", Mock(return_value=(torch.full((64000,), 3.0), 32000)))
     pipeline.video_vae.encode_video.return_value = (torch.full((1, 96), 2.0), (1, 2, 2))
+    pipeline.video_vae.predict_video_latent_shape.return_value = (1, 2, 2)
 
     def encode_audio(waveform, sample_rate):
         length = round(waveform.shape[-1] / sample_rate * 40)
@@ -221,8 +235,25 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     pipeline.audio_vae.encode_waveform.side_effect = encode_audio
     request = _request("ref2va")
     request.prompts[0]["multi_modal_data"].update(video="original.mp4", audio=(torch.full((192000,), 4.0), 32000))
+
+    def capture_denoise_kwargs():
+        kwargs = pipeline.diffuse.call_args.kwargs.copy()
+        context = kwargs.pop("request_context")
+        # Mirror diffuse's consumption of request-owned noise at the mocked boundary.
+        for key in ("precomputed_initial_noise", "precomputed_visual_condition_noise"):
+            kwargs[key] = context.pop(key, None)
+        return kwargs
+
     pipeline.forward(request)
-    local_kwargs = pipeline.diffuse.call_args.kwargs
+    # Deviation pin (manual §3.2): upstream #8577's producer is disabled on this branch, so
+    # the request context must reach `diffuse` carrying no precomputed noise. Restoring the
+    # producer turns this red -- and restoring it is a §5.3 regression, because those rows
+    # would come from `self._initial_noise` rather than `MiniMaxH3RequestNoisePlan`.
+    # Read before `capture_denoise_kwargs`, which pops these keys.
+    forwarded_context = pipeline.diffuse.call_args.kwargs["request_context"]
+    assert "precomputed_initial_noise" not in forwarded_context
+    assert "precomputed_visual_condition_noise" not in forwarded_context
+    local_kwargs = capture_denoise_kwargs()
 
     transformed = prepare_encoder_prompt(request.prompts[0], [request.sampling_params])
     stage_zero = object.__new__(MiniMaxH3Encoder)
@@ -261,12 +292,125 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     pipeline.video_vae.encode_image.reset_mock()
     pipeline.video_vae.encode_video.reset_mock()
     pipeline.forward(SimpleNamespace(prompts=[bridged], sampling_params=request.sampling_params))
-    external_kwargs = pipeline.diffuse.call_args.kwargs
+    external_kwargs = capture_denoise_kwargs()
+
+    def _without_image_geometry(blocks):
+        """`ref_blocks` minus the image block's latent size, which is a geometry result.
+
+        The block list is compared between the paths for everything except this: the
+        reference image's encoded size is exactly what the two geometries disagree
+        about, and it is asserted on its own below.
+        """
+        return [
+            {key: value for key, value in block.items() if key not in ("latent_h", "latent_w")}
+            if block.get("kind") == "image"
+            else block
+            for block in blocks
+        ]
+
     for key, value in local_kwargs.items():
+        if key == "visual_condition":
+            # Deliberately not compared; the two paths are *supposed* to differ here.
+            # See the two claims below.
+            continue
+        if key == "visual_condition_shapes":
+            # Entry 0 is the reference image (the block order is pinned at the end of
+            # this test); it is the other half of the same geometry claim.
+            assert value[1:] == external_kwargs[key][1:]
+            continue
+        if key == "ref_blocks":
+            # Same reason, for the one field of the image block that is a geometry
+            # result; everything else about the block list must still agree.
+            assert _without_image_geometry(value) == _without_image_geometry(external_kwargs[key])
+            continue
+        if key in {"precomputed_initial_noise", "precomputed_visual_condition_noise"}:
+            # Both are None on BOTH paths, and that is the truth today rather than the
+            # intent. `_prepare_local_conditioning` does compute them -- it writes them
+            # into the `request_context` it is handed -- but `_prepare_request_inputs`
+            # rebinds `context` to a fresh dict from
+            # `_prepare_encoder_conditioning_inputs(conditioning, sampling)` right
+            # after, and that helper never sees the first dict. So the write is
+            # discarded and `diffuse` recomputes from its own fallback.
+            #
+            # This assertion previously demanded `value is not None` locally, i.e. the
+            # intent. Delivering it would not be a fix: `whose` generator the
+            # precompute used is upstream's `_initial_noise`, while the fallback
+            # non-guided requests take is `MiniMaxH3RequestNoisePlan` -- the one that
+            # keeps the seed contract bit-exact (manual §5.3). Handing the precomputed
+            # rows to `diffuse` would short-circuit that branch and silently change the
+            # noise of every non-guided ref2va request. The dead write is currently
+            # masking that; do not "fix" the rebind without routing the precompute
+            # through `noise_plan` first.
+            assert value is None, f"{key} is expected to be absent; see the comment above"
+            assert external_kwargs[key] is None
+            continue
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(value, external_kwargs[key])
         else:
             assert value == external_kwargs[key]
+    # ---------------------------------------------------------------------------
+    # Registered deviation from upstream: reference-image geometry is
+    # contract-controlled only on the SINGLE-STAGE path, so these two are asserted
+    # separately instead of being required to agree.
+    #
+    # `prepare_encoder_inputs` resizes references through its `reference_image_shape`
+    # callback, and only the diffusion pipeline passes one
+    # (`pipeline_minimax_h3.py`, "the pipeline resolved the geometry, so honour it
+    # verbatim"). The encoder-stage bridge calls it without
+    # (`stage_input_processors/minimax_h3.py`), which lands on upstream's
+    # `resolve_minimax_h3_reference_image_shape(max_area=None)` -- preserve the
+    # reference's own resolution, rounded to the 32-pixel grid.
+    #
+    # Upstream has no such callback at all, so this test passes there by
+    # construction. Ours added it, which is what makes one path follow the contract
+    # and the other stay upstream-compatible.
+    #
+    # Both paths under test are controlled by this file, so the sizes are named here
+    # rather than derived: the strategy in force is legacy (short edge 2048,
+    # no_upscale off), and the reference is `Image.new("RGB", (256, 256))`.
+    # ---------------------------------------------------------------------------
+    # Claim 1 -- single stage: the contract's geometry applies. 256x256 is enlarged
+    # to the 2048 short edge, i.e. 64x64 patches of 32 pixels. The extra row is the
+    # mocked reference video (`encode_video` returns one row).
+    assert local_kwargs["visual_condition"].shape[0] == 64 * 64 + 1, (
+        "the single-stage path must encode the reference at the contract's short edge"
+    )
+    # Claim 2 -- encoder in its own stage: upstream's resize applies, so the 256x256
+    # reference stays 256x256 and contributes 8x8 patches, plus the same video row.
+    assert external_kwargs["visual_condition"].shape[0] == 8 * 8 + 1, (
+        "the disaggregated path must keep upstream's preserve-resolution resize"
+    )
+    assert local_kwargs["visual_condition"].shape[1] == external_kwargs["visual_condition"].shape[1] == 96
+
+    def _image_block(kwargs):
+        return next(block for block in kwargs["ref_blocks"] if block["kind"] == "image")
+
+    # The same divergence, seen where the denoise loop consumes it: the image block
+    # records the encoded size, and 2048/16 = 128 against 256/16 = 16 is the contract
+    # resize against upstream's preserve-resolution one.
+    assert (_image_block(local_kwargs)["latent_h"], _image_block(local_kwargs)["latent_w"]) == (128, 128)
+    assert (_image_block(external_kwargs)["latent_h"], _image_block(external_kwargs)["latent_w"]) == (16, 16)
+    assert local_kwargs["visual_condition_shapes"][0] == (1, 128, 128)
+    assert external_kwargs["visual_condition_shapes"][0] == (1, 16, 16)
+    local_inputs = pipeline._build_denoise_inputs(**local_kwargs)
+    external_inputs = pipeline._build_denoise_inputs(**external_kwargs)
+    # Claim 3 -- the same geometry, one level deeper. `video_rows` packs the reference
+    # rows ahead of the generated video's, so the divergence reappears as a row count:
+    # 4129 = 4097 + 32 here against 97 = 65 + 32 there. The difference is exactly
+    # 4096 - 64, which is the contract resize against upstream's preserve-resolution
+    # one and nothing else.
+    assert local_inputs["video_rows"].shape == (4129, 96)
+    assert external_inputs["video_rows"].shape == (97, 96)
+    assert local_inputs["video_rows"].shape[0] - external_inputs["video_rows"].shape[0] == 4096 - 64
+
+    # `cond_anchor` and `audio_anchor` are NOT compared across the paths, and this is
+    # the reason rather than an omission: both are `visual_condition` run through
+    # `minimax_h3_imgvid_cond_noise_aug_rows`, so they inherit the reference image's
+    # encoded values -- which are exactly what the two geometries disagree about. The
+    # augmentation noise is seeded identically; the input it is applied to is not.
+    #
+    # `audio_rows` is compared because nothing in it comes from the reference image.
+    assert torch.equal(local_inputs["audio_rows"], external_inputs["audio_rows"])
     pipeline.encode_prompt.assert_not_called()
     pipeline.video_vae.encode_image.assert_not_called()
     pipeline.video_vae.encode_video.assert_not_called()

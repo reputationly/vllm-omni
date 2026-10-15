@@ -119,3 +119,74 @@ def test_late_prefill_waits_until_all_decode_requests_finish(preprocess):
     assert scheduler.schedule().scheduled_request_ids == ["b"]
     scheduler.finish_requests("b", DiffusionRequestStatus.FINISHED_COMPLETED)
     assert scheduler.schedule().scheduled_request_ids == ["late"]
+
+
+def test_preprocess_normalizes_tuple_images_like_a_list(preprocess):
+    image = Image.new("RGB", (64, 64), "red")
+    tuple_request = make_request("tuple", [])
+    tuple_request.prompt["multi_modal_data"]["image"] = (image,)
+
+    processed = preprocess(tuple_request)
+    reference = preprocess(make_request("list", [(64, 64)]))
+
+    assert processed.batch_compatibility_key == reference.batch_compatibility_key
+    assert processed.batch_compatibility_key[0] == "qwen_image_21"
+    assert len(processed.batch_compatibility_key[1]) == 1
+    info = processed.prompt["additional_information"]
+    assert len(info["prompt_image"]) == 1
+    assert len(info["vae_images"]) == 1
+    assert len(info["input_image_sizes"]) == 1
+
+
+def test_preprocess_rejects_more_images_than_the_model_supports(preprocess):
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
+        MAX_QWEN_IMAGE_21_INPUT_IMAGES,
+    )
+
+    request = make_request("too-many", [(64, 64)] * (MAX_QWEN_IMAGE_21_INPUT_IMAGES + 1))
+    with pytest.raises(ValueError, match="At most"):
+        preprocess(request)
+
+
+def test_preprocess_defaults_true_cfg_scale(preprocess):
+    request = make_request("cfg", [])
+    request.sampling_params.true_cfg_scale = None
+    processed = preprocess(request)
+    assert processed.sampling_params.true_cfg_scale == 1.0
+
+    request = make_request("cfg-set", [])
+    request.sampling_params.true_cfg_scale = 4.0
+    assert preprocess(request).sampling_params.true_cfg_scale == 4.0
+
+
+@pytest.mark.parametrize("size,expected_wider", [((128, 64), True), ((64, 128), False)])
+def test_preprocess_derives_output_size_from_condition_aspect(preprocess, size, expected_wider):
+    request = make_request("aspect", [size])
+    request.sampling_params.height = None
+    request.sampling_params.width = None
+
+    processed = preprocess(request)
+
+    height = processed.sampling_params.height
+    width = processed.sampling_params.width
+    assert height % 32 == 0 and width % 32 == 0
+    assert (width > height) is expected_wider
+    info = processed.prompt["additional_information"]
+    assert info["calculated_height"] == height
+    assert info["calculated_width"] == width
+
+
+def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess):
+    processed = preprocess(make_request("staged", [(96, 64)]))
+    info = processed.prompt["additional_information"]
+
+    (vae_image,) = info["vae_images"]
+    # RGB input gains an opaque alpha channel for the RGBA VAE; the frame dim is
+    # inserted for the 3D (video-capable) VAE.
+    assert vae_image.shape[1] == 4
+    assert vae_image.shape[2] == 1
+    (prompt_image,) = info["prompt_image"]
+    assert isinstance(prompt_image, Image.Image)
+    (width, height) = info["input_image_sizes"][0]
+    assert prompt_image.size == (width, height)
+    assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),))

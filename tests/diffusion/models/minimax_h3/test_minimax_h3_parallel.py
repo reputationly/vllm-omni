@@ -93,6 +93,13 @@ def test_pruned_adaln_skips_silu_and_adds_folded_bias_in_fp32():
 
     projection = object.__new__(MiniMaxH3AdalnProj)
     nn.Module.__init__(projection)
+    # Everything `__init__` would have set for a non-cached, non-offloaded
+    # projection; `__new__` skips it, and `_project`/`forward` read all of these.
+    projection._adaln_cache = None
+    projection._offload_weights = False
+    projection._cache_name = "test.linear"
+    projection._weight_stager = None
+    projection._host_signature = None
     projection.expand_ratio = 2
     projection.modality_num = 1
     projection.hidden_size = 1
@@ -718,7 +725,7 @@ def test_swiglu_half_order_keys_off_the_source_name():
 
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 
-    def build_model() -> tuple[MiniMaxH3DiTModel, dict[int, torch.Tensor]]:
+    def build_model(diffusers: bool = False) -> tuple[MiniMaxH3DiTModel, dict[int, torch.Tensor]]:
         captured: dict[int, torch.Tensor] = {}
         parameter = nn.Parameter(torch.empty((4, 1)), requires_grad=False)
 
@@ -728,12 +735,31 @@ def test_swiglu_half_order_keys_off_the_source_name():
         parameter.weight_loader = loader
         model = object.__new__(MiniMaxH3DiTModel)
         nn.Module.__init__(model)
-        model.arch = SimpleNamespace(num_attention_heads=2, attention_head_dim=1, adaln_rank=None)
+        model.arch = SimpleNamespace(
+            num_attention_heads=2,
+            attention_head_dim=1,
+            adaln_rank=None,
+            rope_inv_freq_len=16,
+        )
         block = nn.Module()
         block.mlp = nn.Module()
         block.mlp.fc1 = nn.Module()
         block.mlp.fc1.register_parameter("weight", parameter)
         model.blocks = nn.ModuleList([block])
+        if diffusers:
+            # The Diffusers finalize validates the whole QKV group and rebuilds
+            # `rope.inv_freq` from the config, so that branch needs the buffer and
+            # the theta the ctor would have supplied.
+            model._rope_theta = 10000.0
+            model.rope = nn.Module()
+            model.rope.inv_freq = nn.Parameter(torch.empty(16))
+        # `load_weights` only rewrites Diffusers names when the model was told the
+        # checkpoint is Diffusers-format; `__new__` skips the ctor that derives it,
+        # so without this the Diffusers half of this test drops its name as a
+        # native weight and captures nothing (KeyError: 0). The point of the test
+        # is that the half order follows the *source name*, and the source name is
+        # what a Diffusers checkpoint actually carries.
+        model._diffusers_weights = diffusers
         return model, captured
 
     packed = torch.tensor([[0.0], [1.0], [2.0], [3.0]])
@@ -746,7 +772,7 @@ def test_swiglu_half_order_keys_off_the_source_name():
 
     # Diffusers naming: rows are [up, gate] and must be swapped. A wrong order
     # here loads and runs, so the decision may not rest on the rename table.
-    model, captured = build_model()
+    model, captured = build_model(diffusers=True)
     model.load_weights([("transformer_blocks.0.ff.net.0.proj.weight", packed)])
     assert captured[0][:, 0].tolist() == [2.0, 3.0]
     assert captured[1][:, 0].tolist() == [0.0, 1.0]

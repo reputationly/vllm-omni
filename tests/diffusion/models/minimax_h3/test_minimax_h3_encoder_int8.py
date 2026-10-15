@@ -85,19 +85,35 @@ def _load_int8(module, weight: torch.Tensor, shard_id=None) -> None:
     module.weight_scale.weight_loader(module.weight_scale, scale, shard_id)
 
 
+@pytest.mark.cuda
 def test_row_parallel_int8_matches_bf16_and_replicates_its_scale():
+    """W8A16 is a Triton kernel, so this one has to run on a GPU.
+
+    The file is marked ``cpu`` because the quantize/scale tests above it are pure
+    tensor maths; the forward path is not, and never was -- on CPU it dies in
+    ``mot_gemm.invoke_mot_gemm`` with "Pointer argument cannot be accessed from
+    Triton (cpu tensor?)".
+    """
     cls = _encoder_module("MiniMaxH3Qwen3VLRowParallelLinear")
     torch.manual_seed(0)
     weight = torch.randn(6, 8, dtype=torch.float32)
 
-    reference = cls(_Group(), input_size=8, output_size=6, dtype=torch.float32)
+    # The W8A16 kernel refuses fp32 activations ("W8A16 requires BF16/FP16
+    # activations"), so the comparison this test is named for has to be run in
+    # bf16 -- which is what the encoder's activation dtype is anyway.
+    # Build and load on CPU, then move: `enable_int8()` allocates `weight_scale`
+    # with the *default* device, so doing it after `.cuda()` leaves that buffer on
+    # the host and the Triton kernel then refuses the pointer.
+    reference = cls(_Group(), input_size=8, output_size=6, dtype=torch.bfloat16)
     reference.weight.data.copy_(weight)
-    quantized = cls(_Group(), input_size=8, output_size=6, dtype=torch.float32)
+    quantized = cls(_Group(), input_size=8, output_size=6, dtype=torch.bfloat16)
     _load_int8(quantized, weight)
+    reference = reference.cuda()
+    quantized = quantized.cuda()
 
     assert quantized.weight.dtype == torch.int8
     assert quantized.weight_scale.shape == (6, 1)
-    x = torch.randn(4, 8)
+    x = torch.randn(4, 8, dtype=torch.bfloat16, device="cuda")
     assert torch.allclose(quantized(x), reference(x), atol=2e-2, rtol=2e-2)
 
 

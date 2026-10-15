@@ -84,10 +84,19 @@ def test_the_contract_fields_have_a_structured_owner():
 
 
 def test_an_unowned_stage_field_still_fails_loudly():
-    """The guard the previous test relies on has to be live, not vacuous."""
+    """The guard the previous test relies on has to be live, not vacuous.
+
+    Two validators can answer and which one wins is an implementation detail: an
+    unrecognised stage field now reaches ``OmniDiffusionConfig`` first, which
+    rejects it as "Unknown diffusion config field(s)", before the ownership
+    validator in ``config/omni_config.py`` gets to call it "no structured config
+    owner". Both refuse to start the deployment, which is the property pinned
+    here -- naming only one of them made this fail as the other started
+    answering first.
+    """
     import pytest as _pytest
 
-    with _pytest.raises(ValueError, match="no structured config owner"):
+    with _pytest.raises(ValueError, match=r"no structured config owner|Unknown diffusion config field"):
         _diffusion_stage_engine_values(engine_extras={"minimax_h3_nonexistent_knob": "x"})
 
 

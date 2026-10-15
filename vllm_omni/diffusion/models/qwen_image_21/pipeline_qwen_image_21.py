@@ -242,6 +242,7 @@ def get_qwen_image_21_pre_process_func(
     # The Qwen-Image 2.1 VAE is RGBA (in/out_channels=4): condition images get an
     # opaque alpha channel unless the input already carries one.
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
+    sample_sigmas = (getattr(od_config, "extras", None) or {}).get("sample_sigmas")
 
     def _to_pil(image: Any) -> PIL.Image.Image:
         if isinstance(image, PIL.Image.Image):
@@ -268,6 +269,20 @@ def get_qwen_image_21_pre_process_func(
         request.allow_mixed_step_phases = False
         if request.sampling_params.true_cfg_scale is None:
             request.sampling_params.true_cfg_scale = 1.0
+        # Request-level sigmas may arrive via whitelisted extra-body params,
+        # which the serving layer stores in ``extra_args`` rather than the
+        # typed field (same convention as LTX2). Hoist them so the pipeline
+        # sees the explicit override before the preset grid is injected.
+        if request.sampling_params.sigmas is None:
+            extra_sigmas = (request.sampling_params.extra_args or {}).get("sigmas")
+            if extra_sigmas is not None:
+                request.sampling_params.sigmas = [float(s) for s in extra_sigmas]
+        # Inject the model-level sampling grid as request sigmas so the
+        # step scheduler and cache refresh resolve the total step count from
+        # len(sigmas). prepare_timesteps applies the same grid as a fallback
+        # for paths that bypass this hook; request-level sigmas always win.
+        if request.sampling_params.sigmas is None and sample_sigmas:
+            request.sampling_params.sigmas = list(sample_sigmas)
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
@@ -276,6 +291,8 @@ def get_qwen_image_21_pre_process_func(
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
+        if isinstance(raw_image, tuple):
+            raw_image = list(raw_image)
         if raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0):
             request.batch_compatibility_key = ("qwen_image_21", ())
             request.prompt = prompt
@@ -378,6 +395,16 @@ class QwenImage21Pipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    def release_captured_graphs(self) -> None:
+        """Drop decode graphs before sleep level 2 discards their capture storage.
+
+        The runner looks this up on the pipeline, not on the transformer.
+        """
+        transformer = getattr(self, "transformer", None)
+        release = getattr(transformer, "release_captured_graphs", None)
+        if callable(release):
+            release()
+
     def __init__(
         self,
         *,
@@ -387,6 +414,11 @@ class QwenImage21Pipeline(
         super().__init__()
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        # Model-level sampling grid from model_index.json (diffusers PR
+        # 14950): when the request carries no explicit sigmas, this grid
+        # drives the schedule and its length decides the step count.
+        sample_sigmas = od_config.extras.get("sample_sigmas")
+        self.sample_sigmas = [float(s) for s in sample_sigmas] if sample_sigmas else None
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -792,7 +824,6 @@ class QwenImage21Pipeline(
                 number of images that should be generated per prompt
         """
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        batch_size = len(prompt)
 
         prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(
             prompt,
@@ -801,13 +832,11 @@ class QwenImage21Pipeline(
             prompt_name=prompt_name,
         )
 
-        _, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-        prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
-        image_pad_mask = image_pad_mask.repeat(1, num_images_per_prompt)
-        image_pad_mask = image_pad_mask.view(batch_size * num_images_per_prompt, seq_len)
+        # Request-major expansion (A,A,B,B). ``repeat`` on the 2D masks would
+        # prepend a dimension and reshape to A,B,A,B — wrong pairing with embeds.
+        prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+        prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+        image_pad_mask = image_pad_mask.repeat_interleave(num_images_per_prompt, dim=0)
 
         return prompt_embeds, prompt_embeds_mask, image_pad_mask
 
@@ -908,7 +937,10 @@ class QwenImage21Pipeline(
         return latents, image_latents
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if sigmas is None:
+            sigmas = getattr(self, "sample_sigmas", None)
+        if sigmas is None:
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),
@@ -928,6 +960,18 @@ class QwenImage21Pipeline(
     @property
     def attention_kwargs(self):
         return self._attention_kwargs
+
+    @property
+    def default_num_inference_steps(self):
+        """Step count implied by the model-level sampling grid, when present.
+
+        The model runner falls back to this when the request carries neither
+        num_inference_steps, timesteps, nor sigmas.
+        """
+        sample_sigmas = getattr(self, "sample_sigmas", None)
+        if sample_sigmas is not None:
+            return len(sample_sigmas)
+        return None
 
     @property
     def num_timesteps(self):
@@ -1324,6 +1368,14 @@ class QwenImage21Pipeline(
             # Decode only reads the cache, so a batched view is enough and the
             # per-request caches stay untouched. Merge every stored part — FP8
             # cache entries carry per-request scale tensors alongside "key"/"value".
+            # Callers must pass a homogeneous baked-prefix-length group: denoise_step
+            # sub-batches by prefill_prompt_seq_len before assembling.
+            prefix_lens = {state.extra.get("prefill_prompt_seq_len") for state in states}
+            if len(prefix_lens) > 1:
+                raise ValueError(
+                    "Cannot merge decode KV for requests baked at different padded prompt "
+                    "lengths. denoise_step must sub-batch by prefill_prompt_seq_len first."
+                )
             num_blocks = len(caches[0])
             merged = []
             for block_idx in range(num_blocks):
@@ -1343,29 +1395,136 @@ class QwenImage21Pipeline(
         )
 
     @staticmethod
+    def _decode_group_key(state: "StepRequestState") -> tuple[Any, ...]:
+        """Group decode requests by the padded VLM length baked into their KV."""
+        return (
+            state.extra.get("prefill_prompt_seq_len"),
+            state.extra.get("prefill_negative_prompt_seq_len"),
+        )
+
+    @staticmethod
+    def _split_decode_groups(
+        states: list["StepRequestState"],
+    ) -> list[list["StepRequestState"]]:
+        """Split a decode batch into homogeneous baked-prefix-length groups.
+
+        Preserves first-seen group order and relative order within each group.
+        Callers stitch per-group noise preds back into the input request order.
+        """
+        groups: dict[tuple[Any, ...], list[StepRequestState]] = {}
+        order: list[tuple[Any, ...]] = []
+        for state in states:
+            key = QwenImage21Pipeline._decode_group_key(state)
+            if key not in groups:
+                order.append(key)
+                groups[key] = []
+            groups[key].append(state)
+        return [groups[key] for key in order]
+
+    @staticmethod
+    def _needs_decode_seq_len_split(states: list["StepRequestState"]) -> bool:
+        if len(states) <= 1:
+            return False
+        phases = {QwenImage21Pipeline._kv_cache_phase(state.extra.get("kv_cache")) for state in states}
+        if phases != {"decode"}:
+            return False
+        return len({QwenImage21Pipeline._decode_group_key(state) for state in states}) > 1
+
+    @staticmethod
     def _scatter_kv_cache(
         states: list["StepRequestState"],
         row_counts: list[int],
         kv_cache: list[dict],
     ) -> None:
-        """Split a batched prefill cache back into the per-request caches."""
+        """Split a batched prefill cache back into the per-request caches.
+
+        Clone (not ``.contiguous()``) so each request owns independent storage.
+        Dim-0 slices of a contiguous merged prefill tensor are already contiguous
+        views; keeping those views alive would pin the merged tensor and break
+        the ``owner_prefix is not cached_key`` identity check in step-mode
+        CUDA-graph decode (every decode would fall back to eager).
+        """
         start = 0
         for state, rows in zip(states, row_counts):
             cache = state.extra["kv_cache"]
             for block_idx, block_cache in enumerate(kv_cache):
                 for branch, parts in block_cache.items():
                     cache[block_idx][branch] = {
-                        part: tensor[start : start + rows].contiguous() for part, tensor in parts.items()
+                        part: tensor[start : start + rows].clone() for part, tensor in parts.items()
                     }
             start += rows
+
+    @staticmethod
+    def _resolve_prompt_seq_len(
+        states: list["StepRequestState"],
+        current_seq_len: int,
+        extra_key: str = "prefill_prompt_seq_len",
+    ) -> int:
+        """Prefer the padded VLM length baked into each request's KV at prefill."""
+        seq_len = current_seq_len
+        for state in states:
+            stored = state.extra.get(extra_key)
+            if stored is not None:
+                seq_len = max(seq_len, int(stored))
+        return seq_len
+
+    @staticmethod
+    def _pad_rows_to_seq_len(rows: list[torch.Tensor], seq_len: int) -> torch.Tensor:
+        padded = []
+        for row in rows:
+            if row.shape[1] < seq_len:
+                row = F.pad(row, (0, seq_len - row.shape[1]), value=False)
+            elif row.shape[1] > seq_len:
+                row = row[:, :seq_len]
+            padded.append(row)
+        return torch.cat(padded, dim=0)
 
     def denoise_step(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin."""
+        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
+
+        Decode batches that mix different baked ``prefill_prompt_seq_len`` values
+        (common when the mixed-phase gate forces separate prefills) are
+        sub-batched by that length so both requests keep running.
+        """
         del kwargs
+        if self.interrupt:
+            return None
+
+        t = input_batch.timesteps
+        self._current_timestep = t
+        self.transformer.do_true_cfg = input_batch.do_true_cfg
+
+        states = list(input_batch.states)
+        if not states:
+            raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+
+        if self._needs_decode_seq_len_split(states):
+            # Local import: InputBatch is only TYPE_CHECKING at module scope.
+            from vllm_omni.diffusion.worker.input_batch import InputBatch as _InputBatch
+
+            preds_by_id: dict[str, torch.Tensor] = {}
+            for group in self._split_decode_groups(states):
+                group_pred = self._denoise_step_homogeneous(_InputBatch.make_batch(group))
+                if group_pred is None:
+                    return None
+                offset = 0
+                for state in group:
+                    rows = state.latents.shape[0]
+                    preds_by_id[state.request_id] = group_pred[offset : offset + rows]
+                    offset += rows
+            return torch.cat([preds_by_id[state.request_id] for state in states], dim=0)
+
+        return self._denoise_step_homogeneous(input_batch)
+
+    def _denoise_step_homogeneous(
+        self,
+        input_batch: "InputBatch",
+    ) -> torch.Tensor | None:
+        """Run one denoise forward for a KV-compatible state group."""
         if self.interrupt:
             return None
 
@@ -1382,24 +1541,42 @@ class QwenImage21Pipeline(
 
         # Assemble the joint image-slot mask: right-pad each request's VLM mask
         # to the batch's padded prompt length, then append the target slots.
-        max_seq_len = input_batch.prompt_embeds.shape[1]
-        mask_rows = []
-        for state in states:
-            row = state.extra["image_pad_mask"]
-            if row.shape[1] < max_seq_len:
-                row = F.pad(row, (0, max_seq_len - row.shape[1]), value=False)
-            mask_rows.append(row)
-        img_mask = self._append_target_slots(torch.cat(mask_rows, dim=0), latents.shape[1])
+        # After a mixed-length prefill, each request's KV prefix stays at that
+        # prefill's padded length — keep using it even if later decode batches
+        # shrink (longest prompt finished) so mask / RoPE layout still match.
+        max_seq_len = self._resolve_prompt_seq_len(states, input_batch.prompt_embeds.shape[1])
+        img_mask = self._append_target_slots(
+            self._pad_rows_to_seq_len([state.extra["image_pad_mask"] for state in states], max_seq_len),
+            latents.shape[1],
+        )
+        prompt_embeds = input_batch.prompt_embeds
+        prompt_embeds_mask = input_batch.prompt_embeds_mask
+        if prompt_embeds is not None and prompt_embeds.shape[1] < max_seq_len:
+            pad = max_seq_len - prompt_embeds.shape[1]
+            prompt_embeds = F.pad(prompt_embeds, (0, 0, 0, pad), value=0.0)
+            if prompt_embeds_mask is not None:
+                prompt_embeds_mask = F.pad(prompt_embeds_mask, (0, pad), value=False)
         negative_img_mask = None
+        negative_prompt_embeds = input_batch.negative_prompt_embeds
+        negative_prompt_embeds_mask = input_batch.negative_prompt_embeds_mask
+        negative_seq_len = 0
         if input_batch.do_true_cfg:
-            negative_seq_len = input_batch.negative_prompt_embeds.shape[1]
-            neg_rows = []
-            for state in states:
-                row = state.extra["negative_image_pad_mask"]
-                if row.shape[1] < negative_seq_len:
-                    row = F.pad(row, (0, negative_seq_len - row.shape[1]), value=False)
-                neg_rows.append(row)
-            negative_img_mask = self._append_target_slots(torch.cat(neg_rows, dim=0), latents.shape[1])
+            negative_seq_len = self._resolve_prompt_seq_len(
+                states,
+                input_batch.negative_prompt_embeds.shape[1],
+                extra_key="prefill_negative_prompt_seq_len",
+            )
+            negative_img_mask = self._append_target_slots(
+                self._pad_rows_to_seq_len(
+                    [state.extra["negative_image_pad_mask"] for state in states], negative_seq_len
+                ),
+                latents.shape[1],
+            )
+            if negative_prompt_embeds is not None and negative_prompt_embeds.shape[1] < negative_seq_len:
+                pad = negative_seq_len - negative_prompt_embeds.shape[1]
+                negative_prompt_embeds = F.pad(negative_prompt_embeds, (0, 0, 0, pad), value=0.0)
+                if negative_prompt_embeds_mask is not None:
+                    negative_prompt_embeds_mask = F.pad(negative_prompt_embeds_mask, (0, pad), value=False)
 
         image_latents_list = [state.extra["image_latents"] for state in states]
         if all(image_latent is None for image_latent in image_latents_list):
@@ -1419,8 +1596,8 @@ class QwenImage21Pipeline(
         positive_kwargs = {
             "hidden_states": latent_model_input,
             "timestep": timestep / 1000,
-            "encoder_hidden_states_mask": input_batch.prompt_embeds_mask,
-            "encoder_hidden_states": input_batch.prompt_embeds,
+            "encoder_hidden_states_mask": prompt_embeds_mask,
+            "encoder_hidden_states": prompt_embeds,
             "img_shapes": input_batch.img_shapes,
             "img_mask": img_mask,
             "attention_kwargs": self.attention_kwargs,
@@ -1432,8 +1609,8 @@ class QwenImage21Pipeline(
             negative_kwargs = {
                 "hidden_states": latent_model_input,
                 "timestep": timestep / 1000,
-                "encoder_hidden_states_mask": input_batch.negative_prompt_embeds_mask,
-                "encoder_hidden_states": input_batch.negative_prompt_embeds,
+                "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                "encoder_hidden_states": negative_prompt_embeds,
                 "img_shapes": input_batch.img_shapes,
                 "img_mask": negative_img_mask,
                 "attention_kwargs": self.attention_kwargs,
@@ -1454,6 +1631,12 @@ class QwenImage21Pipeline(
         )
 
         if take_ownership:
+            # Remember the padded VLM length baked into the per-request KV so a
+            # later smaller decode batch can rebuild matching masks.
+            for state in states:
+                state.extra["prefill_prompt_seq_len"] = max_seq_len
+                if input_batch.do_true_cfg:
+                    state.extra["prefill_negative_prompt_seq_len"] = negative_seq_len
             self._scatter_kv_cache(states, row_counts, kv_cache)
 
         return noise_pred

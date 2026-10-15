@@ -48,24 +48,94 @@ def _methods() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
     }
 
 
-def _guarded_component(item: ast.withitem) -> str | None:
-    """``with self._component_on_device(self.audio_vae)`` -> ``"audio_vae"``."""
-    call = item.context_expr
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+# Staged components are staged at *half* granularity in the two places that
+# matter: image encoding runs inside `_component_on_device(self.video_vae
+# .encoder_component)` and decoding inside `...decoder_component`, because only one
+# half is needed at a time and the comment at each site says so. A call on the
+# parent is therefore covered by a guard on either half. That mapping is coarse --
+# it would not catch a decoder-half call sitting inside an encoder-half guard --
+# but the alternative is modelling which method touches which half, and the two
+# call sites this rule exists for are both on the correct half today.
+_STAGED_SUBCOMPONENTS = ("encoder_component", "decoder_component")
+
+# Methods that answer from configuration or from the argument's own shape, never
+# from device tensors, so they are safe to call while the component is parked on the
+# host. Listed explicitly with what each one reads, because "does it touch a
+# parameter?" is not decidable from the syntax:
+#   * `is_distributed_enabled` -> `self.parallel_size` and `dist.is_initialized()`.
+#   * `predict_video_latent_shape` -> `self.model.processor` (a CPU-side shape
+#     calculator) and the numpy array's dimensions.
+# Anything absent from this tuple is assumed to touch parameters, which is the safe
+# default: widening it is a deliberate edit here, not a silent one.
+DEVICE_FREE_QUERIES = ("is_distributed_enabled", "predict_video_latent_shape")
+
+
+def _guarded_component(item: ast.withitem, hoisted: dict[str, str]) -> str | None:
+    """``with self._component_on_device(self.audio_vae)`` -> ``"audio_vae"``.
+
+    Also resolves the hoisted form, where the guard is built into a variable first
+    (``ctx = self._component_on_device(...) if needs else nullcontext()``) and the
+    `with` names that variable.
+    """
+    context = item.context_expr
+    if isinstance(context, ast.Name):
+        return hoisted.get(context.id)
+    if not isinstance(context, ast.Call) or not isinstance(context.func, ast.Attribute):
         return None
-    if call.func.attr != GUARD or not call.args:
+    if context.func.attr != GUARD or not context.args:
         return None
-    arg = call.args[0]
-    return arg.attr if isinstance(arg, ast.Attribute) else None
+    arg = context.args[0]
+    if not isinstance(arg, ast.Attribute):
+        return None
+    if arg.attr in STAGED:
+        return arg.attr
+    inner = arg.value
+    if isinstance(inner, ast.Attribute) and inner.attr in STAGED and arg.attr in _STAGED_SUBCOMPONENTS:
+        return inner.attr
+    return None
+
+
+def _hoisted_guards(function: ast.AST) -> dict[str, str]:
+    """``ctx = self._component_on_device(self.video_vae.encoder_component)`` -> {"ctx": "video_vae"}.
+
+    The right-hand side may be a conditional expression or any other expression, so
+    this looks for the guard call anywhere inside it.
+    """
+    hoisted: dict[str, str] = {}
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        for inner in ast.walk(node.value):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == GUARD
+                and inner.args
+                and isinstance(inner.args[0], ast.Attribute)
+            ):
+                arg = inner.args[0]
+                if arg.attr in STAGED:
+                    hoisted[target.id] = arg.attr
+                elif (
+                    isinstance(arg.value, ast.Attribute)
+                    and arg.value.attr in STAGED
+                    and arg.attr in _STAGED_SUBCOMPONENTS
+                ):
+                    hoisted[target.id] = arg.value.attr
+    return hoisted
 
 
 def _unguarded_calls(function: ast.AST) -> list[tuple[str, int]]:
     """Calls on a staged component that no enclosing ``with`` in this function covers."""
+    hoisted = _hoisted_guards(function)
 
     def walk(node: ast.AST, active: frozenset[str]) -> list[tuple[str, int]]:
         found: list[tuple[str, int]] = []
         if isinstance(node, ast.With | ast.AsyncWith):
-            entering = {name for item in node.items if (name := _guarded_component(item))}
+            entering = {name for item in node.items if (name := _guarded_component(item, hoisted))}
             inner = active | entering
             for statement in node.body:
                 found += walk(statement, frozenset(inner))
@@ -80,6 +150,7 @@ def _unguarded_calls(function: ast.AST) -> list[tuple[str, int]]:
             and value.value.id == "self"
             and value.attr in STAGED
             and value.attr not in active
+            and node.func.attr not in DEVICE_FREE_QUERIES
         ):
             found.append((value.attr, node.lineno))
         for child in ast.iter_child_nodes(node):
@@ -114,12 +185,13 @@ def test_every_resident_body_has_a_guarded_wrapper() -> None:
             continue
         wrapper = methods.get(name[: -len(RESIDENT)])
         assert wrapper is not None, f"{name} assumes a resident component but has no wrapper"
+        wrapper_hoisted = _hoisted_guards(wrapper)
         opened = {
             component
             for node in ast.walk(wrapper)
             if isinstance(node, ast.With | ast.AsyncWith)
             for item in node.items
-            if (component := _guarded_component(item))
+            if (component := _guarded_component(item, wrapper_hoisted))
         }
         calls_it = any(
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == name

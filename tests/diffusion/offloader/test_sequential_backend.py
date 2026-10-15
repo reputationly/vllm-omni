@@ -309,12 +309,16 @@ def test_persistent_dit_staging_reuses_fixed_device_storage(accelerator_device) 
     first_ptr = dit.linear.weight.data_ptr()
     assert dit.linear.weight.device == accelerator_device
     torch.testing.assert_close(dit.linear.weight.data, original_weight)
+    retained_storage = dit_hook._stager._device_storages[0]
+    retained_ptr = retained_storage.data_ptr()
 
-    # Offload via a *different* module's hook (the cross-module swap path),
-    # then reload: the same fixed device storage must be reused so that
-    # CUDA-graph-captured weight pointers stay valid.
+    # Offload via a *different* module's hook (the cross-module swap path).
+    # The module parameters move back to the CPU master, but the fixed device
+    # storage stays allocated so CUDA-graph-captured weight pointers stay valid.
     encoder_hook._to_cpu(dit)
     assert dit.linear.weight.device.type == "cpu"
+    assert dit_hook._stager._device_storages
+    assert dit_hook._stager._device_storages[0].data_ptr() == retained_ptr
     dit_hook._to_gpu(dit)
     assert dit.linear.weight.data_ptr() == first_ptr
     torch.testing.assert_close(dit.linear.weight.data, original_weight)
@@ -325,6 +329,58 @@ def test_persistent_dit_staging_reuses_fixed_device_storage(accelerator_device) 
     assert dit.linear.weight.data_ptr() == first_ptr
 
     remove_sequential_offload([dit, encoder])
+
+
+def test_default_sequential_offload_releases_device_storage(accelerator_device) -> None:
+    """Without persistent staging, offloading keeps plain move semantics."""
+    dit = _create_simple_module().to(accelerator_device)
+    encoder = _create_simple_module().to(accelerator_device)
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[encoder],
+        device=accelerator_device,
+        pin_memory=False,
+    )
+
+    dit_hook = dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert dit_hook._stager is None  # no retained staging: GPU storage is freed on offload
+
+    dit_hook._to_gpu(dit)
+    assert dit.linear.weight.device == accelerator_device
+    dit_hook._to_cpu(dit)
+    assert dit.linear.weight.device.type == "cpu"
+    assert all(parameter.device.type == "cpu" for parameter in dit.parameters())
+
+    remove_sequential_offload([dit, encoder])
+
+
+@pytest.mark.parametrize("decode_graphs", [True, False])
+def test_model_level_persistent_staging_retained_on_every_cuda_device(accelerator_device, decode_graphs: bool) -> None:
+    """Model-level staging is retained on every CUDA device, not only decode-graph models.
+
+    DELIBERATE DEVIATION from upstream. Upstream gates retention on
+    ``enable_cuda_graph_decode`` (``self.device.type == "cuda" and any(...)``);
+    ours is the superset ``self.device.type == "cuda"``, decided in the sync
+    manual §5.4 (acceptance：H3 TP4 连续请求时的主机 RSS). So the parametrization
+    here is over ``decode_graphs`` with the expectation independent of it — on a
+    CUDA device the stager is always present, on a non-CUDA device never.
+    """
+    pipeline = nn.Module()
+    pipeline.transformer = _create_simple_module()
+    if decode_graphs:
+        pipeline.transformer.enable_cuda_graph_decode = True
+    pipeline.text_encoder = _create_simple_module()
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False),
+        accelerator_device,
+    )
+    backend.enable(pipeline)
+
+    hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert (hook._stager is not None) is (accelerator_device.type == "cuda")
+
+    backend.disable()
 
 
 def test_sequential_offload_can_begin_with_dit_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,7 +27,6 @@ _PIPELINE_EXPORTS = ("MiniMaxH3Pipeline", "get_minimax_h3_post_process_func")
 __all__ = [
     "MiniMaxH3Pipeline",
     "get_minimax_h3_post_process_func",
-    "reference_video",
 ]
 
 

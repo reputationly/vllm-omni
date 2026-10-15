@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 checkpoint resolution for the AR text-encoder stage."""
 
+import json
 from pathlib import Path
 
 from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
@@ -50,11 +51,43 @@ def resolve_minimax_h3_partition(
             f"MiniMax-H3 task_type must be one of auto, combined, t2va, fl2va, or ref2va; got {task_type!r}"
         )
     path = Path(model)
-    if task == "auto" and path.is_dir() and path.name in {"FL2VA", "Ref2VA"}:
-        return path.name.lower()
+    if task == "auto" and path.is_dir():
+        # Metadata first, then the directory name. A released partition carries
+        # `model_index.json` with `_minimax_h3.partition`; `FL2VA`/`Ref2VA` is only
+        # the conventional spelling, and repackaged artifacts
+        # (`MiniMax-H3-FL2VA-INT8` and friends) are the common case in this repo's
+        # own deploy configs. This matches `_local_minimax_h3_partition` in the
+        # pipeline, whose docstring already says "from its release metadata, not
+        # its directory name" -- while the two disagreed, a directory the pipeline
+        # recognized resolved to `combined` here, and `combined` then made
+        # `_resolve_minimax_h3_partition_path` skip its "use this directory
+        # directly" branch and look for a `FL2VA/` subdirectory that is not there.
+        partition = _local_partition_from_release_metadata(path)
+        if partition is not None:
+            return partition
+        if path.name in {"FL2VA", "Ref2VA"}:
+            return path.name.lower()
     if task in {"auto", "combined"}:
         return auto_partition
     return "ref2va" if task == "ref2va" else "fl2va"
+
+
+def _local_partition_from_release_metadata(path: Path) -> str | None:
+    """Read ``_minimax_h3.partition`` from a local partition's ``model_index.json``.
+
+    Deliberately a plain file read rather than an HF index lookup: this runs while
+    resolving a deployment's startup layout, and ``path.is_dir()`` already
+    established that there is nothing to fetch.
+    """
+    index_path = path / "model_index.json"
+    if not index_path.is_file():
+        return None
+    try:
+        model_index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    partition = str((model_index.get("_minimax_h3") or {}).get("partition", "")).lower()
+    return partition if partition in {"fl2va", "ref2va"} else None
 
 
 def resolve_minimax_h3_encoder_model_root(

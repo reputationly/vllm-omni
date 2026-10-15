@@ -79,6 +79,19 @@ def _attribute_reads(sources: list[Path]) -> set[str]:
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute):
                 names.add(node.attr)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("getattr", "hasattr")
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                # ``getattr(strategy, "reference_audio_target_truncation", False)``
+                # is a real read; the name lives in a string constant, so the
+                # Attribute branch above never sees it. Missing this made the
+                # test report a wired field as dead (encoder_processing.py).
+                names.add(node.args[1].value)
             elif isinstance(node, ast.keyword) and node.arg:
                 # ``prepare_reference_videos_official(truncate_to_target=...)``
                 # reads the field on the right-hand side; that read is already

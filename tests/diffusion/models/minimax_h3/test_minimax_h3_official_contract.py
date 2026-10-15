@@ -56,9 +56,23 @@ def test_output_canvas_matches_official(oracle):
         )
 
 
-def test_reference_video_canvas_matches_official(oracle):
-    """A video reference follows the same canvas rule as the target."""
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import _reference_video_shape
+@pytest.mark.parametrize("no_upscale", [False, True])
+def test_reference_video_canvas_matches_official(oracle, monkeypatch, no_upscale):
+    """A video reference follows the same canvas rule as the target.
+
+    Run under both states of ``VLLM_OMNI_H3_REF_VIDEO_NO_UPSCALE`` (sync manual
+    §5.0 P2). The fixture's screened cases are all at or above the canvas, so the
+    official canvas must be reproduced either way.
+    """
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+        MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV,
+        _reference_video_shape,
+    )
+
+    if no_upscale:
+        monkeypatch.setenv(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, "1")
+    else:
+        monkeypatch.delenv(MINIMAX_H3_REFERENCE_VIDEO_NO_UPSCALE_ENV, raising=False)
 
     for case in oracle["canvas"]:
         source_w, source_h = case["aspect_width"], case["aspect_height"]

@@ -52,9 +52,6 @@ if not HAS_FLASH_ATTN:
 weight_norm = torch.nn.utils.parametrizations.weight_norm
 
 
-CODEC_NORM_EPS = 1e-2
-
-
 @dataclass
 class AudioTokenizerArgs:
     # audio setting

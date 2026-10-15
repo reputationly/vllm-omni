@@ -55,7 +55,7 @@ class DistributedAutoencoderKLQwenImage21(AutoencoderKLQwenImage21, DistributedV
 
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         for i in range(0, height, tile_latent_stride_height):
             for j in range(0, width, tile_latent_stride_width):
                 time_list = []

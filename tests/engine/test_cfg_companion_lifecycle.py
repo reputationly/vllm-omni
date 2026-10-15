@@ -94,6 +94,9 @@ class _FakePool:
     def release_bindings(self, request_ids):
         pass
 
+    def schedule_release_request_resources(self, request_ids):
+        pass
+
 
 def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     orch = Orchestrator.__new__(Orchestrator)
