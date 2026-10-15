@@ -8,7 +8,6 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torchaudio
-from huggingface_hub import snapshot_download
 from omegaconf import DictConfig, OmegaConf
 from vllm.logger import init_logger
 
@@ -185,7 +184,13 @@ def resolve_preprocess_weights_root(od_config: OmniDiffusionConfig) -> Path:
         "SoulX preprocess weights not found locally; downloading %s",
         _PREPROCESS_WEIGHTS_REPO,
     )
-    downloaded = snapshot_download(
+    # Via `hf_api()` rather than `huggingface_hub.snapshot_download` directly: the helper
+    # tags every request with vLLM-Omni's library info, which `tools/pre_commit/
+    # check_forbidden_imports.py` enforces for the whole tree. Imported here rather than at
+    # module scope to match the other call sites (`benchmarks/data_modules/*`).
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    downloaded = hf_api().snapshot_download(
         _PREPROCESS_WEIGHTS_REPO,
         allow_patterns=["*"],
         local_dir=local_dir,
