@@ -130,6 +130,11 @@ repos:
       args: [tools/pre_commit/shellcheck.sh]
       language: system
       types: [shell]
+      # Archived field scripts from the H3 first-request audio investigation
+      # (docs/实验报告/MiniMax-H3-音频首请求偏差-排查记录.md). Kept byte-identical to the
+      # versions that produced the numbers in that write-up, so lint them if they are ever
+      # revived -- not before, or the archive stops matching the record.
+      exclude: ^docs/实验报告/附件/h3-audio-first-request/
 
     - id: check-spdx-header
       name: Check SPDX headers

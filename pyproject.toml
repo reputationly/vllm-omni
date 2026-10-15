@@ -260,6 +260,11 @@ ignore = [
 # Kandinsky 6 keeps native/BigVGAN names (T/H/W, `l`) and NVIDIA vocoder
 # docstring length so the port stays diffable against the source modules.
 "vllm_omni/diffusion/models/kandinsky6/kandinsky6_transformer.py" = ["N803", "E741"]
+# Archived field probes from the MiniMax-H3 first-request audio investigation
+# (docs/实验报告/MiniMax-H3-音频首请求偏差-排查记录.md). They are kept EXACTLY as they
+# ran, because the record is only useful if the scripts match the numbers in it;
+# normalising them would quietly rewrite the evidence. Not imported by anything.
+"docs/实验报告/附件/h3-audio-first-request/**" = ["UP031", "I001", "F401", "E402", "E401", "F841"]
 "vllm_omni/diffusion/models/kandinsky6/pipeline_kandinsky6.py" = ["N803"]
 "vllm_omni/diffusion/models/kandinsky6/modeling_kandinsky6_audio.py" = ["E501", "E741", "N803", "UP008"]
 
