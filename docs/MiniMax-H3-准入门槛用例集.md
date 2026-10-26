@@ -26,24 +26,67 @@ H3 是**音视频联合生成**模型，不是图像模型。因此"文生图"�
 
 ---
 
-## 2. 用例清单（28 条：11 条基础 + 5 条技术分解 + 8 条能力声明 + 4 条风格对照）
+## 2. 用例清单（29 条）
+
+分四组：**基础 11 条**（任务类型 × 提示词类型，守住通用能力）、**技术分解 5 条**（压 Singularity 的四层优化）、**能力声明 9 条**（逐条对应官方宣称）、**风格对照 4 条**（同一画面换风格）。
+
+所有用例文件在 `docs/h3-gate-cases/`，索引在 `manifest.json`。
+
+### 2.1 基础（g1–g11，11 条）
 
 | ID | 任务 | 时长 | seed | 输入 | 主要考点 |
 | --- | --- | ---: | --- | --- | --- |
 | `g1_t2va_crowd_motion` | t2va | 5 s | 42,43 | 文本 | 人群/暗光/运动 + 中文吆喝口型 + 招牌文字 |
-| `g2_i2va_first_frame` | fl2va | 5 s | 42 | 首帧 | 首帧严格对齐、推镜下身份稳定、画外问答 |
-| `g3_l2va_last_frame` | fl2va | 5 s | 42 | 尾帧 | 两镜倒推、精确收束到尾帧 |
-| `g4_fl2va_first_last` | fl2va | 5 s | 42 | 首+尾帧 | 两端精确、中间连续、并行跟拍 |
-| `g5_ref2va_image` | ref2va | 5 s | 42 | 参考图 | 身份保持 + 新生成画面文字 + 台词 |
-| `g6_ref2va_video` | ref2va | 5 s | 42 | 参考视频 | 运镜/色调继承、无缝接续 |
-| **`g7_t2va_15s_text_long`** | t2va | **15 s** | 42,43 | 文本 | 长片不漂移 + 屏幕文字 + 三镜 + 广播 |
-| **`g8_t2va_15s_dialogue_music`** | t2va | **15 s** | 42,43 | 文本 | 双人轮流对话口型 + 三层声音（对白/音效/配乐）+ 黑板文字 |
-| **`g9_fl2va_15s_keyframes`** | fl2va | **15 s** | 42 | 首+尾帧 | 15 秒两端锚定 + 三镜 + 一句台词 |
-| **`g10_t2va_15s_action_vfx`** | t2va | **15 s** | 42,43 | 文本 | 高速运动形变 + 慢动作细节 + 复杂音效同步 |
-| **`g11_ref2va_15s_video_continue`** | ref2va | **15 s** | 42 | 参考视频 | 长时程继承运镜 + 跨房间连续性 + 台词 |
+| `g2_i2va_first_frame` | i2v | 5 s | 42 | 图 | 首帧严格对齐、推镜下身份稳定、画外问答 |
+| `g3_l2va_last_frame` | l2va | 5 s | 42 | 尾帧 | 两镜倒推、精确收束到尾帧 |
+| `g4_fl2va_first_last` | flf2v | 5 s | 42 | 图 | 两端精确、中间连续、并行跟拍 |
+| `g5_ref2va_image` | ref2va | 5 s | 42 | 图 | 身份保持 + 新生成画面文字 + 台词 |
+| `g6_ref2va_video` | ref2va | 5 s | 42 | 视频 | 运镜/色调继承、无缝接续 |
+| `g7_t2va_15s_text_long` | t2va | 15 s | 42,43 | 文本 | 长片不漂移 + 屏幕文字 + 三镜 + 广播 |
+| `g8_t2va_15s_dialogue_music` | t2va | 15 s | 42,43 | 文本 | 双人轮流对话口型 + 三层声音 + 黑板文字 |
+| `g9_fl2va_15s_keyframes` | flf2v | 15 s | 42 | 图 | 15 秒两端锚定 + 三镜 + 一句台词 |
+| `g10_t2va_15s_action_vfx` | t2va | 15 s | 42,43 | 文本 | 高速运动形变 + 慢动作细节 + 复杂音效同步 |
+| `g11_ref2va_15s_video_continue` | ref2va | 15 s | 42 | 视频 | 长时程继承运镜 + 跨房间连续性 + 台词 |
 
-固定参数：`width=1344, height=768, fps=24, num_inference_steps=4, extra_params.flow_shift=6, audio_flow_shift=3`。
-改权重若步数契约变化，同步改 `num_inference_steps` 并在报告里注明。
+### 2.2 技术分解（s1–s5，5 条）
+
+| ID | 任务 | 时长 | seed | 输入 | 主要考点 |
+| --- | --- | ---: | --- | --- | --- |
+| `s1_quant_gradient_sky` | t2va | 5 s | 42,43 | 文本 | INT8 量化色带 / AdaLN 块间色差（大面积平滑渐变） |
+| `s2_prune_face_texture` | t2va | 5 s | 42 | 文本 | 剪枝 r8 高频细节（毛孔、胡茬、织物织纹） |
+| `s3_vdn_wide_pan_distant` | t2va | 15 s | 42,43 | 文本 | VDN 窗口注意力长程（15s 慢摇远景小目标不丢） |
+| `s4_quant_dark_small_text` | t2va | 5 s | 42 | 文本 | INT8 暗部噪点 + 小字号文字可读 |
+| `s5_quant_thin_lines_backlit` | t2va | 5 s | 42 | 文本 | INT8 高频边缘（细线不断裂、不振铃） |
+
+### 2.3 能力声明（s6–s13、s15，9 条）
+
+| ID | 任务 | 时长 | seed | 输入 | 对应官方声明 |
+| --- | --- | ---: | --- | --- | --- |
+| `s6_hdr_motion_blur` | t2va | 5 s | 42,43 | 文本 | HDR 画质与模糊抑制 |
+| `s7_distant_face_repair` | t2va | 5 s | 42 | 文本 | 远景人脸修复 |
+| `s8_natural_material` | t2va | 5 s | 42 | 文本 | 干净自然的视觉美感（反塑料感） |
+| `s9_action_impact` | t2va | 15 s | 42,43 | 文本 | 增强动态表现力（动作轨迹与打击感） |
+| `s10_vfx_fantasy` | t2va | 5 s | 42 | 文本 | 特效与奇幻元素（粒子个体性） |
+| `s11_micro_expression` | t2va | 5 s | 42 | 文本 | 生动面部表情（微表情） |
+| `s12_camera_control` | t2va | 5 s | 42 | 文本 | 摄影运镜与控制（下摇→前推→右摇） |
+| `s13_prompt_adherence` | t2va | 5 s | 42 | 文本 | V2 提示词控制力（数量/位置/颜色/文字） |
+| `s15_audio_reference` | ref2va | 5 s | 42 | 图,音频 | V2 音频参考条件修正（音色跟随参考音频） |
+
+### 2.4 风格对照（s14a–s14d，4 条）
+
+| ID | 任务 | 时长 | seed | 输入 | 说明 |
+| --- | --- | ---: | --- | --- | --- |
+| `s14a_style_photoreal` | t2va | 5 s | 42 | 文本 | 风格对照：照片级写实 |
+| `s14b_style_east_asian` | t2va | 5 s | 42 | 文本 | 风格对照：东亚写实 |
+| `s14c_style_3dcg` | t2va | 5 s | 42 | 文本 | 风格对照：3D CG |
+| `s14d_style_cinematic_cg` | t2va | 5 s | 42 | 文本 | 风格对照：电影级 CG |
+
+### 2.5 固定参数
+
+`width=1344, height=756`（必须落在 21:9/16:9/4:3/1:1/3:4/9:16 之一）、`fps=24`、
+`num_inference_steps=8`、`extra_params.flow_shift=12`、`audio_flow_shift=3`——即**现网已部署的采样契约**。
+自建 4 步 turbo 上跑需改 `num_inference_steps` 并加 `--send-tuning`，否则测的不是同一套契约。
+
 
 ### 中英双语约定
 
@@ -60,11 +103,13 @@ H3 是**音视频联合生成**模型，不是图像模型。因此"文生图"�
 
 | 文件 | 用途 | 要求 |
 | --- | --- | --- |
-| `first_frame.png` / `last_frame.png` | g2 / g3 | 1344×768，主体清晰、光照中性 |
+| `first_frame.png` / `last_frame.png` | g2 / g3 | 1344×756，主体清晰、光照中性 |
 | `first_frame_cycle.png` / `last_frame_cycle.png` | g4 | 同一场景的两端，护栏线与海平线要对得上 |
 | `g9_first.png` / `g9_last.png` | g9 | 站台与车厢座位两端，需能连成同一趟车 |
 | `ref_person.png` | g5 | 单人三分之四角度，五官清晰 |
-| `ref_clip.mp4` | g6 / g11 | 3–5 s、24 fps、有明确运镜，结尾需可被"接续" |
+| `ref_person_male.png` | s15 | 男性肖像，**提示词性别必须与之相符** |
+| `ref_clip.mp4` | g6 / g11 | 3–5 s、24 fps、有明确运镜，结尾需可被接续 |
+| `ref_voice.wav` | s15 | 参考音色，建议用与台词同文的 TTS 样本 |
 
 素材换了等于换了考题，跨版本对比即失效。
 
