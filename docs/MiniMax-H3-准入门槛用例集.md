@@ -1352,3 +1352,47 @@ docker run -d --name h3-v2-fixbias-int8 --gpus all --network host --ipc host \
 两者 AdaLN 权重相对差 ≈ **1.03**，基本互不相关——所以这次对照是"官方剪枝 vs 自家剪枝+VDN"，
 不是"剪枝 vs 未剪枝"。真正未剪枝的是 `MiniMax-H3-Singularity-v2-VDN-INT8`（44 G，
 `_singularity_pruned: false`，无 adaln_rank）。
+
+### 14.10 BF16 + VDN（不剪枝、不量化）的资源与耗时实测
+
+既想排除量化又想排除剪枝，就只剩官方 BF16 底座 + VDN 烘焙。这一档**能跑**，但只限于原生分辨率。
+
+**制品**：`/nfs-models/wuhanjisuan894/models/MiniMax-H3-Singularity-v2-VDN`
+（62 GB，BF16，17 个分片，`_singularity_pruned: false`，无 `adaln_rank`、无量化配置）
+
+**部署**：`deploy-configs/minimax_h3_singularity_vdn8_fl2va_a100_40g.yaml` + **不加载 LoRA**
+（曲线 LoRA 只适用于剪枝版，未剪枝 abaseline 没有对应适配器），其余环境变量与现网一致。
+
+| 指标 | 实测 |
+| --- | --- |
+| 加载耗时（容器起 → Application startup complete） | **796 s（13 分 16 秒）** |
+| 权重常驻（4 卡） | 加载后 API 就绪时仅 543 MiB/卡，**首次请求才真正进显存** |
+| 5 s 成片墙钟（6 条均值） | **84–86 s** |
+| 峰值显存 | **19.23 GiB/卡**（4 卡一致） |
+| 峰值主机内存 | **184 GiB** |
+| 18 步之外的额外开销 | 无；8 步，`flow_shift=12` |
+
+**与 INT8 剪枝两档对比（同样 6 条用例）**
+
+| 组 | 权重 | 5 s 墙钟 | 峰值显存/卡 |
+| --- | ---: | ---: | ---: |
+| v1 INT8 剪枝（官方 lineage） | 21 GB | 98–102 s | 19.4 GiB |
+| v2 INT8 剪枝（fixbias） | 21 GB | 100–103 s | 19.4 GiB |
+| **BF16 未剪枝 + VDN** | 62 GB | **84–86 s** | **19.23 GiB** |
+
+两点反直觉但可解释：
+
+1. **显存几乎相同**：INT8 是 `weight_only` 序列化检查点，运行时反量化为 BF16，
+   所以两者显存占用接近；BF16 反而略低一点。
+2. **BF16 更快**（84 s vs 100 s）：省掉了每次前向的反量化开销。
+
+**唯一的硬约束：`VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE=1080` 会 OOM。**
+同一条用例在 1080 短边下报 `Cuda failure 2 'out of memory'`（4 s 内失败），
+去掉该变量按原生 756 跑则正常。也就是说这一档**只能在 768P 档使用**。
+
+> 更正记录：我先前把一次 1080 档的 OOM 误判为"756 也 OOM"，据此得出"BF16 跑不起来"的结论，
+> 是错的。实际重启（去掉 1080）后一直可跑，6 条 5 s 用例全部完成，
+> 上面的数字是重测后的结果。
+
+画面（对照 `runs/compare3_sheet.png`）：BF16 档的皮肤纹理、逆光细线、招牌文字都不弱于 INT8 两档，
+`s1` 的明暗跨度反而更接近提示词要求。
