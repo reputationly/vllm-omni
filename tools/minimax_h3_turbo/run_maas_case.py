@@ -25,7 +25,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODEL = {"t2va": "minimax-h3-fl2va", "ref2va": "minimax-h3-ref2va"}
+DEFAULT_MODEL = {
+    "t2va": "minimax-h3-fl2va",
+    "i2v": "minimax-h3-fl2va",
+    "l2va": "minimax-h3-fl2va",
+    "flf2v": "minimax-h3-fl2va",
+    "ref2va": "minimax-h3-ref2va",
+}
 
 
 def http_json(url: str, *, body: dict[str, Any] | None = None, key: str, timeout: float = 60) -> dict[str, Any]:
@@ -76,25 +82,45 @@ def build_body(case: dict[str, Any], model: str, *, send_tuning: bool = False) -
                 body[key] = case[key]
 
     metadata: dict[str, Any] = {}
-    if case.get("image_path"):
-        metadata["src_ref_images"] = [as_media(p.strip()) for p in case["image_path"].split(",") if p.strip()]
-    if case.get("last_frame_path"):
-        metadata["src_ref_images"] = [as_media(case["last_frame_path"])]
-    if case.get("video_path"):
-        metadata["reference_videos"] = [as_media(p.strip()) for p in case["video_path"].split(",") if p.strip()]
-    if case.get("audio_path"):
-        # Field name mirrors src_ref_images / reference_videos; the engine-side
-        # support lives in minimax_h3/reference_audio.py.
-        metadata["reference_audios"] = [as_media(p.strip()) for p in case["audio_path"].split(",") if p.strip()]
+
+    # Keyframe modes are selected by metadata.task_type and, for flf2v, by an ordered
+    # ``images`` list. A single ``image`` is the i2v first frame or the l2va last frame.
+    # Everything else (reference image/video/audio) goes through the ref2va-style keys.
+    keyframe = task in ("i2v", "l2va", "flf2v")
+    if keyframe:
+        metadata["task_type"] = task
+        first = [p.strip() for p in (case.get("image_path") or "").split(",") if p.strip()]
+        last = [case["last_frame_path"]] if case.get("last_frame_path") else []
+        if task == "flf2v":
+            # Two accepted spellings: image_path (first) + last_frame_path, or a
+            # comma-joined image_path holding both frames in order.
+            if not last and len(first) == 2:
+                first, last = [first[0]], [first[1]]
+            if not (first and last):
+                raise SystemExit("flf2v needs both a first and a last frame (image_path + last_frame_path)")
+            body["images"] = [as_media(first[0]), as_media(last[0])]
+        elif task == "i2v":
+            if not first:
+                raise SystemExit("i2v needs image_path")
+            body["image"] = as_media(first[0])
+        else:  # l2va
+            if not last:
+                raise SystemExit("l2va needs last_frame_path")
+            body["image"] = as_media(last[0])
+    else:
+        if case.get("image_path"):
+            metadata["src_ref_images"] = [as_media(p.strip()) for p in case["image_path"].split(",") if p.strip()]
+        if case.get("last_frame_path"):
+            metadata["src_ref_images"] = [as_media(case["last_frame_path"])]
+        if case.get("video_path"):
+            metadata["reference_videos"] = [as_media(p.strip()) for p in case["video_path"].split(",") if p.strip()]
+        if case.get("audio_path"):
+            # Field name mirrors src_ref_images / reference_videos; the engine-side
+            # support lives in minimax_h3/reference_audio.py.
+            metadata["reference_audios"] = [as_media(p.strip()) for p in case["audio_path"].split(",") if p.strip()]
     if metadata:
         body["metadata"] = metadata
 
-    expected = "ref2va" if task == "ref2va" else "t2va"
-    if expected == "t2va" and any(k in metadata for k in ("src_ref_images", "reference_videos", "reference_audios")):
-        raise SystemExit(
-            "this case carries media but the gateway serves minimax-h3-fl2va as task type t2v; "
-            "keyframe modes (i2v/l2va/flf2v) are not exposed — see the suite doc §2.1"
-        )
     return body
 
 
