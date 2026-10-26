@@ -752,3 +752,513 @@ N1 的频谱明显更贴近参考（738 vs 846 Hz），N2 相差很远（300 Hz�
 
 > 这几条的视频已替换到 `singularity_demos/` 对应链接，之前基于旧提示词的结果保留在原目录
 > `20261026-prod-v2/`，不再作为该用例的当前基线。
+
+---
+
+## 13. 附录：29 条用例的英文提示词（逐字）
+
+以下为**实际下发**给模型的英文 `prompt`（中文旁注在各自 JSON 的 `_prompt_zh` 里，不会下发）。
+每条前面标注任务类型、时长与 seed；提示词正文与 `docs/h3-gate-cases/*.json` 完全一致。
+
+### g1_t2va_crowd_motion
+- 任务 `t2va`，时长 `5 s`，seed `42,43`
+- 音频期望：`loud`
+
+```text
+integrated_multimodal_description: [Shot 1] Handheld medium tracking shot inside a crowded night market alley, wet asphalt mirroring saturated red and green signboards. A courier in a dark rain jacket walks away from camera at a steady pace, weaving between stalls. Steam rises from a griddle at frame left, where a vendor (S1) in a blue apron flips skewers and calls out over her shoulder: <d>[Chinese] 牛杂汤好啦，趁热吃！</d> Three pedestrians cross from right to left. The camera follows one metre behind the courier at shoulder height with a slight vertical bob, keeping him sharp while the foreground crowd blurs. At 00:02.000 he glances right at a lit sign reading "永康牛肉麵" in red characters, then keeps walking.
+
+overall_soundscape: Dense crowd murmur, sizzling oil, a metal ladle striking a wok, footsteps on wet pavement, a distant scooter engine.
+
+non_diegetic_music: N/A
+```
+
+### g2_i2va_first_frame
+- 任务 `i2v`，时长 `5 s`，seed `42`，输入 `image_path`
+- 音频期望：`loud`
+
+```text
+Picture 1 aligns to Shot 1 at 0.00 seconds and must match exactly.
+
+integrated_multimodal_description: [Shot 1] Starting from <Picture 1>, the seated woman keeps the same identity, cream linen shirt, loose hair and window lighting. She lifts a ceramic cup toward her mouth, pauses as steam crosses her face, then sets it down and asks someone off-screen: <d>[Chinese] 外面还在下雨吗？</d> Her lips move only on that line; the listener stays out of frame. The camera pushes in slowly from a medium shot to a close-up over the full five seconds, ending at 00:05.00 on her eyes. The blurred bookshelf background stays put.
+
+overall_soundscape: Quiet room tone, ceramic meeting wood, rain against glass, a soft exhale.
+
+non_diegetic_music: N/A
+```
+
+### g3_l2va_last_frame
+- 任务 `l2va`，时长 `5 s`，seed `42`，输入 `last_frame_path`
+- 音频期望：`quiet`
+
+```text
+Picture 1 aligns to the final frame at 00:05.00 and must match exactly.
+
+integrated_multimodal_description: [Shot 1] Wide static view of an empty rain-slicked crosswalk at dusk; overhead cabling and the storefront geometry of the final frame are already in place, no pedestrians. [Shot 2] At 00:02.500 cut to a slightly tighter angle on the same crossing as a woman with a transparent umbrella walks in from screen left, hesitates at the kerb, then steps onto the road. By 00:05.00 she stands exactly where <Picture 1> places her, umbrella tilted, facing camera-left, with the same puddle reflections.
+
+overall_soundscape: Rain on nylon, tyre hiss, a pedestrian signal ticking, water under a shoe.
+
+non_diegetic_music: N/A
+```
+
+### g4_fl2va_first_last
+- 任务 `flf2v`，时长 `5 s`，seed `42`，输入 `image_path`
+- 音频期望：`medium`
+
+```text
+Picture 1 aligns to the first frame at 0.00 seconds, Picture 2 aligns to the final frame at 00:05.00; both must match exactly.
+
+integrated_multimodal_description: [Shot 1] Between <Picture 1> and <Picture 2> the same cyclist rides along the coastal road. He starts upright as in <Picture 1>, the lighthouse passing on his left, then leans into a shallow right-hand bend while the camera tracks alongside at the same height and speed; spray comes off the rear wheel. By 00:05.00 the framing settles into <Picture 2> with the same guardrail line, sea horizon and rider pose. Continuous single take, no cuts.
+
+overall_soundscape: Wind buffeting the microphone, freewheel ticking, waves breaking below, tyres hissing on wet tarmac.
+
+non_diegetic_music: N/A
+```
+
+### g5_ref2va_image
+- 任务 `ref2va`，时长 `5 s`，seed `42`，输入 `image_path`
+- 音频期望：`loud`
+
+```text
+subject_definitions: <Subject 1>: the woman in <Picture 1>. Preserve her identity, face proportions, hairstyle and the grey knit sweater.
+
+summary: A five-second studio clip that keeps <Subject 1> exactly as referenced while she writes and speaks one line.
+
+retention_analysis: <Picture 1> — attribute_transfer: identity, hair and sweater preserved; pose, set and the notebook are new.
+
+detailed_description: [Shot 1] <Subject 1> sits at a plain light-grey studio table, three-quarter angle to camera, soft key light from the left. She opens a notebook whose visible heading reads "第 3 天", writes two lines, then looks up at 00:03.000 and says <d>[Chinese] 写完了，我们走吧。</d> Static medium shot, 50mm equivalent, shallow depth of field.
+
+overall_soundscape: Quiet studio room tone, pen on paper, a page turning, chair leather creaking.
+
+non_diegetic_music: N/A
+```
+
+### g6_ref2va_video
+- 任务 `ref2va`，时长 `5 s`，seed `42`，输入 `video_path`
+- 音频期望：`quiet`
+
+```text
+subject_definitions: <Video 1>: the source clip. Its camera path, colour grade and the talent's outfit are the properties to inherit.
+
+summary: Continue the situation in <Video 1> for five more seconds with a new action, keeping its look and camera language.
+
+retention_analysis: <Video 1> — partially_preserved: framing, grade and wardrobe inherited; the action and the end state are new.
+
+detailed_description: [Shot 1] Picking up exactly where <Video 1> ends, the same subject remains in the same room under the same warm practical lighting. She turns away from the window, crosses to the doorway, and switches off the lamp at 00:04.000; the frame falls to a dim blue ambient with only the window glowing. The camera holds the <Video 1> position and drifts forward slowly.
+
+overall_soundscape: Room tone, floorboard creaks, a lamp switch clicking, distant traffic muffled by glass.
+
+non_diegetic_music: N/A
+```
+
+### g7_t2va_15s_text_long
+- 任务 `t2va`，时长 `15 s`，seed `42,43`
+- 音频期望：`loud`
+
+```text
+integrated_multimodal_description: [Shot 1] Static wide shot of a departure board in a regional Chinese railway station, cool fluorescent light, commuters crossing the lower third. The top line reads "G1024 上海虹桥 08:35". [Shot 2] At 00:07.000 the camera pans right along the platform to a conductor (S1) raising a green flag; lighting and crowd density continue, and the board edge stays visible at frame left. The platform announcement overlaps the pan. [Shot 3] At 00:12.000 cut to a medium shot of the conductor blowing a whistle and calling <d>[Chinese] 车门关闭，请勿靠近。</d> as the doors slide shut.
+
+overall_soundscape: Station announcement reverb, rolling luggage, door chime, whistle blast, crowd shuffling.
+
+non_diegetic_music: N/A
+```
+
+### g8_t2va_15s_dialogue_music
+- 任务 `t2va`，时长 `15 s`，seed `42,43`
+- 音频期望：`loud`
+
+```text
+integrated_multimodal_description: [Shot 1] Late-afternoon cafe window seat, low sun raking across a marble table. A man (S1) in a rolled-sleeve shirt and a woman (S2) in a rust-coloured sweater sit opposite each other; a chalkboard behind them reads "今日手冲 柑橘 花香". S1 slides a folded paper across the table and says <d>[Chinese] 你看这个地址，是不是写错了？</d> [Shot 2] At 00:06.000 cut to a close-up on S2 reading the paper, warm light on her cheek; she frowns, then laughs and answers <d>[Chinese] 没错，就是那条巷子。</d> [Shot 3] At 00:11.500 cut back to the wide two-shot as both stand up; S1 pockets the paper and the camera holds while the window light flickers as a bus passes outside.
+
+overall_soundscape: Espresso machine hiss, ceramic cups on saucers, other tables' murmured conversation, cutlery, a bus rumbling past the glass.
+
+non_diegetic_music: Sparse solo piano, around 70 BPM, soft sustain pedal, entering under the first line and thinning to a single unresolved note as they stand.
+```
+
+### g9_fl2va_15s_keyframes
+- 任务 `flf2v`，时长 `15 s`，seed `42`，输入 `image_path`
+- 音频期望：`medium`
+
+```text
+Picture 1 aligns to the first frame at 0.00 seconds and Picture 2 aligns to the final frame at 00:15.00; both must match exactly.
+
+integrated_multimodal_description: [Shot 1] Opening exactly on <Picture 1>: the traveller stands at the platform edge with a canvas duffel, morning fog behind the tracks. He checks his ticket and steps back from the yellow line. [Shot 2] At 00:05.500 cut to a wider platform view as the train slides in, the same fog density and the same duffel on his shoulder; he turns toward the opening doors. [Shot 3] At 00:10.000 cut to a medium shot from inside the carriage as he steps up, sets the bag on the rack and says to a seated passenger <d>[Chinese] 借过一下，谢谢。</d> By 00:15.00 the framing settles into <Picture 2> with the same seat row, window light and posture.
+
+overall_soundscape: Fog-muffled platform ambience, train brakes and door chime, duffel strap creaking, footsteps on the carriage step.
+
+non_diegetic_music: N/A
+```
+
+### g10_t2va_15s_action_vfx
+- 任务 `t2va`，时长 `15 s`，seed `42,43`
+- 音频期望：`loud`
+
+```text
+integrated_multimodal_description: [Shot 1] Low handheld tracking shot behind a courier sprinting across a rain-soaked rooftop at night, neon signs out of focus below the parapet. His shoes strike standing water and throw sheets of spray toward the lens; the camera shakes with each stride. [Shot 2] At 00:06.000 the action drops into slow motion as he vaults a low vent duct: droplets hang in the air, his jacket hem lifts, and the rooftop lights streak behind him, then time snaps back to real speed as he lands. [Shot 3] At 00:11.000 cut to a static wide as he hits the gravel, rolls once and comes up running toward a stairwell door; the camera holds the rooftop as he disappears into the dark.
+
+overall_soundscape: Rain hammering metal, boots slapping water, cloth snapping in wind, a hollow metallic boom on the vault, gravel scattering on landing, distant siren.
+
+non_diegetic_music: Pulsing synth bass at 128 BPM with a rising filter sweep through the vault, cutting to near silence for half a second on the landing, then a single low hit.
+```
+
+### g11_ref2va_15s_video_continue
+- 任务 `ref2va`，时长 `15 s`，seed `42`，输入 `video_path`
+- 音频期望：`quiet`
+
+```text
+subject_definitions: <Video 1>: the source clip. Inherit its camera height, lens character, colour grade and the talent's wardrobe.
+
+summary: A fifteen-second continuation of <Video 1> in which the same subject leaves the room, moves through a hallway and speaks one line at a doorway.
+
+retention_analysis: <Video 1> — partially_preserved: framing, grade and wardrobe inherited; location, action and end state are new.
+
+detailed_description: [Shot 1] Resuming exactly at the last frame of <Video 1>, the same subject turns from the window and walks toward the door; the camera follows at the <Video 1> height with the same slow drift. [Shot 2] At 00:05.000 cut to the hallway beyond the door, same warm practical light spilling from the room; she walks away from camera past a narrow console table. [Shot 3] At 00:10.000 cut to a medium shot at the far doorway where she stops, looks back over her shoulder and says <d>[Chinese] 灯我关了，你先走。</d> then steps out of frame as the hallway dims.
+
+overall_soundscape: Room tone, door latch, floorboards underfoot, a clock ticking in the hallway, the click of a light switch.
+
+non_diegetic_music: N/A
+```
+
+### s1_quant_gradient_sky
+- 任务 `t2va`，时长 `5 s`，seed `42,43`
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. Extended dynamic range, smooth tonal gradients.
+
+integrated_multimodal_description: [Shot 1] Extremely slow tilt up from a still lake surface to an overcast dusk sky, filling the frame with one continuous tonal gradient from deep indigo at the horizon to pale grey-blue overhead; no objects, no texture, only smooth light. A single distant bird crosses from right to left at 00:03.000. The camera holds a locked horizon and moves at less than one degree per second.
+
+overall_soundscape: Almost silent open-air ambience, faint water lapping, one distant bird call.
+
+non_diegetic_music: N/A
+```
+
+### s2_prune_face_texture
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. Hard side light, high-frequency skin detail.
+
+integrated_multimodal_description: [Shot 1] Tight close-up on a man's face in his fifties, three-quarter angle, hard side light from a window at frame left. Skin pores, two-day stubble, a thin scar over the right eyebrow and the weave of a charcoal wool coat fill the frame. He turns his head slowly toward the light and narrows his eyes at 00:03.000; the camera pushes in a few centimetres. Background is a dark neutral wall, thrown far out of focus.
+
+overall_soundscape: Quiet room tone, fabric rustling against a chair, one slow breath.
+
+non_diegetic_music: N/A
+```
+
+### s3_vdn_wide_pan_distant
+- 任务 `t2va`，时长 `15 s`，seed `42,43`
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. Extended dynamic range at golden hour.
+
+integrated_multimodal_description: [Shot 1] Wide static opening view of a wide river valley at golden hour; the camera is still until the pan begins. In the far distance, three small fishing boats sit on the water and a footbridge crosses the river; tiny hikers move along it. Foreground reeds are in silhouette at frame bottom. [Shot 2] At 00:06.000 the camera begins a slow horizontal pan right along the valley, keeping the boats in view while the bridge slides toward frame centre; reeds continue to sweep across the lower edge. [Shot 3] At 00:11.000 the pan settles on the bridge with the same boats now small at frame left; light has warmed by a few degrees and the hikers are still on the span.
+
+overall_soundscape: Wind through reeds, distant water, faint voices from the bridge far off.
+
+non_diegetic_music: N/A
+```
+
+### s4_quant_dark_small_text
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. Low-key night lighting, deep shadow detail.
+
+integrated_multimodal_description: [Shot 1] Static medium shot of a narrow shuttered shopfront at night, lit only by one warm bulb under the awning. Deep shadow fills two thirds of the frame; a small hand-painted sign beside the door, no taller than a hand, reads "修鞋" in two characters. An old man in a dark jacket sits on a low stool, repairing a shoe by hand, and looks up at 00:03.500. The camera does not move.
+
+overall_soundscape: Night street hush, a needle through leather, the bulb humming, a distant dog.
+
+non_diegetic_music: N/A
+```
+
+### s5_quant_thin_lines_backlit
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. High-contrast backlight against an overcast sky.
+
+integrated_multimodal_description: [Shot 1] Low-angle shot looking up at a tangle of overhead power lines and a steel lattice tower against a bright overcast sky; the wires are thin, high-contrast dark lines crossing the whole frame. The camera drifts slowly right, so the wires slide across the sky at a shallow angle. A single pigeon lands on the top wire at 00:03.000 and the wire dips slightly.
+
+overall_soundscape: Light wind, distant traffic hum, wingbeats then a soft coo.
+
+non_diegetic_music: N/A
+```
+
+### s6_hdr_motion_blur
+- 任务 `t2va`，时长 `5 s`，seed `42,43`
+- 对应声明：HDR 画质与模糊抑制
+- 音频期望：`loud`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. Extended dynamic range, highlights and shadows both retained.
+
+integrated_multimodal_description: [Shot 1] A runner sprints from frame right to frame left past a floor-to-ceiling window at late afternoon. Blown-out sunlight through the glass (specular highlights on the frame) sits beside deep shadow in the room's far corner. The camera pans with him at matched speed, keeping his torso centred while the window streaks behind. He passes the window between 00:01.000 and 00:02.500, then decelerates into shadow. Both the window highlights and the shadow detail must stay readable; his limbs must not smear.
+
+overall_soundscape: Footsteps on wood, fabric snapping, breath, window glass rattling slightly.
+
+non_diegetic_music: N/A
+```
+
+### s7_distant_face_repair
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：远景人脸修复
+- 音频期望：`loud`
+
+```text
+Style: East Asian realism, realistic fabric textures, soft natural lighting, detailed environmental materials, cinematic composition. Documentary framing.
+
+integrated_multimodal_description: [Shot 1] Wide shot across a village market lane; people occupy only one eighth of the frame height. Four stallholders stand behind trays of vegetables facing camera, and two customers walk between them. The camera pushes in slowly to a medium wide over five seconds, ending at 00:05.00 with the nearest two faces about one sixth of frame height. Every visible face must keep normal proportions — two eyes, one nose, one mouth, no melting or doubling — through the whole push-in.
+
+overall_soundscape: Market murmur, crates shifting, coins on a tray, a bicycle bell.
+
+non_diegetic_music: N/A
+```
+
+### s8_natural_material
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：干净自然的视觉美感
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking. Matte surfaces, no plastic sheen.
+
+integrated_multimodal_description: [Shot 1] Static close view of two bare hands resting on a raw oak table beside a matte ceramic bowl of water and a folded linen cloth. Soft north-window light from the left; the wood shows open grain and a few scratches, the bowl has a dry unglazed rim, the linen shows individual fibres and a crease. Nothing in frame is wet or polished. One finger taps the bowl at 00:03.000 and the water surface trembles. Skin must read as skin, not plastic; no plastic sheen, no bloom, no glowing rim.
+
+overall_soundscape: Quiet room, a fingertip on ceramic, cloth shifting, faint birds outside.
+
+non_diegetic_music: N/A
+```
+
+### s9_action_impact
+- 任务 `t2va`，时长 `15 s`，seed `42,43`
+- 对应声明：增强动态表现力
+- 音频期望：`loud`
+
+```text
+Style: Cinematic CG style, dramatic cinematic lighting, detailed environments, dynamic action choreography, atmospheric effects, film-quality rendering.
+
+integrated_multimodal_description: [Shot 1] Two fighters in dark training clothes face each other in a bare wooden hall, low side light. Fighter A steps in with a diagonal downward cut from his right shoulder toward B's left hip; B parries at chest height, the blades meet at 00:02.000 with a visible jarring recoil in both forearms, and sparks are absent — it is steel on steel in daylight. [Shot 2] At 00:06.000 cut to a low angle as B counter-thrusts straight at A's torso; A twists aside, the blade passing his ribs, and his sleeve snaps. [Shot 3] At 00:11.000 cut wide as A sweeps B's lead leg, B drops to one knee, and the impact sends a small puff of dust from the floorboards. Each strike must read as a single continuous arc with a clear start, contact and follow-through; no teleporting limbs.
+
+overall_soundscape: Steel ringing on contact, cloth snapping, boots sliding on boards, a low body-impact thud, both breathing hard.
+
+non_diegetic_music: N/A
+```
+
+### s10_vfx_fantasy
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：特效与奇幻元素
+- 音频期望：`loud`
+
+```text
+Style: Cinematic CG style, dramatic cinematic lighting, detailed environments, dynamic action choreography, atmospheric effects, film-quality rendering.
+
+integrated_multimodal_description: [Shot 1] A robed figure stands in a stone chamber and presses both palms together at chest height; a ring of small ember-like particles ignites between the palms at 00:01.500, spirals outward into a slowly rotating ring, and lights the figure's face from below. At 00:03.500 the ring snaps into a flat disc of pale blue light that casts hard shadows on the walls. Particles must stay individual motes with distinct motion paths, not a blur or a texture still; they must not pass through the hands.
+
+overall_soundscape: Low stone-room reverb, a rising airy whoosh, crackling embers, a soft metallic snap when the disc forms.
+
+non_diegetic_music: N/A
+```
+
+### s11_micro_expression
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：生动面部表情
+- 音频期望：`quiet`
+
+```text
+Style: East Asian realism, realistic fabric textures, soft natural lighting, detailed environmental materials, cinematic composition. Tight close-up performance.
+
+integrated_multimodal_description: [Shot 1] Locked-off close-up on a woman's face, soft window light from frame right, plain wall behind. She is listening. At 00:01.000 her eyes narrow slightly and her lips part; at 00:02.500 the corners of her mouth tighten as she holds back a reaction; at 00:03.800 she exhales through the nose, her shoulders drop a centimetre and her gaze softens. No head turn, no dialogue, no big smile — the whole performance stays inside the eyes and mouth.
+
+overall_soundscape: Nearly silent room tone, one soft inhale, a faint fabric shift.
+
+non_diegetic_music: N/A
+```
+
+### s12_camera_control
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：摄影运镜与控制
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking.
+
+integrated_multimodal_description: [Shot 1] A single continuous take in a covered arcade. The camera starts low, looking up at the vaulted ceiling, then performs exactly this sequence: tilt down to horizontal over the first second; dolly forward at walking pace for two seconds along the arcade; then pan right ninety degrees to end on a bicycle leaning against a pillar, holding it for the final two seconds. No cut, no zoom, no handheld shake — the motion is a smooth gimbal move. The bicycle must be off-screen until the pan brings it in at 00:04.000.
+
+overall_soundscape: Arcade reverb, footsteps, a bicycle freewheel ticking once, distant traffic.
+
+non_diegetic_music: N/A
+```
+
+### s13_prompt_adherence
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：提示词控制力
+- 音频期望：`quiet`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking.
+
+integrated_multimodal_description: [Shot 1] A plain white tabletop shot from directly above, even soft light, no props beyond what is listed. Exactly three objects, left to right: a red enamel mug, a green apple, and a closed black notebook. The mug sits one hand-width from the left edge, the apple in the exact centre of the frame, the notebook one hand-width from the right edge. The notebook cover carries one line of white text reading "2026 归档". Nothing else is on the table and there are no shadows from off-frame objects. At 00:03.000 a hand enters from the bottom edge and takes only the apple, leaving the other two untouched.
+
+overall_soundscape: Quiet room, ceramic set down, a page edge tapped, one apple lifted.
+
+non_diegetic_music: N/A
+```
+
+### s14a_style_photoreal
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：V2 风格渲染增强
+- 音频期望：`medium`
+
+```text
+Style: Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking.
+
+integrated_multimodal_description: [Shot 1] A young woman in a dark green raincoat stands at the rail of a small ferry, wind lifting her hair, grey sea and low clouds behind her. She looks toward the horizon and does not move except for the wind in her hair and coat; the camera holds a medium shot with a slow drift left. At 00:03.000 she turns her head one quarter toward camera.
+
+overall_soundscape: Wind across an open deck, hull cutting water, a loose rope tapping metal, distant gull.
+
+non_diegetic_music: N/A
+```
+
+### s14b_style_east_asian
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：V2 风格渲染增强
+- 音频期望：`medium`
+
+```text
+Style: East Asian realism, realistic fabric textures, soft natural lighting, detailed environmental materials, cinematic composition.
+
+integrated_multimodal_description: [Shot 1] A young woman in a dark green raincoat stands at the rail of a small ferry, wind lifting her hair, grey sea and low clouds behind her. She looks toward the horizon and does not move except for the wind in her hair and coat; the camera holds a medium shot with a slow drift left. At 00:03.000 she turns her head one quarter toward camera.
+
+overall_soundscape: Wind across an open deck, hull cutting water, a loose rope tapping metal, distant gull.
+
+non_diegetic_music: N/A
+```
+
+### s14c_style_3dcg
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：V2 风格渲染增强
+- 音频期望：`medium`
+
+```text
+Style: 3D CG style, detailed character materials, expressive facial animation, fluid action, depth and dimensionality, polished 3D rendering.
+
+integrated_multimodal_description: [Shot 1] A young woman in a dark green raincoat stands at the rail of a small ferry, wind lifting her hair, grey sea and low clouds behind her; soft overcast key light from above with cool bounce off the water. She looks toward the horizon and does not move except for the wind in her hair and coat; the camera holds a medium shot with a slow drift left. At 00:03.000 she turns her head one quarter toward camera.
+
+overall_soundscape: Wind across an open deck, hull cutting water, a loose rope tapping metal, distant gull.
+
+non_diegetic_music: N/A
+```
+
+### s14d_style_cinematic_cg
+- 任务 `t2va`，时长 `5 s`，seed `42`
+- 对应声明：V2 风格渲染增强
+- 音频期望：`medium`
+
+```text
+Style: Cinematic CG style, dramatic cinematic lighting, detailed environments, dynamic action choreography, atmospheric effects, film-quality rendering.
+
+integrated_multimodal_description: [Shot 1] A young woman in a dark green raincoat stands at the rail of a small ferry, wind lifting her hair, grey sea and low clouds behind her. She looks toward the horizon and does not move except for the wind in her hair and coat; the camera holds a medium shot with a slow drift left. At 00:03.000 she turns her head one quarter toward camera.
+
+overall_soundscape: Wind across an open deck, hull cutting water, a loose rope tapping metal, distant gull.
+
+non_diegetic_music: N/A
+```
+
+### s15_audio_reference
+- 任务 `ref2va`，时长 `5 s`，seed `42`，输入 `image_path, audio_path`
+- 对应声明：V2 音频参考条件修正
+- 音频期望：`loud`
+
+```text
+Style: East Asian realism, realistic fabric textures, soft natural lighting, detailed environmental materials, cinematic composition.
+
+subject_definitions: <Subject 1>: the man in <Picture 1> — a man in his forties, short close-cropped hair with greying temples, dark grey crew-neck knit sweater; his identity, face shape and hairstyle must be preserved. <Audio 1>: a voice sample used only to set the timbre and delivery of <Subject 1>'s line.
+
+summary: A five-second studio shot in which <Subject 1> speaks one short line, with the voice timbre guided by <Audio 1>.
+
+retention_analysis: <Picture 1> — attribute_transfer: identity and wardrobe preserved. <Audio 1> — reference: timbre and pacing referenced; the words are new.
+
+detailed_description: [Shot 1] <Subject 1> sits at a plain table facing camera, soft key light from the left. He looks up at 00:01.500 and says, in the timbre of <Audio 1>: <d>[Chinese] 这个方案我看过了，明天给你答复。</d> His lips close after 00:04.000. Static medium shot, shallow depth of field.
+
+overall_soundscape: Quiet studio room tone, chair leather creaking, one soft breath.
+
+non_diegetic_music: N/A
+```
+
+---
+
+## 14. Singularity v2 部署与首轮测试（2026-10-26）
+
+### 14.1 制品
+
+`/nfs-models/wuhanjisuan894/models/`（与 `/nfs-data/models/` 同一份 30T 存储）：
+
+| 目录 | 大小 | 说明 |
+| --- | ---: | --- |
+| `MiniMax-H3-Singularity-v2-pruned-r8-fixbias` | 38 G | 剪枝 BF16（修好 AdaLN 偏置的底座） |
+| `...-pruned-r8-fixbias-VDN` | 38 G | + VDN 烘焙 |
+| **`...-pruned-r8-fixbias-VDN-INT8`** | **20 G** | **+ INT8，fl2va 生产候选** |
+| **`...-pruned-r8-fixbias-VDN-INT8-ref2va`** | **20 G** | ref2va 形态 |
+
+对照组 v1 = 现网在跑的 `MiniMax-H3-Singularity-VDN-INT8`（44 G，**未剪枝**）。
+
+### 14.2 部署命令（与现网同构）
+
+```bash
+docker run -d --name h3-v2-fixbias-int8 --gpus all --network host --ipc host \
+  --shm-size 32g --init \
+  -e VLLM_OMNI_VDN_ALLOW_UNTRAINED_TASKS=1 -e VLLM_OMNI_VDN_KV_GATHER_BUDGET_MB=192 \
+  -e VLLM_OMNI_H3_EXPERIMENTAL_SHORT_EDGE=1080 \
+  -e VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=900 \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -v /nfs-data:/nfs-data -v /nfs-models:/nfs-models -v /nfs-output:/nfs-output \
+  $IMG vllm serve $MODEL --omni \
+    --deploy-config deploy-configs/minimax_h3_vdn8_fl2va_pruned_a100_40g.yaml \
+    --lora-path .../VDN-MiniMax-H3/stage-dmd-step-250-curve-fl2va-baked2 \
+    --allowed-local-media-path /nfs-output \
+    --init-timeout 2400 --stage-init-timeout 2400 \
+    --host <ip> --port 40700 --trust-remote-code
+```
+
+- **加载 270 s**（v1 是 200 s，v2 权重更小但初始化路径相同量级）。
+- 两份 deploy config（`..._singularity_vdn8_fl2va_...` 与 `..._vdn8_fl2va_pruned_...`）**逐项 diff 完全一致**，
+  所以 v1/v2 的差别只来自权重。
+
+### 14.3 首轮结果（同 seed=42、同配置，各 6 条）
+
+| 用例 | v1 墙钟 | v2 墙钟 | 画面结论 |
+| --- | ---: | ---: | --- |
+| s1 渐变 | 174 s（首条含编译） | 118 s | 两条都无色带；v2 明暗跨度更小（6.1 vs 13.2 级） |
+| s2 面部 | 100 s | 108 s | 两条皮肤毛孔/胡茬都在，**v2 不软** |
+| s4 暗部小字 | 101 s | 103 s | 两条都出现「修鞋」招牌，暗部可控 |
+| s5 逆光细线 | 104 s | 105 s | 两条线条连续 |
+| s13 提示词遵循 | 102 s | 100 s | 两条都满足三物体 + 「2026 归档」 |
+| g1 夜市 | 103 s | 100 s | 两条都成立，v2 招牌「永康牛肉面」清晰 |
+
+**延迟无差异**（warm 100–108 s），**v2 没有复现 10-24 的崩坏**，fixbias 重建有效。
+
+### 14.4 两个被自建引擎暴露的用例参数错误
+
+现网网关会丢弃 `num_inference_steps` 与 `extra_params`，所以这两个错误在 MaaS 上**永远不会报**，
+但自建实例会直接拒绝：
+
+| 字段 | 原值 | 现网实际执行 | 已改为 |
+| --- | --- | --- | --- |
+| `num_inference_steps` | 4（g 系列遗留 turbo 契约） | 8 | **8** |
+| `extra_params.flow_shift` | 6 | 12 | **12** |
+
+引擎报错原文：
+`this VDN artifact carries a 8-step DMD adapter and requires num_inference_steps=8, got 4`、
+`VDN-H3 requires flow_shift=12, got 6`。
+
+> 修正后 prompt 未变，因此 `prompt_sha256` 仍与现网基线一致，历史基线不受影响。
+
+### 14.5 一个不能用的指标
+
+同一 case 上比 Laplacian 方差（清晰度）会得出"v2 明显更软"（s2 58.7 vs 108.2），
+但两者**取景不同**（v1 是侧脸带头发胡须，v2 是正脸特写），指标被内容干扰。
+视觉核对后 v2 细节并不差。**跨模型比清晰度必须固定内容或人工判读，此指标只能同内容自比。**
