@@ -679,3 +679,31 @@ N1 的频谱明显更贴近参考（738 vs 846 Hz），N2 相差很远（300 Hz�
 
 > 附带发现（已单独记录）：`ref2va` 下**文字性别优先于参考图性别**——
 > 参考图是男性、提示词写 `woman/she`，输出就是女性。做身份一致性用例时必须让文字与图像一致。
+
+### 12.6 按官方提示词要求修正后的重跑（8 条）
+
+对 `s1`–`s5` 与 `s14c` 做提示词审计后发现三处不合规，已修正并全部重跑：
+
+| 问题 | 用例 | 修正 |
+| --- | --- | --- |
+| **完全没有风格行**（官方要求明确指定风格） | `s1`–`s5` | 首行补官方短语 `Photorealistic style, natural lighting, realistic skin texture, …`，并按用例追加一句场景限定 |
+| **自相矛盾**：`Wide locked-off view … camera begins a slow horizontal pan` | `s3` | 改为 `Wide static opening view …; the camera is still until the pan begins.` |
+| **缺光照** | `s14c` | 官方风格短语保持逐字，正文补 `soft overcast key light from above with cool bounce off the water` |
+
+产物：`/nfs-output/h3_gate/runs/20261026-prod-v2b/`（8 条，全部可追溯）。
+
+| 用例 | 任务 | 时长 | seed | 状态 | 墙钟 s | 相对最快 | 来源 | 幻影 | 结构 | 文字 | 音频 | 备注 |
+| --- | --- | ---: | ---: | --- | ---: | ---: | --- | :-: | :-: | :-: | ---: | --- |
+| `s14c_style_3dcg` | t2va | 5s | 42 | completed | 116 | 1.09× | 一致 | - | - | - | - | 计算时间 |
+| `s1_quant_gradient_sky` | t2va | 5s | 42 | completed | 106 | 1.00× | 一致 | - | - | - | - | 计算时间 |
+| `s1_quant_gradient_sky` | t2va | 5s | 43 | completed | 116 | 1.09× | 一致 | - | - | - | - | 计算时间 |
+| `s2_prune_face_texture` | t2va | 5s | 42 | completed | 110 | 1.05× | 一致 | - | - | - | - | 计算时间 |
+| `s3_vdn_wide_pan_distant` | t2va | 15s | 42 | completed | 296 | 1.02× | 一致 | - | - | - | - | 计算时间 |
+| `s3_vdn_wide_pan_distant` | t2va | 15s | 43 | completed | 291 | 1.00× | 一致 | - | - | - | - | 计算时间 |
+| `s4_quant_dark_small_text` | t2va | 5s | 42 | completed | 116 | 1.09× | 一致 | - | - | - | - | 计算时间 |
+| `s5_quant_thin_lines_backlit` | t2va | 5s | 42 | completed | 110 | 1.05× | 一致 | - | - | - | - | 计算时间 |
+
+5 s 最快 106 s / 中位 113 s，15 s 最快 291 s / 中位 294 s，与修正前同量级，说明补风格行没有带来性能代价。
+
+> 这几条的视频已替换到 `singularity_demos/` 对应链接，之前基于旧提示词的结果保留在原目录
+> `20261026-prod-v2/`，不再作为该用例的当前基线。
