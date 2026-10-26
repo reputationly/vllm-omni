@@ -89,6 +89,22 @@ def main() -> None:
     # ``extra="allow"`` body, where they would otherwise be forwarded verbatim.
     for key in [name for name in request_body if name.startswith("_")]:
         request_body.pop(key)
+    # The gateway calls the keyframe modes i2v / l2va / flf2v, but the engine only
+    # knows the checkpoint partition (fl2va) plus the media fields, so translate.
+    extra = request_body.setdefault("extra_params", {})
+    task = str(extra.get("task", ""))
+    if task in ("i2v", "l2va", "flf2v"):
+        frames = [s.strip() for s in str(request_body.get("image_path") or "").split(",") if s.strip()]
+        last = request_body.get("last_frame_path")
+        if task == "i2v":
+            request_body["image_path"] = frames[0]
+        elif task == "l2va":
+            request_body.pop("image_path", None)
+            request_body["last_frame_path"] = last or frames[0]
+        else:
+            request_body["image_path"] = frames[0]
+            request_body["last_frame_path"] = last or (frames[1] if len(frames) > 1 else frames[0])
+        extra["task"] = "fl2va"
     request_body["save_result_path"] = str(output_path)
     (case_dir / "request.json").write_text(
         json.dumps(request_body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
