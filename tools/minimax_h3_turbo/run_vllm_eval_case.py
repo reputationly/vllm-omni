@@ -84,6 +84,11 @@ def main() -> None:
     case_dir.mkdir(parents=True, exist_ok=False)
     output_path = case_dir / "output.mp4"
     request_body = json.loads(args.request.read_text(encoding="utf-8"))
+    # Case files keep human-facing sidecars (``_prompt_zh`` and friends). They are
+    # documentation, not knobs: dropping them here keeps them out of the engine's
+    # ``extra="allow"`` body, where they would otherwise be forwarded verbatim.
+    for key in [name for name in request_body if name.startswith("_")]:
+        request_body.pop(key)
     request_body["save_result_path"] = str(output_path)
     (case_dir / "request.json").write_text(
         json.dumps(request_body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

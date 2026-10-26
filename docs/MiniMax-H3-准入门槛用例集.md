@@ -1,0 +1,621 @@
+# MiniMax-H3 准入门槛用例集
+
+> 用途：**每次改权重（新 LoRA / 量化 / 剪枝）或改推理优化后，必须跑完本用例集并全过，才允许进入下一步评估。**
+> 用例文件在 `docs/h3-gate-cases/`，机器可读；本文件是规范与判读口径。
+
+版本：v8（2026-10-26）。基线：`MiniMax-H3-FL2VA-Turbo4-768p-v1.1-BF16`（4 步烘焙，scale 1.0）。
+
+---
+
+## 1. 任务覆盖
+
+H3 是**音视频联合生成**模型，不是图像模型。因此"文生图"一条**不适用**：
+
+| 需求 | H3 支持 | 用例 | 说明 |
+| --- | --- | --- | --- |
+| 文生图 | ❌ | — | H3 无图像输出；图像需求走 `image_tasks` 那条线，不要塞进本用例集 |
+| 文生视频（T2VA） | ✅ | `g1` `g7` `g8` `g10` | 含音频、对白、配乐 |
+| 首帧生视频（I2VA） | ✅ | `g2` | `image_path` 单图 |
+| 尾帧生视频（L2VA） | ✅ | `g3` | `last_frame_path` |
+| 首尾帧生视频（FL2VA） | ✅ | `g4` `g9` | `image_path` 逗号两图（首、尾） |
+| 参考图生视频（Ref2VA） | ✅ | `g5` | 人物/物体一致性 |
+| 参考视频生视频（Ref2VA） | ✅ | `g6` `g11` | 延续或编辑既有片段 |
+
+分区限制（`pipeline_minimax_h3.py:1751`）：`fl2va` 分区只能服务 `{t2va, fl2va}`；
+`ref2va` 分区只能服务 `{ref2va}`。所以 `g1–g4`、`g7–g10` 需要 fl2va 实例；`g5`、`g6`、`g11` 需要 ref2va 实例。
+
+---
+
+## 2. 用例清单（28 条：11 条基础 + 5 条技术分解 + 8 条能力声明 + 4 条风格对照）
+
+| ID | 任务 | 时长 | seed | 输入 | 主要考点 |
+| --- | --- | ---: | --- | --- | --- |
+| `g1_t2va_crowd_motion` | t2va | 5 s | 42,43 | 文本 | 人群/暗光/运动 + 中文吆喝口型 + 招牌文字 |
+| `g2_i2va_first_frame` | fl2va | 5 s | 42 | 首帧 | 首帧严格对齐、推镜下身份稳定、画外问答 |
+| `g3_l2va_last_frame` | fl2va | 5 s | 42 | 尾帧 | 两镜倒推、精确收束到尾帧 |
+| `g4_fl2va_first_last` | fl2va | 5 s | 42 | 首+尾帧 | 两端精确、中间连续、并行跟拍 |
+| `g5_ref2va_image` | ref2va | 5 s | 42 | 参考图 | 身份保持 + 新生成画面文字 + 台词 |
+| `g6_ref2va_video` | ref2va | 5 s | 42 | 参考视频 | 运镜/色调继承、无缝接续 |
+| **`g7_t2va_15s_text_long`** | t2va | **15 s** | 42,43 | 文本 | 长片不漂移 + 屏幕文字 + 三镜 + 广播 |
+| **`g8_t2va_15s_dialogue_music`** | t2va | **15 s** | 42,43 | 文本 | 双人轮流对话口型 + 三层声音（对白/音效/配乐）+ 黑板文字 |
+| **`g9_fl2va_15s_keyframes`** | fl2va | **15 s** | 42 | 首+尾帧 | 15 秒两端锚定 + 三镜 + 一句台词 |
+| **`g10_t2va_15s_action_vfx`** | t2va | **15 s** | 42,43 | 文本 | 高速运动形变 + 慢动作细节 + 复杂音效同步 |
+| **`g11_ref2va_15s_video_continue`** | ref2va | **15 s** | 42 | 参考视频 | 长时程继承运镜 + 跨房间连续性 + 台词 |
+
+固定参数：`width=1344, height=768, fps=24, num_inference_steps=4, extra_params.flow_shift=6, audio_flow_shift=3`。
+改权重若步数契约变化，同步改 `num_inference_steps` 并在报告里注明。
+
+### 中英双语约定
+
+每个用例文件里有：
+
+- **`prompt`（英文）** —— **唯一下发给模型的字段**，符合 H3 的 `integrated_multimodal_description` /
+  `overall_soundscape` / `non_diegetic_music`（或 Ref2VA 六段式）格式。
+- **`_prompt_zh`（中文）** —— 仅供人读，说明这条在考什么；**`run_vllm_eval_case.py` 会在提交前剥离所有
+  `_` 开头的键**，因此它永远不会到达引擎。
+
+### 素材要求
+
+`g2–` `g6`、`g9`、`g11` 需要固定素材，放在 `/nfs-output/h3_gate/assets/`，**首次运行后冻结**：
+
+| 文件 | 用途 | 要求 |
+| --- | --- | --- |
+| `first_frame.png` / `last_frame.png` | g2 / g3 | 1344×768，主体清晰、光照中性 |
+| `first_frame_cycle.png` / `last_frame_cycle.png` | g4 | 同一场景的两端，护栏线与海平线要对得上 |
+| `g9_first.png` / `g9_last.png` | g9 | 站台与车厢座位两端，需能连成同一趟车 |
+| `ref_person.png` | g5 | 单人三分之四角度，五官清晰 |
+| `ref_clip.mp4` | g6 / g11 | 3–5 s、24 fps、有明确运镜，结尾需可被"接续" |
+
+素材换了等于换了考题，跨版本对比即失效。
+
+---
+
+## 3. 提示词设计审核（v1 → v3）
+
+第一版用例写完后按 `.agents/skills/h3-prompt-writing` 的两份格式规范逐条自查，问题如下：
+
+| # | v1 的问题 | v3 的处理 |
+| --- | --- | --- |
+| 1 | **全篇没有一句台词**，完全没测 H3 的强项——对白与口型 | `g1` 摊主吆喝、`g2` 画外问句、`g5` 一句、`g7` 站务员喊话、`g8` 双人对话、`g9` 让路、`g11` 回头叮嘱，均用 `<d>[Chinese] …</d>` + `(S1)/(S2)` |
+| 2 | **`non_diegetic_music` 全是 N/A**，配乐层没被覆盖 | `g8` 独奏钢琴（70 BPM、延音踏板、尾音不解决）、`g10` 128 BPM 合成贝斯（过场滤波、落地静半秒再给低音） |
+| 3 | `g3`（尾帧）只有单镜，没验证"尾帧必须落在**最后一个镜头**"这条规则 | 改为两镜：先空镜建立空间，`00:02.500` 切镜后收束到尾帧 |
+| 4 | 声音只有一层"环境声"，没有把对白/音效/配乐分层 | 三层分离：台词只放描述里、`overall_soundscape` 只写环境与拟音、`non_diegetic_music` 只写观众听到的配乐 |
+| 5 | 时长只有 1 条 15s，且没覆盖对话/配乐/高速/参考视频 | **15s 扩到 5 条**，分别压长片一致性、双人对话+配乐、首尾帧三镜、高速动作+慢动作、参考视频延续 |
+| 6 | 相机描述偶有"参数清单"味（如只给"肩高、一米后"） | 统一改成动作化描述：类型 + 方向 + 幅度 + 速度（"并行跟随、同高度同速"、"缓慢前移"） |
+| 7 | 画面文字只放双引号，没写"逐字保留" | 每条含文字的用例都显式要求原有文字保持不变；`g5` 的 `retention_analysis` 明确把新文字列为 **new**，不算作参考丢失 |
+| 8 | 没有标注每条在考什么的"强项" | `manifest.json` 每条增加 `covers` 与 `strengths` 两个字段 |
+
+### 提示词自检清单（新增用例时必须过一遍）
+
+- [ ] 字段齐全且**顺序正确**：base 模式三段；Ref2VA 六段
+- [ ] 首镜写 `[Shot 1]` **不带时间码**；后续切镜 `[Shot 2] At 00:03.500, …`，时间**严格递增**
+- [ ] 所有切镜与事件都在片长内；结尾时间与 `seconds` 一致（两位小数）
+- [ ] 参考标签（`<Picture N>` / `<Video N>` / `<Subject N>`）只用于**实际提供**的素材，且六个字段里保持一致
+- [ ] 台词只写语言标签与原文：`<d>[Chinese] …</d>`；说话人用稳定 `(S1)`；画外音要注明
+- [ ] 画面文字用双引号逐字保留
+- [ ] 三层声音不重复：对白/现场音乐写在描述里，环境与拟音进 `overall_soundscape`，配乐进 `non_diegetic_music`
+- [ ] 相机运动写成动作（方向/幅度/速度），不堆砌关键词
+- [ ] 无未替换的模板变量
+
+---
+
+## 4. 怎么跑
+
+```bash
+# 1) 起实例（一实例一适配器；动态 LoRA 不能带 --enable-cpu-offload）
+PORT=40660
+
+# 2) 逐条提交（驱动会自动剥离 _ 开头的中文说明字段）
+for f in docs/h3-gate-cases/g*.json; do
+  id=$(basename "$f" .json)
+  python3 tools/minimax_h3_turbo/run_vllm_eval_case.py \
+    --endpoint http://127.0.0.1:$PORT \
+    --request "$f" \
+    --tag "gate_$id" \
+    --output-root /nfs-output/h3_gate/runs/$(date +%Y%m%d-%H%M) \
+    --container <container-name> --timeout-seconds 1800
+done
+```
+
+> 多 seed 用例（`g1` `g7` `g8` `g10`）改 `seed` 再跑一遍。
+> **计时前先空跑 3 条丢弃**：4 步实测要 3 条才到稳态。
+
+---
+
+## 5. 验收门槛
+
+### 5.1 硬门槛（任一不过 = 直接不通过）
+
+| 项 | 判据 |
+| --- | --- |
+| 完成 | 16 次运行（11 条 + 多 seed 展开）全部 `completed`，无 OOM、无 `no live replica` |
+| 时长/分辨率 | 输出时长误差 ≤ 0.2 s，分辨率与请求一致 |
+| 音轨 | 有音频流；**峰值 ≥ −20 dBFS**（*预期静音的用例除外，见下方注*）；有声段占比 > 30%；有台词的用例须能听出人声 |
+| 确定性 | 同 seed 连跑两次，`output.mp4` 的 sha256 **完全相同** |
+| 显存 | 单卡峰值 ≤ 32 GB（40G 卡留 8 GB 余量） |
+
+#### 音频门槛的按用例例外
+
+`−20 dBFS` 不能一刀切：`s1_quant_gradient_sky` 的提示词写的是"近乎无声的旷野环境 + 一声远鸟"，
+实测峰值 **−39.2 dBFS**，这是**符合预期的**，不是缺陷。
+
+判定规则改为：
+
+| 用例类型 | 音频判据 |
+| --- | --- |
+| 有人声/音乐/动作音效 | 峰值 ≥ −20 dBFS |
+| 明确要求安静（`s1`） | 有音频流即可，不设电平下限；允许 −45 ~ −30 dBFS |
+| 明确要求纯静音（`non_diegetic_music: N/A` 且 soundscape 写 N/A） | 应有静音轨 |
+
+基线实测：`g8` −10.6 / −11.2 dBFS（对白+配乐）、`g10` −5.2 / −3.9 dBFS（动作）、`g1` −16.6 / −13.7、`g7` −7.1 / −10.4、`s1` −39.2（预期安静）。
+
+### 5.2 性能门槛（相对基线，防止用"更慢"换质量）
+
+| 场景 | 基线（v1.1 烘焙） | 允许上限 |
+| --- | ---: | ---: |
+| 5s | 58–60 s | **≤ 66 s**（1.10×） |
+| 15s（热） | 223 s | **≤ 257 s**（1.15×） |
+| 冷启动首条 | 187 s | ≤ 240 s |
+
+### 5.3 质量门槛（人工盲评，5 分制）
+
+每条成片按 6 项打分，**任一项 < 3 分 = 不通过**：
+
+| 项 | 5 分 | 3 分（及格线） | 1 分 |
+| --- | --- | --- | --- |
+| 幻影/重影 | 全片无叠影 | 快速段轻微拖影 | 出现双人/双影 |
+| 结构完整性 | 主体与环境稳定 | 局部糊但不散 | 崩坏/条纹/色块 |
+| 参考保持 | 身份/构图高度一致 | 可辨认但漂移 | 换了个人 |
+| 文字可读 | 牌面文字正确可读 | 字形糊但可猜 | 乱码 |
+| **口型/对白** | 口型与台词同步、可听清 | 略有错位但可懂 | 无声或完全不对 |
+| **声音层次** | 对白/音效/配乐分明 | 有层次但混浊 | 糊成一团或缺失 |
+
+**盲评纪律**：拼图行序随机、只标 A/B/C…，评完再揭开（`build_panels.py`）。
+禁止只用锐度/SSIM 下结论——已证明糊化场景下这两个指标会和肉眼相反。
+
+### 5.4 记录模板
+
+```markdown
+# 准入门槛结果 <版本> <日期>
+基线：MiniMax-H3-FL2VA-Turbo4-768p-v1.1-BF16
+| 用例 | 完成 | 墙钟 | 峰值GPU | 幻影 | 结构 | 参考 | 文字 | 口型 | 声音 | 判定 |
+| --- | --- | ---: | ---: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| g1 … | ✅ | 61 s | 19.8 GB | 4 | 4 | — | 4 | 4 | 4 | 通过 |
+结论：通过 / 不通过（不通过项：…）
+```
+
+---
+
+## 6. 已知坑（跑之前先看）
+
+1. **一实例一适配器**：中途换 LoRA 会挂死 worker（`RPC call to execute_model timed out`）。
+2. **动态 LoRA 不能开 `--enable-cpu-offload`**，显存会从 ~19.7 GB 涨到 ~30.9 GB。
+3. **`VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0` 会让卡住的请求永远 PENDING**（GPU 0%、无报错），设成有限值。
+4. **驱动日志里没有 `Turbo adapter` 不代表 LoRA 没生效**：用"同 seed 有无 LoRA 的 sha256 是否不同"判定。
+5. **不要混挂仓库旧源码**（8-18 版）与镜像代码（10-15 版），会 `ImportError`。
+6. **烘焙前先算 `‖ΔW‖/‖W‖`**：低于 ~1e-4 就别烘，改用动态 LoRA（BF16 ulp ≈ 0.39%）。
+7. **容器加 `--init`**，否则 `docker rm -f` 可能因僵尸进程失败。
+
+---
+
+## 7. 现网基线
+
+已完成，29 次运行、全部可追溯，见 **§12**。关键帧四例（`g2`/`g3`/`g4`/`g9`）受网关限制无法覆盖，见 §8.6。
+
+---
+
+## 8. MaaS 现网传输适配（2026-10-26 实测）
+
+现网网关 `https://maas.ovaijisuan.com` 是 **new-api**（`v0.13.2-ovaijisuan-20261025`），
+不是自建 vLLM-Omni 的直连形态。两者的请求体**不能直接互换**，实测差异如下。
+
+### 8.1 接口
+
+| 动作 | 路由 | 说明 |
+| --- | --- | --- |
+| 提交 | `POST /v1/videos` | 请求体 `{model, prompt, seconds, size, ...}`，返回 `task_id` |
+| 轮询 | `GET /v1/videos/{task_id}` | `status`：`queued` / `in_progress` / `completed` / `failed` |
+| 取片 | `GET /v1/videos/{task_id}/content`，或用 `metadata.url` | 完成后 `metadata.url` 是带签名的 OBS 直链 |
+
+`model` 只有两个 H3 端点：`minimax-h3-fl2va`、`minimax-h3-ref2va`。
+
+### 8.2 字段映射（关键坑）
+
+| 用例字段 | 现网写法 | 坑 |
+| --- | --- | --- |
+| `width`/`height` | `size: "1344x756"` | **引擎按 size 反推比例**，`1344x768` 会被算成 7:4 而报错 `aspect_ratio must be one of 21:9,16:9,4:3,1:1,3:4,9:16`；`aspect_ratio` 字段**被忽略** |
+| `seconds` | `"5"` 字符串 | 支持 **2–20**，越界报错并列出允许值 |
+| `seed` | 原样 | 透传 |
+| `image_path` | `metadata.src_ref_images: [url 或 data-uri]` | 只接受 **http(s) URL 或 base64/data-uri**，不接受服务器路径 |
+| `video_path` | `metadata.reference_videos: [url 或 data-uri]` | 同上 |
+| `num_inference_steps` / `extra_params` | 默认**不发** | 基线要测"已部署的采样契约"，只有复跑引擎契约时才用 `--send-tuning` |
+| `_prompt_zh` | 不下发 | 执行器剥离所有 `_` 前缀键 |
+
+### 8.3 任务类型可达性（重要）
+
+网关把 `minimax-h3-fl2va` 配成了 **t2v**，`minimax-h3-ref2va` 配成 **r2va**。
+实测给 fl2va 传 `image` 会被直接拒绝：
+
+```
+模型 minimax-h3-fl2va 的任务类型 t2v 不接受图片输入;
+要按图生成请改用支持图片输入的任务类型(i2v/l2va/flf2v)或对应模型
+```
+
+而 `/v1/models` 里**没有** i2v / l2va / flf2v 的 H3 条目。因此：
+
+| 用例 | 现网可否跑 |
+| --- | --- |
+| `g1` `g7` `g8` `g10`（t2va） | ✅ 可跑 |
+| `g5` `g6` `g11`（ref2va） | ✅ 可跑，**但需先把素材变成 URL 或 data-uri** |
+| `g2`（i2v）、`g3`（l2va）、`g4` `g9`（flf2v） | ❌ **不可达**；用 `metadata.src_ref_images` 硬传图会被**静默忽略**（见 §8.6） |
+
+> 也就是说：本用例集 11 条里，现网当前只能覆盖 **7 条**（4 条 t2va + 3 条 ref2va）。
+> 关键帧三态（首帧/尾帧/首尾帧）在现网**暂时没有入口**，这是配置问题，不是能力问题——
+> 引擎侧 `pipeline_minimax_h3.py` 是支持 `t2va`/`fl2va`/`ref2va` 的。
+
+### 8.4 首条基线结果
+
+`g1_t2va_crowd_motion`（5s，1344x756，16:9，seed 42，`minimax-h3-fl2va`）：
+
+| 项 | 值 |
+| --- | --- |
+| 状态 | **completed** |
+| 墙钟 | **115.5 s** |
+| 输出 | 1344×736、24 fps、5.17 s、5.67 MB、含音轨 |
+| 主观 | 夜市结构完整、人群与蒸汽自然；招牌「永康牛肉麵」**文字清晰可读**（同一画面出现多处均正确） |
+| 产物 | `/nfs-output/h3_gate/runs/20261026-prod/prod_g1_t2va_crowd_motion/` |
+
+作为对照：我们自建的 4 步 turbo 在同一条提示词上出现过重影与糊化——**现网这条基线明显更稳**，
+所以本用例集把"现网 ≥ 3 分"作为及格线是合理的。
+
+### 8.5 执行器
+
+`tools/minimax_h3_turbo/run_maas_case.py`：读标准用例 JSON → 按上表映射 → 提交/轮询/取片 → 写
+`request.json`、`summary.json`、`output.mp4`。用法：
+
+```bash
+python3 tools/minimax_h3_turbo/run_maas_case.py \
+  --base-url https://maas.ovaijisuan.com --api-key "$KEY" \
+  --request docs/h3-gate-cases/g1_t2va_crowd_motion.json \
+  --tag prod_g1_t2va_crowd_motion --output-root /nfs-output/h3_gate/runs/<日期>-prod
+```
+
+### 8.6 关键帧三态：实测**不可用**（且是静默忽略）
+
+有人反馈"关键帧都支持"，我用两个可判定的实验核对，结论是**当前网关上不可用**：
+
+| 尝试 | 结果 |
+| --- | --- |
+| 顶层 `image` 字段 | **400 明确拒绝**：`模型 minimax-h3-fl2va 的任务类型 t2v 不接受图片输入` |
+| `metadata.src_ref_images` | **202 接受、正常出片，但内容与输入的图毫无关系** |
+
+判定性实验：提交一张**1344×756 的彩色渐变图** + 提示词
+`Animate this exact frame with a very slow push-in. Keep the composition, colours and layout unchanged.`，
+拿回的成片首帧是一间**维多利亚红丝绒客厅**——既不是渐变图，也与"保持构图不变"无关。
+说明 `src_ref_images` 在 `minimax-h3-fl2va`（t2v）上被**静默丢弃**，比顶层 `image` 的显式拒绝更隐蔽。
+
+因此：
+
+- **i2v / l2va / flf2v 在现网仍无入口**，需要网关侧把 fl2va 拆出对应任务类型的模型条目；
+- 在那之前，`g2`/`g3`/`g4`/`g9` 只能在我们自建实例上跑，不能进现网基线；
+- 执行器已内置保护：带媒体但任务是 t2va 的用例会**直接拒绝提交**，避免再产生"看起来成功、其实没用图"的假结果。
+
+### 8.7 固定素材的生成（qwen-image-pro）
+
+`g2–g6`、`g9`、`g11` 需要的静帧用 `qwen-image-pro` 生成，脚本
+`tools/minimax_h3_turbo/gen_gate_assets.py`（提示词**按 Qwen-Image 的写法**组织：
+具体主体 + 角度 + 服装 + 光线 + 背景 + 镜头 + 风格，避免抽象形容词——与 H3 的视频提示词是两种体裁，
+不能混用）。已生成 7 张，落在 `/nfs-output/h3_gate/assets/`：
+
+| 文件 | 用途 |
+| --- | --- |
+| `ref_person.png` | g5 / g11 的人物身份参考 |
+| `first_frame.png` | g2 首帧 |
+| `last_frame.png` | g3 尾帧 |
+| `first_frame_cycle.png` / `last_frame_cycle.png` | g4 首尾帧（同场景两端） |
+| `g9_first.png` / `g9_last.png` | g9 站台→车厢两端 |
+
+参考**视频**（g6/g11 的 `<Video 1>`）仍需单独生成：可用 `minimax-h3-fl2va` 先跑一条 t2v 当作源片段，
+再把它作为 `metadata.reference_videos` 喂给 `minimax-h3-ref2va`。
+
+---
+
+## 9. 图像素材的提示词规范（qwen-image-pro）
+
+生成用例素材时踩过一次真实的坑：画面里出现**乱码文字/箭头标注**。原因不是模型不行，是提示词写错了。
+
+### 9.1 规范依据
+
+`.agents/skills/minimalist-product-ad-generator/SKILL.md`：
+
+> Include exact visible copy … **in the rendering prompt**, not only in the plan.
+> For bad typography, **first reduce simultaneous text or correct its reference.**
+
+推论有两条：
+
+1. **要字就逐字给**：需要出现的文案必须写进提示词原文（和 H3 视频提示词里"可见文字用双引号逐字保留"是同一条规矩）。
+2. **不要字就明确禁止并枚举**：只说"无文字"太弱；要列出不许出现的东西（标牌、标语、标注线、箭头、编号、水印、logo），
+   否则模型会按"这画面似乎该有信息"自行补字，补出来就是乱码。
+
+### 9.2 我犯的两个具体错误
+
+| 原来的写法 | 为什么错 | 改成 |
+| --- | --- | --- |
+| 「招牌文字**模糊不可辨认**」 | 等于说"这里该有字，但随便写"——模型就编乱码 | 「无任何招牌文字」 |
+| 「画面文字**模糊不可辨认**」 | 同上 | 「画面中无任何文字」 |
+| 结尾只写「画面干净无文字」 | 禁止项太少，挡不住箭头/标注/编号 | 统一追加 `NO_TEXT` 常量，枚举 8 类禁止元素 |
+
+### 9.3 现在统一追加的约束
+
+```python
+NO_TEXT = (
+    "画面中不出现任何文字：不要汉字、字母、数字、符号、标牌、招牌、标语、说明文字、"
+    "标注线、箭头、编号、水印或 logo；人物服装与所有物体表面均为无字素面。"
+)
+```
+
+所有静帧素材都拼接该常量；确需文字时（例如 g5 的笔记本「第 3 天」），
+必须在提示词里逐字写出，并**减少同屏文字数量**（规范原文：reduce simultaneous text）。
+
+> 注意：这条约束是给**图像**素材用的；H3 视频提示词走的是另一套格式（见 §3），
+> 那里要求把可见文字用双引号写进 `integrated_multimodal_description`。两者不要混用。
+
+### 8.8 为什么 5s 会跑到 300 秒：排队，不是模型慢
+
+在现网 `minimax-h3-fl2va`（gpu23 / 10.0.0.6:40011）的引擎日志里直接读出来的：
+
+| 请求 | 降噪循环 | 引擎总耗时（队列空时） |
+| --- | --- | --- |
+| 5s / 8 步 | 1:24–1:26（10.3–10.8 s/it） | **96–101 s** |
+| 15s / 8 步 | 4:12（31.4 s/it） | 260–360 s |
+
+同一条 5s 请求的 `engine=` 在日志里从 96 s 一路出现到 **600 s**：
+
+```
+06:54:17 total=194.55s
+06:56:17 total=291.10s
+06:58:58 total=437.02s
+07:01:41 total=600.09s   ← 同一批 4 个 5s 任务挤在队列里
+07:05:09 total= 96.18s   ← 队列空了
+07:11:18 total= 96.60s
+07:12:57 total=101.10s
+```
+
+`max_num_seqs=1`，引擎串行处理，后来的请求把等待时间算进了自己的 `engine` 计时。
+所以**面板上的 300–600 秒不等于计算时间**。
+
+判读基线时必须区分：
+
+- **纯计算**：5s ≈ 96–101 s，15s ≈ 260–300 s（8 步 INT8 的正常水平）；
+- **含排队**：任何大于上界的数字都是队列，不能写进性能门槛的对照。
+
+对照我们自建的 4 步 turbo（5s 58–60 s、15s 223 s），步数减半、时间也大致减半，
+说明现网这个耗时本身是合理的。
+
+> 教训：不要在现网上做参数探针。这次探接口时连提了 8 个占位任务，人为制造了队列，
+> 一度让 5s 请求看起来要 300–600 秒。
+
+---
+
+## 10. Singularity 专项用例（s1–s5）
+
+现网跑的是 `MiniMax-H3-Singularity-VDN-INT8`，优化栈是四层叠加：
+
+| 层 | 做了什么 | 典型副作用 |
+| --- | --- | --- |
+| **剪枝 r8** | 把 transformer 压到 rank-8 曲线子空间 | 高频细节被抹平（皮肤、织物、细线） |
+| **fixbias** | 修 `prune_partition_to_curve.py` 丢失 AdaLN 偏置的缺陷（v2 曾因此 16 个 block 崩坏） | 偏置异常 → 整体亮度/色偏、块间不一致 |
+| **VDN** | `VDN_WINDOW_ATTN` 窗口注意力并烘焙 | 长程依赖弱 → 远景小目标、跨镜头一致性下降 |
+| **INT8** | W8A16 量化 | 暗部色带、噪点、高光溢出、小字糊 |
+
+这些不是"模型能力"，而是**工程取舍**——每一层都对应一种特定的劣化方式。
+所以门槛集里必须有用例专门盯着它们，否则改量化参数或换剪枝策略时，常规用例可能全过、而某一层已经坏了。
+
+### 用例与优化的对应关系
+
+| 用例 | 压哪一层 | 判读要点 |
+| --- | --- | --- |
+| `s1_quant_gradient_sky` | INT8 + AdaLN | 大面积平滑渐变里是否出现**色带**、条带边界、块状亮度跳变；天空从靛蓝到灰蓝应连续过渡 |
+| `s2_prune_face_texture` | 剪枝 r8 | 毛孔、胡茬、疤痕、羊毛织纹是否还在；剪枝过头会变成"磨皮" |
+| `s3_vdn_wide_pan_distant` | VDN 窗口 + 15s | 15 秒慢摇中，远处三条船与桥上行人不许消失/撕裂；这是窗口注意力的长程短板 |
+| `s4_quant_dark_small_text` | INT8 暗部 | 三分之二暗部下是否噪点爆开；手掌大的「修鞋」两字是否可读 |
+| `s5_quant_thin_lines_backlit` | INT8 高频 | 逆光细电线是否断裂、发毛、带光晕；高对比边缘有没有振铃 |
+
+### 判读加分项
+
+- `s1`：用直方图看天空区域的亮度分布是否连续（色带会在直方图上出现尖峰）。
+- `s3`：抽 1.0 / 6.5 / 11.5 s，逐帧确认远处船与人**还在原位**；VDN 若窗口切错，会在摇镜中途丢掉远景。
+- `s5`：放大到 200% 看电线边缘，量化振铃表现为线条两侧的周期性亮暗环。
+
+### 运行注意
+
+- 这 5 条按**现网契约**写（8 步、`flow_shift=12`），所以对 MaaS 直接跑即可（执行器默认不下发 tuning 参数）。
+- 若要在自建集群的 4 步 turbo 上跑，需加 `--send-tuning` 并同步改 `num_inference_steps`，否则测的不是同一套契约。
+
+### 10.1 官方能力声明 → 用例映射（s6–s14）
+
+Singularity 的官方宣称逐条建用例，任何一条回归都会在这套里露出来：
+
+| 官方声明 | 用例 | 判读要点 |
+| --- | --- | --- |
+| HDR 画质与模糊抑制 | `s6_hdr_motion_blur` | 强逆光窗口 + 深阴影同框，人物横向快速跑；高光不溢出、暗部不糊成块、四肢不拖影 |
+| 远景人脸修复 | `s7_distant_face_repair` | 人脸只占画面高度 1/8→1/6，全程五官不塌、不重影、不融化 |
+| 干净自然的视觉美感 | `s8_natural_material` | 生木、素烧陶、亚麻、裸手；皮肤不能像塑料，无塑料高光、无泛光、无发光描边 |
+| 增强动态表现力 | `s9_action_impact` | 15s 三段剑术，每击写清起手→接触→跟随；不许肢体瞬移，接触要有反馈 |
+| 特效与奇幻元素 | `s10_vfx_fantasy` | 粒子必须是一颗颗独立轨迹，不许糊成贴图、不许穿模 |
+| 生动面部表情 | `s11_micro_expression` | 只靠眼神与嘴角的微变化完成表演，不转头不说话 |
+| 摄影运镜与控制 | `s12_camera_control` | 指定"下摇→前推→右摇 90°→停住"，自行车 00:04 前不许入画 |
+| V2 提示词控制力 | `s13_prompt_adherence` | 恰好三件物体、指定颜色与位置、一处文字、00:03 只拿走苹果 |
+| V2 风格渲染增强 | `s14a–s14d` | 同一画面内容仅换 Style 行（photorealistic / East Asian realism / 3D CG / cinematic CG），四张应明显不同 |
+| V2 音频参考条件修正 | **待补** | 需要 `ref2va` 接受 `metadata.reference_audios` 且提供音频素材；网关当前未验证该字段 |
+| 保留基础模型能力 | 基础 11 条（g1–g11） | 声称"不退化"，就用原有用例守住 |
+
+### 10.2 提示词组织（按官方建议）
+
+官方给的建议已落到所有 s 系列用例里：
+
+- **长度**：单条提示词控制在 3000 字符以内（官方上限约 5000），当前最长约 900 字符；
+- **显式风格**：每条第一行就是 `Style: …`（photorealistic / East Asian realism / 3D CG / cinematic CG），
+  不再依赖"电影感""高级"这类抽象词；
+- **动作写轨迹与先后**：`s9` 明确写了起手方向、接触时刻、跟随动作，并按 `[Shot 2] At 00:06.000` 分段；
+- **不重复、不冲突**：风格只声明一次；同一场景不同段落不出现互斥的光照或时间描述。
+
+### 10.3 官方风格提示词（逐字）
+
+官方给了四条风格提示词示例，原文存在 `docs/h3-gate-cases/style-reference.md`，此处摘录：
+
+| 风格 | 官方原文 |
+| --- | --- |
+| 照片级写实 | `Photorealistic style, natural lighting, realistic skin texture, detailed environmental materials, fluid character movement, cinematic camera tracking.` |
+| 东亚写实 | `East Asian realism, a traditional courtyard, realistic fabric textures, soft natural lighting, detailed architecture, fluid martial arts movements, cinematic composition.` |
+| 3D CG | `3D CG style, detailed character materials, expressive facial animation, fluid action, depth and dimensionality, polished 3D rendering.` |
+| 电影级 CG | `Cinematic CG style, dramatic cinematic lighting, detailed environments, dynamic action choreography, atmospheric effects, film-quality rendering.` |
+
+**用法约定**：
+
+- 风格行放在提示词**第一行**，格式 `Style: <官方原文>`；
+- 官方示例里混有**内容线索**（`a traditional courtyard`、`fluid martial arts movements`、
+  `detailed architecture`），用在与该内容无关的场景会与画面描述冲突——按官方"避免相互冲突"的要求，
+  受控对照时剔除这些词，只保留风格描述；
+- `s14a–s14d` 就是受控对照：**同一画面内容（渡轮海景），只换 Style 行**，四张必须呈现明显不同的风格；
+- 其余 s 系列已统一改用官方措辞（`s6`/`s8`/`s12`/`s13` 用照片级写实，`s7`/`s11` 用东亚写实，
+  `s9`/`s10` 用电影级 CG），并按需追加一条场景限定（如 `Extended dynamic range, highlights and shadows both retained.`）。
+
+### 8.9 现网网关不透传 seed 与采样参数（影响基线方法）
+
+在 `minimax-h3-ref2va`（gpu33）与 `minimax-h3-fl2va`（gpu23）的引擎日志里都能看到：
+
+```
+Applied extra_params: {'duration': 5, 'task': 'ref2va'}
+Video sampling params: steps=8 guidance=None guidance_2=None seed=None
+```
+
+我们用请求体带上了 `seed: 42`，引擎侧始终是 **`seed=None`**。
+进一步试验：把 `seed` 塞进 `extra_params` 也没用——new-api 会**重建** `extra_params`，
+只保留它自己生成的 `duration` 与 `task`，其余键被丢弃。
+
+同一条用例连跑两次（相同 prompt、相同 seed=42、无音频参考），**帧级像素都不同**：
+
+| 运行 | 第 2 秒帧 sha256（前 20 位） |
+| --- | --- |
+| `ref2va_s15_noaudio` | `b6117bd81cf9f39bece1` |
+| `ref2va_s15_noaudio_b` | `6b237455d2001445461c` |
+
+结论：
+
+1. **现网不具备同 seed 复现能力**，5.1 里"同 seed 两次 sha256 相同"这一条**在 MaaS 上不适用**，
+   只能在自建实例上验；对现网基线，改用"多次采样取中位/最快值"的方法。
+2. **`num_inference_steps` / `flow_shift` 也无法透传**——所以 s 系列的 8 步 / `flow_shift=12`
+   写法与实际执行一致（正好是现网默认值），但**无法再按参数扫描**。
+3. 音频参考（`s15`）因此**无法用 A/B 哈希法证明生效**：输出本身随机，差异不能归因。
+   要判定只能靠人耳听音色是否贴近参考音频，或对多条样本做音色统计。这是当前方法学的真实边界，
+   已如实记在这里，不做过度声称。
+
+---
+
+## 11. ref2va 三条用例实测通过（2026-10-26）
+
+`g5` / `g6` / `g11` 原先卡在"缺参考视频"，本轮补齐并全部跑通，**三条都用人眼确认参考生效**。
+
+### 11.1 参考图（g5）
+
+请求带 `metadata.src_ref_images`（`ref_person.png` 转 data-uri）。
+成片里是**同一张脸、同一件灰开衫白 T**，只是换成坐姿写字、影棚环境。
+
+> 对照：同样的字段在 `minimax-h3-fl2va`（t2v）上被**静默丢弃**（见 §8.6）。
+> 两个端点对同一字段的行为完全不同，这是本用例集里最容易踩的坑。
+
+### 11.2 参考视频（g6 / g11）
+
+参考视频用 `minimax-h3-ref2va` 自己生成（`assets_src/ref_clip.json`：暖光房间、高窗、人物转身），
+落到 `assets/ref_clip.mp4`（5 s / 1344×756 / 1.6 MB），再作为 `metadata.reference_videos` 喂回。
+
+| 用例 | 时长 | 验证点 | 结果 |
+| --- | --- | --- | --- |
+| `g6_ref2va_video` | 5 s | 是否从参考片段结尾接续、运镜/色调是否继承 | ✅ 首帧为同一扇窗、同一条窗帘、同一件灰开衫，机位退到门口，与提示词"转向门口"一致 |
+| `g11_ref2va_15s_video_continue` | 15 s | 长时程延续 + 跨房间空间连续性 | ✅ 12 s 处正是走廊门口回头镜，走廊纵深、画框与卧室尽头都成立 |
+
+音频峰值：`g5` **−0.6 dBFS**（接近满刻度，需关注是否削波）、`g6` −9.8 dBFS、`g11` −5.2 dBFS。
+
+> `g5` 的 −0.6 dBFS 已超出 `loud` 档的"≥ −20"下限很多，属于**过响**而非过轻——
+> 门槛里应补一条上限（建议 ≤ −1 dBFS），否则削波会伪装成"音量充足"。
+
+### 11.3 仍不可达的关键帧三态
+
+`g2`（i2v）/ `g3`（l2va）/ `g4`、`g9`（flf2v）在现网仍无入口（§8.6），三条 ref2va 的通过不影响这一结论。
+---
+
+## 12. 现网基线（2026-10-26 实测，29 次运行）
+
+### 12.1 环境
+
+| 项 | 值 |
+| --- | --- |
+| 网关 | `https://maas.ovaijisuan.com`（new-api `v0.13.2-ovaijisuan-20261025`） |
+| fl2va 端点 | `minimax-h3-fl2va` → gpu23 `10.0.0.6:40011`，`MiniMax-H3-Singularity-VDN-INT8`，8 步、`VDN_WINDOW_ATTN`、TP4 |
+| ref2va 端点 | `minimax-h3-ref2va` → gpu33 `10.0.0.148:40012`，`MiniMax-H3-Singularity-VDN-INT8-ref2va`，8 步 |
+| 产物 | `/nfs-output/h3_gate/runs/20261026-prod-v2/`（fl2va）与 `20261026-prod-ref2va/`（ref2va） |
+
+### 12.2 口径
+
+- **来源可追溯**：每条运行记录 `prompt_sha256`，与当前用例比对；本次 29 条**全部「一致」**。
+- **计算时间 vs 排队**：网关 `max_num_seqs=1` 串行，取同时长最快样本为计算基准，超 1.25× 标「含排队」。
+- **评分**：幻影/结构/文字 5 分制，人工看片；音频只测峰值电平（dBFS），不看内容。
+- **音频期望**：按 `audio_db_baseline` 相对判定（±6 dB），绝对档位只作兜底。
+
+### 12.3 结果
+
+| 用例 | 任务 | 时长 | seed | 状态 | 墙钟 s | 相对最快 | 来源 | 幻影 | 结构 | 文字 | 音频 | 备注 |
+| --- | --- | ---: | ---: | --- | ---: | ---: | --- | :-: | :-: | :-: | ---: | --- |
+| `g10_t2va_15s_action_vfx` | t2va | 15s | 42 | completed | 291 | 1.02× | 一致 | 4 | 4 | - | -5.2 dB | 计算时间 |
+| `g10_t2va_15s_action_vfx` | t2va | 15s | 43 | completed | 306 | 1.07× | 一致 | 4 | 5 | - | -3.9 dB | 计算时间 |
+| `g1_t2va_crowd_motion` | t2va | 5s | 42 | completed | 176 | 1.67× | 一致 | 5 | 5 | 5 | -16.6 dB | 含排队（最快 105 s 的 1.7×） |
+| `g1_t2va_crowd_motion` | t2va | 5s | 43 | completed | 116 | 1.10× | 一致 | 5 | 5 | 5 | -13.7 dB | 计算时间 |
+| `g7_t2va_15s_text_long` | t2va | 15s | 42 | completed | 291 | 1.02× | 一致 | 5 | 5 | 5 | -7.1 dB | 计算时间 |
+| `g7_t2va_15s_text_long` | t2va | 15s | 43 | completed | 291 | 1.02× | 一致 | 5 | 5 | 5 | -10.4 dB | 计算时间 |
+| `g8_t2va_15s_dialogue_music` | t2va | 15s | 42 | completed | 291 | 1.02× | 一致 | 5 | 5 | 5 | -10.6 dB | 计算时间 |
+| `g8_t2va_15s_dialogue_music` | t2va | 15s | 43 | completed | 286 | 1.00× | 一致 | 5 | 5 | 5 | -11.2 dB | 计算时间 |
+| `s10_vfx_fantasy` | t2va | 5s | 42 | completed | 116 | 1.10× | 一致 | 5 | 5 | - | -5.5 dB | 计算时间 |
+| `s11_micro_expression` | t2va | 5s | 42 | completed | 110 | 1.05× | 一致 | 5 | 5 | - | -35.9 dB | 计算时间 |
+| `s12_camera_control` | t2va | 5s | 42 | completed | 116 | 1.10× | 一致 | 5 | 5 | - | -24.3 dB | 计算时间 |
+| `s13_prompt_adherence` | t2va | 5s | 42 | completed | 116 | 1.10× | 一致 | 5 | 5 | 5 | -20.4 dB | 计算时间 |
+| `s14a_style_photoreal` | t2va | 5s | 42 | completed | 116 | 1.10× | 一致 | 5 | 5 | - | -22.1 dB | 计算时间 |
+| `s14b_style_east_asian` | t2va | 5s | 42 | completed | 116 | 1.10× | 一致 | 5 | 5 | - | -28.3 dB | 计算时间 |
+| `s14c_style_3dcg` | t2va | 5s | 42 | completed | 116 | 1.10× | 一致 | 5 | 5 | - | -23.3 dB | 计算时间 |
+| `s14d_style_cinematic_cg` | t2va | 5s | 42 | completed | 110 | 1.05× | 一致 | 5 | 5 | - | -20.2 dB | 计算时间 |
+| `s1_quant_gradient_sky` | t2va | 5s | 42 | completed | 120 | 1.14× | 一致 | 5 | 5 | - | -39.2 dB | 计算时间 |
+| `s1_quant_gradient_sky` | t2va | 5s | 43 | completed | 116 | 1.10× | 一致 | 5 | 4 | - | -38.3 dB | 计算时间 |
+| `s2_prune_face_texture` | t2va | 5s | 42 | completed | 115 | 1.09× | 一致 | 5 | 5 | - | -41.2 dB | 计算时间 |
+| `s3_vdn_wide_pan_distant` | t2va | 15s | 42 | completed | 291 | 1.02× | 一致 | 5 | 5 | - | -34.6 dB | 计算时间 |
+| `s3_vdn_wide_pan_distant` | t2va | 15s | 43 | completed | 296 | 1.03× | 一致 | 5 | 5 | - | -31.2 dB | 计算时间 |
+| `s4_quant_dark_small_text` | t2va | 5s | 42 | completed | 106 | 1.00× | 一致 | 5 | 5 | 5 | -11.6 dB | 计算时间 |
+| `s5_quant_thin_lines_backlit` | t2va | 5s | 42 | completed | 120 | 1.14× | 一致 | 5 | 5 | - | -23.5 dB | 计算时间 |
+| `s6_hdr_motion_blur` | t2va | 5s | 42 | completed | 105 | 1.00× | 一致 | 4 | 4 | - | -24.4 dB | 计算时间 |
+| `s6_hdr_motion_blur` | t2va | 5s | 43 | completed | 106 | 1.00× | 一致 | 4 | 4 | - | -25.1 dB | 计算时间 |
+| `s7_distant_face_repair` | t2va | 5s | 42 | completed | 105 | 1.00× | 一致 | 5 | 5 | - | -32.5 dB | 计算时间 |
+| `s8_natural_material` | t2va | 5s | 42 | completed | 120 | 1.14× | 一致 | 5 | 5 | - | -17.6 dB | 计算时间 |
+| `s9_action_impact` | t2va | 15s | 42 | completed | 296 | 1.03× | 一致 | 5 | 5 | - | -8.2 dB | 计算时间 |
+| `s9_action_impact` | t2va | 15s | 43 | completed | 291 | 1.02× | 一致 | 5 | 5 | - | -4.4 dB | 计算时间 |
+
+**峰值显存**（网关不返回，在 gpu23 上用 `nvidia-smi` 每 2–3 s 采样实测）：
+
+| 时长 | 峰值/卡 | 采样 |
+| --- | ---: | --- |
+| 5 s | **19.4 GB**（19417 MiB） | 64 个采样点，四卡一致 |
+| 15 s | **22.5 GB**（22503 MiB） | 101 个采样点，四卡一致 |
+
+对照我们自建 4 步 turbo（5s 19.7 GB、15s 25.9 GB），现网 8 步 INT8 的显存**更省**——
+INT8 量化与 VDN 窗口注意力的收益主要体现在这里。
+
+**汇总**：完成且可追溯 29 / 29；关键帧四例（g2/g3/g4/g9）被网关拒绝（§8.6），未计入。
+5s 最快 **105 s** / 中位 116 s；15s 最快 **286 s** / 中位 291 s。
+
+### 12.4 从基线读出的结论
+
+1. **画面整体很强**：除 `g10`（快动作拖影）与 `s6`（HDR 前景运动模糊）为 4 分外，其余 24 条幻影/结构均为 5 分。
+2. **文字渲染是现网强项**：`g7` 的出发信息屏（含整屏时间表小字）、`g8` 的黑板「今日手冲 柑橘花香」、
+   `s4` 手掌大的「修鞋」、`s13` 的「2026 归档」全部正确可读。
+3. **Singularity 的专项声明基本成立**：剪枝未毁高频（`s2` 毛孔/胡茬清晰）、
+   量化无色带（`s1` 阶梯 < 1 级）、VDN 长程稳（`s3` 15s 慢摇远景船一直在）、
+   运镜指令可执行（`s12` 严格执行下摇→前推→右摇）、四风格可区分（`s14a–d`）。
+4. **唯一系统性弱点**：快速运动下的拖影（`g10`、`s6`），这与官方"HDR 与模糊抑制"的宣称仍有差距。

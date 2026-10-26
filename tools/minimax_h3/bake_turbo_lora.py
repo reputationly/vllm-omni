@@ -375,28 +375,118 @@ def bake(
     return ratios
 
 
-def assemble_partition(base_dir: Path, out_transformer: Path, partition_out: Path) -> None:
-    """Build a servable partition dir: baked transformer + symlinks to shared components.
+PARTITION_KEYS = ("fl2va", "ref2va")
 
-    The text encoder and VAEs are unchanged and large; symlinking avoids a second
-    copy on NFS. The result is what `--model` should point at.
+
+def _read_release_metadata(model_index_path: Path) -> dict:
+    doc = json.loads(model_index_path.read_text(encoding="utf-8"))
+    meta = doc.get("_minimax_h3")
+    if not isinstance(meta, dict):
+        raise SystemExit(f"{model_index_path} has no `_minimax_h3` block")
+    return meta
+
+
+def _validate_release(meta: dict, origin: str) -> None:
+    partition = str(meta.get("partition", "")).lower()
+    if partition not in PARTITION_KEYS:
+        raise SystemExit(f"{origin}: unsupported partition {partition!r}, expected one of {PARTITION_KEYS}")
+    shifts = meta.get("sigma_shift_scales") or {}
+    for key in ("video", "audio"):
+        if not isinstance(shifts.get(key), int | float):
+            raise SystemExit(f"{origin}: sigma_shift_scales.{key} is missing or not a number")
+    schedule = meta.get("base_schedule")
+    if schedule is not None and (not isinstance(schedule, list) or len(schedule) < 2):
+        raise SystemExit(f"{origin}: base_schedule must list at least two sigma boundaries")
+
+
+def resolve_contract(base_dir: Path, contract_from: Path | None) -> tuple[dict, str]:
+    """Return the distilled contract the assembled partition has to declare.
+
+    The baked transformer is a distilled checkpoint, so the partition must carry that
+    release's flow shifts (and its sigma grid when it has one). The base partition's own
+    ``model_index.json`` describes an *un-distilled* checkpoint: inheriting it silently
+    serves the adapter with the base shift, which then reads as a quality bug rather than
+    a configuration error. It is therefore only inherited when the base is itself distilled.
+    """
+    if contract_from is not None:
+        meta = _read_release_metadata(contract_from)
+        _validate_release(meta, str(contract_from))
+        return meta, str(contract_from)
+
+    base_index = base_dir.parent / "model_index.json"
+    if base_index.is_file():
+        meta = _read_release_metadata(base_index)
+        if meta.get("distilled") or meta.get("base_schedule"):
+            _validate_release(meta, str(base_index))
+            return meta, f"{base_index} (distilled base)"
+
+    raise SystemExit(
+        "refusing to assemble a servable partition without a distillation contract:\n"
+        f"  {base_index} carries neither `distilled` nor `base_schedule`,\n"
+        "  so inheriting it would serve this baked adapter with the base model's flow shift.\n"
+        "Pass --contract-from <model_index.json> from the release this LoRA belongs to\n"
+        "(it supplies sigma_shift_scales and, for few-step releases, base_schedule)."
+    )
+
+
+def assemble_partition(
+    base_dir: Path,
+    out_transformer: Path,
+    partition_out: Path,
+    *,
+    contract_from: Path | None = None,
+    fusion_scale: float | None = None,
+    copy_components: bool = True,
+) -> None:
+    """Build a servable partition dir: baked transformer + the shared components.
+
+    ``copy_components`` (default) duplicates the text encoder and VAEs so the partition is
+    self-contained; pass ``False`` to symlink them instead and save the space. Copies are
+    several tens of GiB per partition (the text encoder alone is ~63 GiB), so the choice is
+    deliberate rather than incidental.
+
+    ``model_index.json`` is always written as a real file, never symlinked: it has to
+    describe the distilled contract, and a symlink would also let any later edit rewrite the
+    base model in place (a manual metadata patch has already done exactly that once).
     """
     source_partition = base_dir.parent
+    meta, origin = resolve_contract(base_dir, contract_from)
     partition_out.mkdir(parents=True, exist_ok=True)
 
     for entry in sorted(source_partition.iterdir()):
-        if entry.name == base_dir.name:
+        if entry.name in (base_dir.name, "model_index.json"):
             continue
-        link = partition_out / entry.name
-        if link.is_symlink() or link.exists():
+        dest = partition_out / entry.name
+        if dest.is_symlink() or dest.exists():
             continue
-        os.symlink(entry.resolve(), link)
+        if copy_components:
+            shutil.copytree(entry.resolve(), dest, symlinks=False)
+        else:
+            os.symlink(entry.resolve(), dest)
 
     target = partition_out / base_dir.name
     if target.resolve() != out_transformer.resolve():
         if target.is_symlink() or target.exists():
             raise SystemExit(f"{target} already exists and does not point at {out_transformer}")
         os.symlink(out_transformer.resolve(), target)
+
+    index_path = partition_out / "model_index.json"
+    if index_path.is_symlink():
+        index_path.unlink()
+
+    doc = json.loads((source_partition / "model_index.json").read_text(encoding="utf-8"))
+    doc["_minimax_h3"] = json.loads(json.dumps(meta))
+    if fusion_scale is not None:
+        doc["_minimax_h3"].setdefault("distilled", {})["effective_lora_scale"] = float(fusion_scale)
+    index_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    shifts = meta["sigma_shift_scales"]
+    print(f"\npartition metadata source: {origin}")
+    print(
+        f"  shift video/audio = {shifts['video']:g}/{shifts['audio']:g}"
+        f", sigma points = {len(meta.get('base_schedule') or [])}"
+        f", effective scale = {fusion_scale}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +543,25 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="also assemble a servable partition dir here (symlinks the shared components)",
+    )
+    parser.add_argument(
+        "--contract-from",
+        type=Path,
+        default=None,
+        help=(
+            "model_index.json of the release this LoRA belongs to; its `_minimax_h3` block "
+            "(flow shifts, sigma grid) is copied into the assembled partition. Required when "
+            "the base partition is not itself distilled."
+        ),
+    )
+    parser.add_argument(
+        "--symlink-components",
+        action="store_true",
+        help=(
+            "symlink the shared components (text encoder, VAEs) instead of copying them. "
+            "Saves several tens of GiB per partition but leaves the directory dependent on "
+            "the base model; the default is a self-contained copy."
+        ),
     )
     parser.add_argument(
         "--scale",
@@ -525,7 +634,14 @@ def main() -> int:
     )
 
     if args.partition_out:
-        assemble_partition(args.base, args.output, args.partition_out)
+        assemble_partition(
+            args.base,
+            args.output,
+            args.partition_out,
+            contract_from=args.contract_from,
+            fusion_scale=scale,
+            copy_components=not args.symlink_components,
+        )
         print(f"\npartition assembled: {args.partition_out}")
         print("point --model at that directory")
 
