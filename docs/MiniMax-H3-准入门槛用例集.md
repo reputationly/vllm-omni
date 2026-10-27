@@ -1718,3 +1718,45 @@ python3 tools/minimax_h3_turbo/summarize_gate_runs.py \
 
 > 说明：同一用例目录下的 `summary.json` 记录状态与墙钟，`request.json` 记录实际下发的请求体
 > （含 `prompt_sha256`），可用于核对这条结果是否对应当前用例版本。
+
+### 16.5 输入条件清单（跑用例前必须就位）
+
+固定输入全部放在 **`/nfs-models/wuhanjisuan894/h3_gate/assets/`**（持久存储）。
+用例 JSON 里写的是本目录的绝对路径，**不要改名、不要移动**；同目录下的 `README.md` 是这份清单的副本。
+
+| 文件 | 规格 | 用于用例 | 来源 |
+| --- | --- | --- | --- |
+| `first_frame.png` | 1024×1024 PNG | `g2_i2va_first_frame` | qwen-image-pro 生成（窗边持杯女性） |
+| `last_frame.png` | 1024×1024 PNG | `g3_l2va_last_frame` | qwen-image-pro 生成（雨夜斑马线） |
+| `first_frame_cycle.png` | 1024×1024 PNG | `g4_fl2va_first_last` 首帧 | qwen-image-pro 生成（骑行起点） |
+| `last_frame_cycle.png` | 1024×1024 PNG | `g4_fl2va_first_last` 尾帧 | qwen-image-pro 生成（骑行压弯） |
+| `g9_first.png` | 1024×1024 PNG | `g9_fl2va_15s_keyframes` 首帧 | qwen-image-pro 生成（站台） |
+| `g9_last.png` | 1024×1024 PNG | `g9_fl2va_15s_keyframes` 尾帧 | qwen-image-pro 生成（车厢） |
+| `ref_person.png` | 1024×1024 PNG | `g5_ref2va_image` | qwen-image-pro 生成（女性身份参考） |
+| `ref_person_male.png` | 1024×1024 PNG | `s15_audio_reference` | qwen-image-pro 生成；**提示词性别必须与图一致** |
+| `ref_clip.mp4` | 1344×736 / 24 fps / 5.18 s | `g6_ref2va_video`、`g11_ref2va_15s_video_continue` | ref2va 自产（暖光房间、高窗、转身） |
+| `ref_voice.wav` | 24 kHz 单声道 PCM / 2.72 s | `s15_audio_reference` | `breeze-tts-2` 合成同句台词（男中音） |
+| `vbvr_1_001.png` | 1376×768 PNG | `v1_vbvr_apples` | Licon VBVR `validation/1/001.png` |
+| `vbvr_2_001.png` | 1376×768 PNG | `v2_vbvr_pepper` | 同上 `validation/2` |
+| `vbvr_3_001.png` | 1376×768 PNG | `v3_vbvr_magazine` | 同上 `validation/3` |
+| `vbvr_4_001.png` | 864×480 PNG | `v4_vbvr_blocks` | 同上 `validation/4` |
+| `vbvr_5_001.png` | 1376×768 PNG | `v5_vbvr_cylinders` | 同上 `validation/5` |
+| `vbvr_6_001.png` | 864×480 PNG | `v6_vbvr_cubes` | 同上 `validation/6` |
+
+**共 16 个文件，覆盖 15 条用例**（其余 22 条只吃文本，无需素材）。
+
+怎么核对是否就位：
+
+```bash
+ls -l /nfs-models/wuhanjisuan894/h3_gate/assets/ | wc -l   # 应为 17（16 素材 + README）
+```
+
+怎么重新生成：
+
+- 图像：`tools/minimax_h3_turbo/gen_gate_assets.py`（提示词内置，含禁止文字的统一约束）；
+  VBVR 那六张不在脚本内，需从 `LiconStudio/Minimax-H3-VBVR` 的 `validation/<n>/001.png` 取。
+- 参考视频：用 ref2va 跑一次生成 case（§14.7），产物落到 `ref_clip.mp4`。
+- 参考音频：网关 `breeze-tts-2` 合成同句台词（§8.10）。
+
+**冻结规则**：素材一旦被基线使用就不得替换。确需更换时必须换批次号、在 §16 登记新路径与原因、
+并重跑受影响的用例，不能与旧结果混用。
