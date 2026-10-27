@@ -1628,3 +1628,93 @@ python3 tools/minimax_h3_turbo/summarize_gate_runs.py \
   --runs-dir  /nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2 \
   --out /tmp/baseline.md
 ```
+
+### 16.4 现网基线：逐条成片路径
+
+下面是**现网跑出来的结果**（§12 基线表的数据源），每条给出可直接打开的 `output.mp4` 绝对路径。
+路径以持久存储 `/nfs-models/wuhanjisuan894/h3_gate/` 为根，`/nfs-output` 被清理后依然有效。
+
+
+### 20261026-prod-v2 —— 现网主基线（T2VA + Singularity 专项，29 条）
+
+| 用例 | seed | 墙钟 | 成片路径 |
+| --- | ---: | ---: | --- |
+| `g10_t2va_15s_action_vfx` | 42 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g10_t2va_15s_action_vfx_s42/output.mp4` |
+| `g10_t2va_15s_action_vfx` | 43 | 306 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g10_t2va_15s_action_vfx_s43/output.mp4` |
+| `g1_t2va_crowd_motion` | 42 | 176 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g1_t2va_crowd_motion_s42/output.mp4` |
+| `g1_t2va_crowd_motion` | 43 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g1_t2va_crowd_motion_s43/output.mp4` |
+| `g7_t2va_15s_text_long` | 42 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g7_t2va_15s_text_long_s42/output.mp4` |
+| `g7_t2va_15s_text_long` | 43 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g7_t2va_15s_text_long_s43/output.mp4` |
+| `g8_t2va_15s_dialogue_music` | 42 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g8_t2va_15s_dialogue_music_s42/output.mp4` |
+| `g8_t2va_15s_dialogue_music` | 43 | 286 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_g8_t2va_15s_dialogue_music_s43/output.mp4` |
+| `s10_vfx_fantasy` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s10_vfx_fantasy_s42/output.mp4` |
+| `s11_micro_expression` | 42 | 110 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s11_micro_expression_s42/output.mp4` |
+| `s12_camera_control` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s12_camera_control_s42/output.mp4` |
+| `s13_prompt_adherence` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s13_prompt_adherence_s42/output.mp4` |
+| `s14a_style_photoreal` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s14a_style_photoreal_s42/output.mp4` |
+| `s14b_style_east_asian` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s14b_style_east_asian_s42/output.mp4` |
+| `s14c_style_3dcg` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s14c_style_3dcg_s42/output.mp4` |
+| `s14d_style_cinematic_cg` | 42 | 110 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s14d_style_cinematic_cg_s42/output.mp4` |
+| `s1_quant_gradient_sky` | 42 | 120 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s1_quant_gradient_sky_s42/output.mp4` |
+| `s1_quant_gradient_sky` | 43 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s1_quant_gradient_sky_s43/output.mp4` |
+| `s2_prune_face_texture` | 42 | 115 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s2_prune_face_texture_s42/output.mp4` |
+| `s3_vdn_wide_pan_distant` | 42 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s3_vdn_wide_pan_distant_s42/output.mp4` |
+| `s3_vdn_wide_pan_distant` | 43 | 296 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s3_vdn_wide_pan_distant_s43/output.mp4` |
+| `s4_quant_dark_small_text` | 42 | 106 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s4_quant_dark_small_text_s42/output.mp4` |
+| `s5_quant_thin_lines_backlit` | 42 | 120 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s5_quant_thin_lines_backlit_s42/output.mp4` |
+| `s6_hdr_motion_blur` | 42 | 105 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s6_hdr_motion_blur_s42/output.mp4` |
+| `s6_hdr_motion_blur` | 43 | 106 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s6_hdr_motion_blur_s43/output.mp4` |
+| `s7_distant_face_repair` | 42 | 105 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s7_distant_face_repair_s42/output.mp4` |
+| `s8_natural_material` | 42 | 120 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s8_natural_material_s42/output.mp4` |
+| `s9_action_impact` | 42 | 296 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s9_action_impact_s42/output.mp4` |
+| `s9_action_impact` | 43 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s9_action_impact_s43/output.mp4` |
+
+### 20261026-prod-v2b —— 提示词合规修正后重跑（8 条）
+
+| 用例 | seed | 墙钟 | 成片路径 |
+| --- | ---: | ---: | --- |
+| `s14c_style_3dcg` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s14c_style_3dcg_s42/output.mp4` |
+| `s1_quant_gradient_sky` | 42 | 106 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s1_quant_gradient_sky_s42/output.mp4` |
+| `s1_quant_gradient_sky` | 43 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s1_quant_gradient_sky_s43/output.mp4` |
+| `s2_prune_face_texture` | 42 | 110 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s2_prune_face_texture_s42/output.mp4` |
+| `s3_vdn_wide_pan_distant` | 42 | 296 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s3_vdn_wide_pan_distant_s42/output.mp4` |
+| `s3_vdn_wide_pan_distant` | 43 | 291 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s3_vdn_wide_pan_distant_s43/output.mp4` |
+| `s4_quant_dark_small_text` | 42 | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s4_quant_dark_small_text_s42/output.mp4` |
+| `s5_quant_thin_lines_backlit` | 42 | 110 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2b/prod_s5_quant_thin_lines_backlit_s42/output.mp4` |
+
+### 20261026-prod-keyframe —— 关键帧三态（4 条）
+
+| 用例 | seed | 墙钟 | 成片路径 |
+| --- | ---: | ---: | --- |
+| `g2_i2va_first_frame` | - | 161 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-keyframe/prod_g2_i2va_first_frame/output.mp4` |
+| `g3_l2va_last_frame` | - | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-keyframe/prod_g3_l2va_last_frame/output.mp4` |
+| `g4_fl2va_first_last` | - | 126 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-keyframe/prod_g4_fl2va_first_last/output.mp4` |
+| `g9_fl2va_15s_keyframes` | - | 322 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-keyframe/prod_g9_fl2va_15s_keyframes/output.mp4` |
+
+### 20261026-prod-ref2va —— 参考生视频 + 音频参考（7 条）
+
+| 用例 | seed | 墙钟 | 成片路径 |
+| --- | ---: | ---: | --- |
+| `g11_15s` | - | 547 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_g11_15s/output.mp4` |
+| `g5_image` | - | 121 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_g5_image/output.mp4` |
+| `g6_video` | - | 261 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_g6_video/output.mp4` |
+| `s15_audio` | - | 126 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_s15_audio/output.mp4` |
+| `s15_noaudio` | - | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_s15_noaudio/output.mp4` |
+| `s15_noaudio_b` | - | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_s15_noaudio_b/output.mp4` |
+| `s15_seedx` | - | 107 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-ref2va/ref2va_s15_seedx/output.mp4` |
+
+### 20261027-ext —— 外部参照（8 条）
+
+| 用例 | seed | 墙钟 | 成片路径 |
+| --- | ---: | ---: | --- |
+| `e1_sb_train_chase` | - | 121 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_e1_sb_train_chase/output.mp4` |
+| `e2_sb_glass_table` | - | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_e2_sb_glass_table/output.mp4` |
+| `v1_vbvr_apples` | - | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_v1_vbvr_apples/output.mp4` |
+| `v2_vbvr_pepper` | - | 131 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_v2_vbvr_pepper/output.mp4` |
+| `v3_vbvr_magazine` | - | 131 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_v3_vbvr_magazine/output.mp4` |
+| `v4_vbvr_blocks` | - | 256 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_v4_vbvr_blocks/output.mp4` |
+| `v5_vbvr_cylinders` | - | 211 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_v5_vbvr_cylinders/output.mp4` |
+| `v6_vbvr_cubes` | - | 116 s | `/nfs-models/wuhanjisuan894/h3_gate/runs/20261027-ext/ext_v6_vbvr_cubes/output.mp4` |
+
+> 说明：同一用例目录下的 `summary.json` 记录状态与墙钟，`request.json` 记录实际下发的请求体
+> （含 `prompt_sha256`），可用于核对这条结果是否对应当前用例版本。
