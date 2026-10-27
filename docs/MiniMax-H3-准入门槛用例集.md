@@ -1561,3 +1561,70 @@ docker run -d --name h3-v2-fixbias-int8 --gpus all --network host --ipc host \
 - `v3`：**先动哪个物体**是硬约束，看前 1.5 秒第一只手伸向谁；
 - `v6`：盯 4–5 s 处是否多出方块；
 - `e2`：左右手分工、"NIGHT SHIFT" 文字、镜中倒影是否与实物对应。
+
+---
+
+## 16. 基线生成物路径（权威副本）
+
+**根目录**：`/nfs-models/wuhanjisuan894/h3_gate/`（持久存储；`/nfs-output/h3_gate/` 只是会被清理的镜像）
+
+每个用例目录内固定四件套：
+
+```text
+<批次>/<tag>/
+├── output.mp4      成片
+├── summary.json    状态、墙钟、峰值主机内存、容器名
+├── request.json    实际下发的请求体（含 prompt_sha256）
+├── progress.json   逐阶段进度采样
+└── samples.jsonl   每秒 CPU/GPU/显存采样
+```
+
+同目录下的 `runs/README.md` 是这份清单的副本，方便直接在该目录里查看。
+
+### 16.1 各批次
+
+| 批次目录 | 内容 | 用例 | 视频 | 大小 |
+| --- | --- | ---: | ---: | ---: |
+| `runs/20261026-prod-v2/` | **现网主基线**（29 条，§12 表的数据源） | 29 | 29 | 142 M |
+| `runs/20261026-prod-v2b/` | 提示词合规修正后重跑（§12.6） | 8 | 8 | 36 M |
+| `runs/20261026-prod-keyframe/` | 关键帧三态四条（i2v/l2va/flf2v） | 4 | 4 | 29 M |
+| `runs/20261026-prod-ref2va/` | ref2va 四条 + s15 音频参考对照组 | 7 | 7 | 28 M |
+| `runs/20261027-ext/` | 外部参照 8 条（§15，含两张抽帧拼图） | 8 | 8 | 37 M |
+| `runs/20261026-v1full/` | v1（现网权重，本地实例）25 条 | 25 | 25 | 101 M |
+| `runs/20261026-v2full/` | v2（fixbias）25 条 | 25 | 25 | 98 M |
+| `runs/20261026-v2bf16/` | BF16 未剪枝档（部分完成，§14.10） | 10 | 8 | 30 M |
+| `runs/20261026-v2ref2va/` | v2 的 ref2va 四条 | 4 | 4 | 8.6 M |
+| `runs/20261026-v1local/` | 本地 v1 六条受控对照 | 6 | 6 | 16 M |
+| `runs/20261026-v2/` | 本地 v2 六条受控对照 | 8 | 7 | 14 M |
+| `runs/20261026-s15v2/` | 音频参考：可控参考音（第一轮） | 2 | 2 | 7.0 M |
+| `runs/20261026-s15v3/` | 音频参考：三组混淆实验（§8.10 作废） | 3 | 3 | 11 M |
+| `runs/20261026-s15v4/` | 音频参考：干净对照（**结论依据**） | 2 | 2 | 6.6 M |
+| `runs/20261026-prod-stale/` | 不可追溯的旧结果（隔离，**不进基线**） | 9 | 8 | 57 M |
+| `runs/20261026-mem/` | 显存采样用两次单独运行 | 2 | 2 | 12 M |
+| `runs/20261026-assets/` | 参考视频生成（ref_clip.mp4 的来源） | 1 | 1 | 3.7 M |
+| `runs/v1v2_compare/` | v1 vs v2 对照拼图（25 行） | — | — | 4.0 M |
+
+### 16.2 关键索引文件
+
+| 文件 | 用途 |
+| --- | --- |
+| `runs/20261026-prod-v2/BASELINE.md` | 由 `summarize_gate_runs.py` 生成的基线表（含溯源与排队标注） |
+| `runs/v1v2_compare/sheet.png` | v1 / v2 逐条抽帧对照（25 行） |
+| `runs/compare3_sheet.png` | 三档对照（v1 / v2 / BF16） |
+| `runs/20261027-ext/ext_sheet.png`、`ext_sheet2.png` | 外部参照用例抽帧（e1–e3、v1–v6） |
+| `runs/prod_v2_sheet.png` | 现网主基线抽帧（在 `runs/` 根目录，不在批次目录内） |
+| `runs/prod-v2.log` | 现网批次运行日志 |
+| `cases/manifest.json` | 37 条用例的索引与来源标注 |
+
+### 16.3 复核基线时的最短路径
+
+```bash
+# 看某条用例的请求与结果
+cat /nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2/prod_s1_quant_gradient_sky_s42/summary.json
+
+# 重算基线表（会逐条校验 prompt_sha256）
+python3 tools/minimax_h3_turbo/summarize_gate_runs.py \
+  --suite-dir /nfs-models/wuhanjisuan894/h3_gate/cases \
+  --runs-dir  /nfs-models/wuhanjisuan894/h3_gate/runs/20261026-prod-v2 \
+  --out /tmp/baseline.md
+```
