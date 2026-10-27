@@ -62,6 +62,31 @@ tools/minimax_h3_turbo/run_suite.sh local http://10.0.0.126:40700 /nfs-output/h3
 > 需要测吞吐/并发能力时，那是**另一个实验**：单独建批次、单独记录，并在报告里标明
 > "这是并发实验，墙钟含排队"，**不能混进质量基线**。
 
+### 0.1.2 产物必须落在 `/nfs-models`，不是 `/nfs-output`
+
+`/nfs-output` **会定期清理**，只适合放临时产物。用例、素材、基线结果一律放持久目录：
+
+```text
+/nfs-models/wuhanjisuan894/h3_gate/
+├── cases/      37 条用例 + manifest（媒体路径已指向本目录 assets/）
+├── assets/     冻结素材（首帧、尾帧、参考图、参考视频、参考音频、VBVR 首帧）
+├── runs/       基线产物（各批次 output.mp4 + summary.json + request.json）
+└── ext_cases/  外部仓库原始提示词与首帧（Semantic-Bridge / VBVR）
+```
+
+**新批次直接写这里**，不要再往 `/nfs-output` 写：
+
+```bash
+--output-root /nfs-models/wuhanjisuan894/h3_gate/runs/<日期>-<批次>
+```
+
+`/nfs-output/h3_gate/` 下仍保留一份当前副本供脚本默认路径使用，但**它不是权威存储**，
+被清理后请从 `/nfs-models` 重新同步：
+
+```bash
+cp -a /nfs-models/wuhanjisuan894/h3_gate/{cases,assets,runs} /nfs-output/h3_gate/
+```
+
 ### 0.2 必须先做的三件事
 
 | # | 事 | 不做会怎样 |
@@ -184,7 +209,7 @@ H3 是**音视频联合生成**模型，不是图像模型。因此"文生图"�
 
 ### 素材要求
 
-`g2–` `g6`、`g9`、`g11` 需要固定素材，放在 `/nfs-output/h3_gate/assets/`，**首次运行后冻结**：
+`g2`–`g6`、`g9`、`g11`、`s15`、`v1`–`v6` 需要固定素材，放在 **`/nfs-models/wuhanjisuan894/h3_gate/assets/`**（持久存储；`/nfs-output` 会被清理），**首次运行后冻结**：
 
 | 文件 | 用途 | 要求 |
 | --- | --- | --- |
