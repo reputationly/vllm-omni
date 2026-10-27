@@ -1743,7 +1743,7 @@ python3 tools/minimax_h3_turbo/summarize_gate_runs.py \
 | `vbvr_5_001.png` | 1376×768 PNG | `v5_vbvr_cylinders` | 同上 `validation/5` |
 | `vbvr_6_001.png` | 864×480 PNG | `v6_vbvr_cubes` | 同上 `validation/6` |
 
-**共 16 个文件，覆盖 15 条用例**（其余 22 条只吃文本，无需素材）。
+**共 16 个文件，覆盖 14 条用例**（其余 23 条只吃文本，无需素材）。
 
 怎么核对是否就位：
 
