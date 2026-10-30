@@ -84,9 +84,12 @@ _SNAPSHOT_DIR = os.getenv("VLLM_OMNI_H3_MEMORY_SNAPSHOT_DIR")
 _SNAPSHOT_STEP = int(os.getenv("VLLM_OMNI_H3_MEMORY_SNAPSHOT_STEP", "1"))
 # TP diagnostic: the renoise solver draws eps on every rank from a replicated
 # generator, so the final latents must agree bit-for-bit across ranks. Enabled
-# per deployment, it logs one sha256 per rank per request so a divergence is a
-# log diff rather than a silent quality loss.
+# per deployment, it writes one sha256 per rank per request to
+# VLLM_OMNI_H3_LATENT_SHA256_DIR so a divergence is a file diff rather than a
+# silent quality loss. A file, not the logger: stage-worker logs do not reach
+# the engine's collected output.
 _LOG_FINAL_LATENT_SHA256 = os.getenv("VLLM_OMNI_H3_LOG_FINAL_LATENT_SHA256", "0") == "1"
+_LATENT_SHA256_DIR = os.getenv("VLLM_OMNI_H3_LATENT_SHA256_DIR")
 
 
 def _log_final_latent_sha256(video_rows: torch.Tensor) -> None:
@@ -94,6 +97,13 @@ def _log_final_latent_sha256(video_rows: torch.Tensor) -> None:
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     digest = hashlib.sha256(video_rows.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()
+    if _LATENT_SHA256_DIR:
+        import time
+        from pathlib import Path
+
+        Path(_LATENT_SHA256_DIR).mkdir(parents=True, exist_ok=True)
+        path = Path(_LATENT_SHA256_DIR) / f"{time.time_ns()}_rank{rank}.txt"
+        path.write_text(f"rank={rank} shape={tuple(video_rows.shape)} sha256={digest}\n")
     logger.info("H3 final video latents sha256 rank=%d shape=%s: %s", rank, tuple(video_rows.shape), digest)
 
 
