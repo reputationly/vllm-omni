@@ -80,6 +80,11 @@ def test_renoise_solver_requires_a_generator():
 def test_renoise_final_step_returns_x0_without_drawing_noise(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
 
+    generator = torch.Generator().manual_seed(43)
+    solver = create_h3_sample_solver("renoise", _SIGMAS, generator=generator)
+    state = torch.randn(6, 96, generator=torch.Generator().manual_seed(1))
+    x0 = torch.randn(6, 96, generator=torch.Generator().manual_seed(2)) * 0.1
+
     draws = []
     real_randn = torch.randn
 
@@ -88,11 +93,6 @@ def test_renoise_final_step_returns_x0_without_drawing_noise(monkeypatch):
         return real_randn(*args, **kwargs)
 
     monkeypatch.setattr(torch, "randn", counting_randn)
-    generator = torch.Generator().manual_seed(43)
-    solver = create_h3_sample_solver("renoise", _SIGMAS, generator=generator)
-    state = torch.randn(6, 96, generator=torch.Generator().manual_seed(1))
-    x0 = torch.randn(6, 96, generator=torch.Generator().manual_seed(2)) * 0.1
-
     solver.step(state, x0, 0)
     solver.step(state, x0, 1)
     assert len(draws) == 2
@@ -131,15 +131,23 @@ def test_renoise_same_seed_reproduces_the_update():
     state = torch.randn(4, 96, generator=torch.Generator().manual_seed(1))
     x0 = torch.randn(4, 96, generator=torch.Generator().manual_seed(2)) * 0.1
 
-    def run(seed: int) -> torch.Tensor:
+    def run(seed: int) -> list[torch.Tensor]:
         solver = create_h3_sample_solver("renoise", _SIGMAS, generator=torch.Generator().manual_seed(seed))
+        outs = []
         out = state
         for step in range(len(_SIGMAS) - 1):
             out = solver.step(out, x0, step)
-        return out
+            outs.append(out)
+        return outs
 
-    assert torch.equal(run(43), run(43))
-    assert not torch.equal(run(43), run(44))
+    first, repeat, other = run(43), run(43), run(44)
+    for left, right in zip(first, repeat, strict=True):
+        assert torch.equal(left, right)
+    # The noise draws diverge per seed on every non-final step; the terminal
+    # step is the deterministic x0 passthrough and must not.
+    assert not torch.equal(first[0], other[0])
+    assert not torch.equal(first[1], other[1])
+    assert torch.equal(first[2], other[2])
 
 
 def test_renoise_video_steps_before_audio_on_one_generator():
@@ -311,6 +319,9 @@ def _distilled_renoise_pipeline(diffuse_calls: list[dict[str, Any]]):
 
     pipeline.diffuse = diffuse
     pipeline.decode = Mock(return_value=(torch.zeros(1, 3, 1, 1, 1), torch.zeros(1)))
+    # The CPU platform has no allocator cache to release; the sampler contract
+    # under test lives upstream of that boundary.
+    pipeline._release_stage_cache = lambda: None
     return pipeline
 
 
