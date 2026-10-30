@@ -20,8 +20,8 @@ from .scheduling_minimax_h3_euler_ancestral import minimax_h3_euler_eta0_step
 def normalize_h3_sampler(name: str | None) -> str:
     if name is None:
         return "euler"
-    if name not in ("euler", "res_multistep"):
-        raise ValueError(f"Unsupported MiniMax H3 sampler: {name!r}; expected euler or res_multistep")
+    if name not in ("euler", "res_multistep", "renoise"):
+        raise ValueError(f"Unsupported MiniMax H3 sampler: {name!r}; expected euler, res_multistep or renoise")
     return name
 
 
@@ -48,8 +48,11 @@ def res_multistep_coeffs(sigmas: Sequence[float]) -> list[tuple[float, float] | 
 class H3SampleSolver:
     """Own the denoised history for one request and one video/audio stream."""
 
-    def __init__(self, name: str | None, sigmas: Sequence[float]):
+    def __init__(self, name: str | None, sigmas: Sequence[float], generator: torch.Generator | None = None):
         self.name = normalize_h3_sampler(name)
+        if self.name == "renoise" and generator is None:
+            raise ValueError("MiniMax H3 renoise sampling requires a dedicated torch.Generator")
+        self.generator = generator
         self.sigmas = tuple(float(s) for s in sigmas)
         self.coeffs = res_multistep_coeffs(self.sigmas)
         self.old_denoised: torch.Tensor | None = None
@@ -60,7 +63,20 @@ class H3SampleSolver:
             raise ValueError("H3 solver steps must be consumed once, in order")
         coeff = self.coeffs[step]
         curr, nxt = self.sigmas[step : step + 2]
-        if self.name == "euler" or coeff is None:
+        if self.name == "renoise":
+            if nxt == 0:
+                # The terminal boundary lands on clean latents, so the solver
+                # returns x0 and must not consume the generator's stream.
+                out = denoised.to(state.dtype)
+            else:
+                eps = torch.randn(
+                    state.shape,
+                    generator=self.generator,
+                    device=state.device,
+                    dtype=torch.float32,
+                )
+                out = ((1.0 - nxt) * denoised.float() + nxt * eps).to(state.dtype)
+        elif self.name == "euler" or coeff is None:
             out = minimax_h3_euler_eta0_step(state, denoised, sigma_curr=curr, sigma_next=nxt)
         else:
             old = self.old_denoised
@@ -82,5 +98,9 @@ class H3SampleSolver:
         return out
 
 
-def create_h3_sample_solver(name: str | None, sigmas: Sequence[float]) -> H3SampleSolver:
-    return H3SampleSolver(name, sigmas)
+def create_h3_sample_solver(
+    name: str | None,
+    sigmas: Sequence[float],
+    generator: torch.Generator | None = None,
+) -> H3SampleSolver:
+    return H3SampleSolver(name, sigmas, generator=generator)

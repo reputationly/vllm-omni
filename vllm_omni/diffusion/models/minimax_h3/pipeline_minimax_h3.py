@@ -131,6 +131,7 @@ from .condition_noise import (
 from .continuation import diffuse_continuation, plan_continuation_windows, resolve_continuation
 from .denoise_loop import (
     MiniMaxH3DenoiseBranch,
+    _log_final_latent_sha256,
     minimax_h3_denoise_loop,
     minimax_h3_prepare_denoise_rows,
     minimax_h3_publish_denoise_progress,
@@ -599,6 +600,31 @@ def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     """Read a partition's distilled schedule. An absent key means legacy uniform."""
     return DMD2SigmaSchedule.from_metadata(release)
+
+
+_MINIMAX_H3_CONDITIONING_NUMERICS = ("bf16_conditioning_v1", "fp32_conditioning_v1")
+
+
+def _read_release_sampler(release: Mapping[str, Any]) -> str | None:
+    """Read a partition's default sampler. An absent key leaves euler as the default."""
+    value = release.get("sampler")
+    if value is None:
+        return None
+    return normalize_h3_sampler(str(value))
+
+
+def _read_conditioning_numerics(release: Mapping[str, Any]) -> str | None:
+    """Read a partition's conditioning numerics policy. An absent key keeps fp32 rows."""
+    value = release.get("conditioning_numerics")
+    if value is None:
+        return None
+    value = str(value)
+    if value not in _MINIMAX_H3_CONDITIONING_NUMERICS:
+        raise ValueError(
+            f"MiniMax H3 release conditioning_numerics must be one of {_MINIMAX_H3_CONDITIONING_NUMERICS}, "
+            f"got {value!r}"
+        )
+    return value
 
 
 # Parking the VAEs on the host between uses, WITHOUT the layerwise offload that used to be
@@ -1453,6 +1479,11 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    # Same scoping as the schedule: a release may pin the sampler it was
+    # distilled for and the numerics its conditioning latents were produced
+    # under. Absent keys keep the request-level default (euler, fp32 rows).
+    _sampler_by_partition: ClassVar[Mapping[str, str | None]] = {}
+    _conditioning_numerics_by_partition: ClassVar[Mapping[str, str | None]] = {}
     # Class-level default so an instance built without `__init__` -- the request
     # helpers are exercised that way in tests -- still resolves a contract, and
     # resolves the safe one. `__init__` shadows this per instance.
@@ -1771,8 +1802,12 @@ class MiniMaxH3Pipeline(
         # such a checkpoint was trained on. Each partition carries its own
         # contract, so a distilled FL2VA must not drag Ref2VA onto its schedule.
         self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
+        self._sampler_by_partition = {expected_partition: _read_release_sampler(release)}
+        self._conditioning_numerics_by_partition = {expected_partition: _read_conditioning_numerics(release)}
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
+            self._sampler_by_partition["ref2va"] = _read_release_sampler(ref2va_release)
+            self._conditioning_numerics_by_partition["ref2va"] = _read_conditioning_numerics(ref2va_release)
 
         # Which contract this instance serves, resolved once here. Startup-level
         # on purpose: a request may not pick, because switching contracts
@@ -2331,6 +2366,21 @@ class MiniMaxH3Pipeline(
     def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
         partition = "ref2va" if task == "ref2va" else "fl2va"
         return self._base_schedule_by_partition.get(partition)
+
+    def _sampler_for_task(self, task: str) -> str | None:
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._sampler_by_partition.get(partition)
+
+    def _conditioning_numerics_for_task(self, task: str) -> str | None:
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._conditioning_numerics_by_partition.get(partition)
+
+    def _resolve_request_sampler(self, task: str, extra: Mapping[str, Any]) -> str:
+        """The request's sampler wins; otherwise the serving partition's default applies."""
+        sampler = extra.get("sampler")
+        if sampler is None:
+            sampler = self._sampler_for_task(task)
+        return normalize_h3_sampler(sampler)
 
     def _resolve_task(
         self,
@@ -3207,10 +3257,10 @@ class MiniMaxH3Pipeline(
         )
         # Upstream: res_multistep sampler plus the time-shifted sigma schedules.
         sampler = normalize_h3_sampler(sampler)
-        if sampler != "euler" and base_schedule is not None:
+        if sampler not in ("euler", "renoise") and base_schedule is not None:
             raise ValueError(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
-                "use sampler='euler' for this schedule."
+                "use sampler='euler' or sampler='renoise' for this schedule."
             )
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
@@ -3335,6 +3385,11 @@ class MiniMaxH3Pipeline(
         visual_anchor = visual_condition
         if visual_anchor is not None:
             assert condition_shapes is not None  # resolved with the draw above
+            if self._conditioning_numerics_for_task(task) == "bf16_conditioning_v1":
+                # The release encoded its keyframe latents in bf16; round the
+                # clean rows through the same precision before the 0.999 noise
+                # augmentation so the anchors match the training distribution.
+                visual_anchor = visual_anchor.to(torch.bfloat16).to(torch.float32)
             visual_anchor = minimax_h3_imgvid_cond_noise_aug_rows(
                 visual_anchor,
                 condition_shapes=condition_shapes,
@@ -3555,6 +3610,13 @@ class MiniMaxH3Pipeline(
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        renoise_generator = None
+        if inputs["sampler"] == "renoise":
+            # One dedicated generator per denoise pass, seeded alongside (not
+            # on) the initial-noise seed. The same object feeds the video and
+            # audio solvers, whose step order the loop keeps as video-then-audio.
+            renoise_generator = torch.Generator(device=self.device)
+            renoise_generator.manual_seed(int(seed) + 1)
         # Each pass (including each output and hi-res refine) owns its cache.
         # Refine can change both the packed shape and the schedule length.
         registry = getattr(transformer, "_hook_registry", None)
@@ -3567,6 +3629,7 @@ class MiniMaxH3Pipeline(
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],
+                    renoise_generator=renoise_generator,
                     model=transformer,
                     positive=branch,
                     initial_video_rows=inputs["video_rows"],
@@ -4504,11 +4567,11 @@ class MiniMaxH3Pipeline(
 
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
-        sampler = normalize_h3_sampler(extra.get("sampler"))
-        if sampler != "euler" and base_schedule is not None:
+        sampler = self._resolve_request_sampler(task, extra)
+        if sampler not in ("euler", "renoise") and base_schedule is not None:
             raise ValueError(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
-                "use sampler='euler' for this schedule."
+                "use sampler='euler' or sampler='renoise' for this schedule."
             )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
@@ -4951,6 +5014,14 @@ class MiniMaxH3Pipeline(
         # rows have a different width, so they stay request-private.
         state.latents = video_rows
         state.do_true_cfg = False  # H3 checkpoints are CFG-distilled.
+        step_sampler = inputs.get("sampler", "euler")
+        renoise_generator = None
+        if step_sampler == "renoise":
+            # Same contract as the request-mode loop: one dedicated generator
+            # per request, seeded off the initial-noise seed, shared by the
+            # video and audio solvers in video-then-audio step order.
+            renoise_generator = torch.Generator(device=self.device)
+            renoise_generator.manual_seed(int(context["seed"]) + 1)
         state.extra.update(
             {
                 _STEP_BRANCH: branch,
@@ -4958,8 +5029,8 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ROWS: audio_rows,
                 _STEP_COND_ANCHOR: cond_anchor,
                 _STEP_AUDIO_ANCHOR: audio_anchor,
-                _STEP_VIDEO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_video),
-                _STEP_AUDIO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_audio),
+                _STEP_VIDEO_SOLVER: create_h3_sample_solver(step_sampler, sigmas_video, generator=renoise_generator),
+                _STEP_AUDIO_SOLVER: create_h3_sample_solver(step_sampler, sigmas_audio, generator=renoise_generator),
                 _STEP_SIGMAS_VIDEO: sigmas_video,
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
@@ -5175,6 +5246,7 @@ class MiniMaxH3Pipeline(
         """Unpack the denoised rows and run the joint video/audio VAE decode."""
         del kwargs
         shape = state.extra[_STEP_SHAPE]
+        _log_final_latent_sha256(state.latents)
         video_latent, audio_latent = self._unpack_denoised_rows(
             state.extra[_STEP_BRANCH],
             state.latents,

@@ -9,6 +9,7 @@ rows stay pinned to their noised step-0 anchors.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -81,6 +82,19 @@ _LOG_STEP_MEMORY = os.getenv("VLLM_OMNI_H3_LOG_STEP_MEMORY", "0") == "1"
 # a poor track record -- the snapshot names the allocating frame instead.
 _SNAPSHOT_DIR = os.getenv("VLLM_OMNI_H3_MEMORY_SNAPSHOT_DIR")
 _SNAPSHOT_STEP = int(os.getenv("VLLM_OMNI_H3_MEMORY_SNAPSHOT_STEP", "1"))
+# TP diagnostic: the renoise solver draws eps on every rank from a replicated
+# generator, so the final latents must agree bit-for-bit across ranks. Enabled
+# per deployment, it logs one sha256 per rank per request so a divergence is a
+# log diff rather than a silent quality loss.
+_LOG_FINAL_LATENT_SHA256 = os.getenv("VLLM_OMNI_H3_LOG_FINAL_LATENT_SHA256", "0") == "1"
+
+
+def _log_final_latent_sha256(video_rows: torch.Tensor) -> None:
+    if not _LOG_FINAL_LATENT_SHA256:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    digest = hashlib.sha256(video_rows.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()
+    logger.info("H3 final video latents sha256 rank=%d shape=%s: %s", rank, tuple(video_rows.shape), digest)
 
 
 def _snapshot_begin(step: int) -> None:
@@ -441,6 +455,7 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    renoise_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -473,8 +488,10 @@ def minimax_h3_denoise_loop(
     if audio_edit is not None:
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
-    video_solver = create_h3_sample_solver(sampler, sigmas_video)
-    audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
+    # One generator feeds both streams; the loop steps video before audio on
+    # every iteration, which is the draw order the upstream sampler uses.
+    video_solver = create_h3_sample_solver(sampler, sigmas_video, generator=renoise_generator)
+    audio_solver = create_h3_sample_solver(sampler, sigmas_audio, generator=renoise_generator)
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         check_request_cancellation()
@@ -580,6 +597,7 @@ def minimax_h3_denoise_loop(
             check_request_cancellation(synchronize=True)
 
     minimax_h3_publish_denoise_progress(None, None, None)
+    _log_final_latent_sha256(video_rows)
     return video_rows, audio_rows
 
 
