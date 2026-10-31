@@ -384,7 +384,9 @@ def bake(
 
     index_path = base_dir / "model.safetensors.index.json"
     if not index_path.exists():
-        raise SystemExit(f"{index_path} not found; this tool expects a sharded native checkpoint")
+        index_path = base_dir / "diffusion_pytorch_model.safetensors.index.json"
+    if not index_path.exists():
+        raise SystemExit(f"no safetensors index under {base_dir}; this tool expects a sharded native checkpoint")
     weight_map = json.loads(index_path.read_text())["weight_map"]
 
     missing = sorted(k for k in plan.pairs_by_base if k not in weight_map)
