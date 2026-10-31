@@ -602,6 +602,16 @@ def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     return DMD2SigmaSchedule.from_metadata(release)
 
 
+def _read_release_shift_pinned(release: Mapping[str, Any]) -> bool:
+    """Whether a release pins its shift scales as part of its schedule contract."""
+    if "sigma_shift_scales" not in release:
+        return False
+    distilled = release.get("distilled")
+    if not isinstance(distilled, Mapping):
+        return False
+    return not bool(distilled.get("supports_num_inference_steps_override", True))
+
+
 _MINIMAX_H3_CONDITIONING_NUMERICS = ("bf16_conditioning_v1", "fp32_conditioning_v1")
 
 
@@ -1804,10 +1814,12 @@ class MiniMaxH3Pipeline(
         self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
         self._sampler_by_partition = {expected_partition: _read_release_sampler(release)}
         self._conditioning_numerics_by_partition = {expected_partition: _read_conditioning_numerics(release)}
+        self._shift_pinned_by_partition = {expected_partition: _read_release_shift_pinned(release)}
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
             self._sampler_by_partition["ref2va"] = _read_release_sampler(ref2va_release)
             self._conditioning_numerics_by_partition["ref2va"] = _read_conditioning_numerics(ref2va_release)
+            self._shift_pinned_by_partition["ref2va"] = _read_release_shift_pinned(ref2va_release)
 
         # Which contract this instance serves, resolved once here. Startup-level
         # on purpose: a request may not pick, because switching contracts
@@ -2370,6 +2382,41 @@ class MiniMaxH3Pipeline(
     def _sampler_for_task(self, task: str) -> str | None:
         partition = "ref2va" if task == "ref2va" else "fl2va"
         return self._sampler_by_partition.get(partition)
+
+    def _resolve_shift_scales(self, task: str, extra: Mapping[str, Any]) -> tuple[float, float]:
+        """Resolve ``(video_shift, audio_shift)`` for a request.
+
+        A release that pins its sigma schedule also pins the shifts those
+        positions were distilled at: a request may repeat the pinned values
+        or omit them, but may not override them. Other partitions take
+        request shifts exactly as before.
+        """
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        if not getattr(self, "_shift_pinned_by_partition", {}).get(partition):
+            return (
+                float(extra.get("flow_shift", self.default_video_shift)),
+                float(extra.get("audio_flow_shift", self.default_audio_shift)),
+            )
+        for key, required in (
+            ("flow_shift", self.default_video_shift),
+            ("audio_flow_shift", self.default_audio_shift),
+        ):
+            value = extra.get(key)
+            if value is None:
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError) as exc:
+                raise OmniClientError(
+                    "this MiniMax H3 checkpoint pins a distilled sigma schedule; "
+                    f"{key} must be {required:g} or omitted, got {value!r}"
+                ) from exc
+            if not math.isclose(parsed, required):
+                raise OmniClientError(
+                    "this MiniMax H3 checkpoint pins a distilled sigma schedule; "
+                    f"{key} must be {required:g} or omitted, got {parsed:g}"
+                )
+        return self.default_video_shift, self.default_audio_shift
 
     def _conditioning_numerics_for_task(self, task: str) -> str | None:
         partition = "ref2va" if task == "ref2va" else "fl2va"
@@ -4568,6 +4615,7 @@ class MiniMaxH3Pipeline(
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         sampler = self._resolve_request_sampler(task, extra)
+        video_shift, audio_shift = self._resolve_shift_scales(task, extra)
         if sampler not in ("euler", "renoise") and base_schedule is not None:
             raise ValueError(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
@@ -4586,8 +4634,8 @@ class MiniMaxH3Pipeline(
                     mode=mode,
                     num_steps=num_steps,
                     base_schedule=base_schedule,
-                    flow_shift=float(extra.get("flow_shift", self.default_video_shift)),
-                    audio_flow_shift=float(extra.get("audio_flow_shift", self.default_audio_shift)),
+                    flow_shift=video_shift,
+                    audio_flow_shift=audio_shift,
                 )
             except ValueError as exc:
                 logger.warning("Rejecting optional AdaLN sidecar for this schedule; using runtime cache: %s", exc)
@@ -4671,8 +4719,8 @@ class MiniMaxH3Pipeline(
             "seed": int(sampling.seed if sampling.seed is not None else 42),
             "sampler": sampler,
             "num_steps": num_steps,
-            "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
-            "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
+            "video_shift": video_shift,
+            "audio_shift": audio_shift,
             "base_schedule": base_schedule,
             "num_outputs": _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt),
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
