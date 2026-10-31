@@ -146,7 +146,7 @@ class MiniMaxH3InferenceStrategy:
     visual_condition_noise_shape_mode: str  # "condition_shape" | "legacy_oversized_slice"
 
     # fl2va keyframes: the follower is cover-cropped officially, stretched today.
-    fl2va_keyframe_resize_mode: str  # "official_cover_crop" | "legacy_stretch"
+    fl2va_keyframe_resize_mode: str  # "official_cover_crop" | "legacy_stretch" | "source_center_crop"
 
     # ref2va reference images: official encodes at a short edge of their own and
     # never binds the generated canvas. See P-C1 in the problem log — today the

@@ -223,6 +223,11 @@ def get_diffusion_model_metadata(model_class_name: str | None) -> DiffusionModel
 
 _MINIMAX_H3_PIPELINES = ("MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline")
 
+# FL2VA keyframe resize modes that need the source aspect to reach
+# ``prepare_fl2va_keyframes`` intact — a route-level prestretch would make the
+# release-conditioned crop a no-op.
+_FL2VA_SOURCE_ASPECT_MODES = frozenset({"official_cover_crop", "source_center_crop"})
+
 
 def _minimax_h3_strategy(od_config: object | None) -> Any | None:
     """The contract this instance serves, as the serving layer can see it.
@@ -287,10 +292,10 @@ def reference_images_bind_output_canvas(
     strategy = _minimax_h3_strategy(od_config)
     if strategy is None:
         return True
-    if str(task_type or "").lower() == "fl2va" and strategy.fl2va_keyframe_resize_mode == "official_cover_crop":
-        # The follower must reach ``prepare_fl2va_keyframes`` with its source
-        # aspect ratio intact. A route-level stretch makes it equal the output
-        # canvas and turns the official cover-crop into a no-op.
+    if str(task_type or "").lower() == "fl2va" and strategy.fl2va_keyframe_resize_mode in _FL2VA_SOURCE_ASPECT_MODES:
+        # The keyframes must reach ``prepare_fl2va_keyframes`` with their source
+        # aspect ratio intact. A route-level stretch makes them equal the output
+        # canvas and turns the release-conditioned crop into a no-op.
         return False
     return strategy.reference_image_geometry_mode == "legacy_canvas_prestretch"
 
