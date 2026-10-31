@@ -68,9 +68,10 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-# LoRA factor suffixes, in PEFT's "default" adapter naming.
-_LORA_A = ".lora_A.default.weight"
-_LORA_B = ".lora_B.default.weight"
+# LoRA factor suffixes. PEFT "default" adapters use lora_A/lora_B; Diffusers
+# adapters use lora.down/lora.up; some exports drop the ".default" level.
+_LORA_A_SUFFIXES = (".lora_A.default.weight", ".lora_A.weight", ".lora.down.weight")
+_LORA_B_SUFFIXES = (".lora_B.default.weight", ".lora_B.weight", ".lora.up.weight")
 
 # Diffusers module suffix -> (native module suffix, slot).
 # `slot` selects the assembly rule applied to the delta before it is added.
@@ -198,12 +199,17 @@ def build_plan(lora_path: Path) -> BakePlan:
 
     modules: dict[str, dict[str, str]] = {}
     for key in keys:
-        if key.endswith(_LORA_A):
-            modules.setdefault(key[: -len(_LORA_A)], {})["a"] = key
-        elif key.endswith(_LORA_B):
-            modules.setdefault(key[: -len(_LORA_B)], {})["b"] = key
+        for suffix in _LORA_A_SUFFIXES:
+            if key.endswith(suffix):
+                modules.setdefault(key[: -len(suffix)], {})["a"] = key
+                break
         else:
-            raise ValueError(f"unrecognised LoRA tensor (not a PEFT lora_A/lora_B pair): {key}")
+            for suffix in _LORA_B_SUFFIXES:
+                if key.endswith(suffix):
+                    modules.setdefault(key[: -len(suffix)], {})["b"] = key
+                    break
+            else:
+                raise ValueError(f"unrecognised LoRA tensor (not a lora factor pair): {key}")
 
     plan = BakePlan(metadata=metadata)
     ranks: set[int] = set()
@@ -222,6 +228,8 @@ def build_plan(lora_path: Path) -> BakePlan:
     plan.rank = ranks.pop()
     if "alpha" in metadata:
         plan.alpha = float(metadata["alpha"])
+    elif "lora_alpha" in metadata:
+        plan.alpha = float(metadata["lora_alpha"])
 
     # A qkv target needs all three slots; two of three would shift the heads.
     for base_key, pairs in plan.pairs_by_base.items():

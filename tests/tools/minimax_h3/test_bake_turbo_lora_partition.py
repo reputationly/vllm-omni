@@ -6,8 +6,9 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
-from tools.minimax_h3.bake_turbo_lora import assemble_partition
+from tools.minimax_h3.bake_turbo_lora import assemble_partition, build_plan
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -129,3 +130,44 @@ def test_partition_can_still_symlink_components_when_asked(tmp_path: Path) -> No
     assemble_partition(base / "transformer", base / "transformer", out, fusion_scale=0.0625, copy_components=False)
 
     assert (out / "text_encoder").is_symlink()
+
+
+def _write_named_lora(tmp_path, a_suffix: str, b_suffix: str, alpha_key: str | None) -> Path:
+    from safetensors.torch import save_file
+
+    torch.manual_seed(7)
+    a = torch.randn(16, 64)
+    b = torch.randn(64, 16)
+    tensors = {
+        f"transformer_blocks.0.attn.to_q{a_suffix}": a.clone(),
+        f"transformer_blocks.0.attn.to_q{b_suffix}": b.clone(),
+        f"transformer_blocks.0.attn.to_k{a_suffix}": a.clone(),
+        f"transformer_blocks.0.attn.to_k{b_suffix}": b.clone(),
+        f"transformer_blocks.0.attn.to_v{a_suffix}": a.clone(),
+        f"transformer_blocks.0.attn.to_v{b_suffix}": b.clone(),
+    }
+    meta = {alpha_key: "128"} if alpha_key else {}
+    path = tmp_path / f"lora_{a_suffix.strip('.').replace('.', '_')}.safetensors"
+    save_file(tensors, str(path), metadata=meta)
+    return path
+
+
+@pytest.mark.parametrize(
+    "a_suffix,b_suffix",
+    [
+        (".lora_A.default.weight", ".lora_B.default.weight"),
+        (".lora_A.weight", ".lora_B.weight"),
+        (".lora.down.weight", ".lora.up.weight"),
+    ],
+)
+def test_build_plan_accepts_all_lora_namings(tmp_path, a_suffix, b_suffix):
+    plan = build_plan(_write_named_lora(tmp_path, a_suffix, b_suffix, "alpha"))
+    assert set(plan.pairs_by_base) == {"blocks.0.attn.qkv_proj.weight"}
+    assert sorted(p.slot for p in plan.pairs_by_base["blocks.0.attn.qkv_proj.weight"]) == ["k", "q", "v"]
+    assert plan.rank == 16
+    assert plan.alpha == 128.0
+
+
+def test_build_plan_reads_lora_alpha_metadata(tmp_path):
+    plan = build_plan(_write_named_lora(tmp_path, ".lora.down.weight", ".lora.up.weight", "lora_alpha"))
+    assert plan.alpha == 128.0
