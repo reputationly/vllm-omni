@@ -344,3 +344,46 @@ def test_request_res_multistep_rejects_the_pinned_release_schedule():
 
     with pytest.raises(ValueError, match="res_multistep"):
         pipeline.forward(_request_batch({"sampler": "res_multistep"}))
+
+
+def test_decode_overlaps_audio_vae_with_video_vae():
+    """The audio DAC decode runs on a worker thread alongside video VAE decode.
+
+    The audio decoder has no collective ops, so overlapping it with the video
+    decode is a pure scheduling change: identical outputs, shorter stall.
+    """
+    import threading
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    threads: dict[str, int] = {}
+    video_tensor = torch.ones(2, 3, 4, 8, 8)
+    audio_tensor = torch.full((1, 2, 16), 0.5)
+
+    class _FakeVideoVAE:
+        decoder_component = object()
+
+        def decode_latent(self, latent):
+            threads["video"] = threading.get_ident()
+            return latent * 2
+
+    class _FakeAudioVAE:
+        def decode_latent(self, latent):
+            threads["audio"] = threading.get_ident()
+            return latent + 1
+
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline._release_stage_cache = lambda: None
+    pipeline._component_on_device = lambda comp: nullcontext()
+    pipeline._offload_model_cpu_stage_output = lambda t: t
+    pipeline.device = torch.device("cpu")
+    pipeline.video_vae = _FakeVideoVAE()
+    pipeline.audio_vae = _FakeAudioVAE()
+
+    video, audio = MiniMaxH3Pipeline.decode(pipeline, video_tensor, audio_tensor, height=8, width=8)
+
+    assert "audio" in threads and "video" in threads
+    assert threads["audio"] != threads["video"]
+    assert torch.equal(video, video_tensor * 2)
+    assert torch.equal(audio, audio_tensor + 1)
