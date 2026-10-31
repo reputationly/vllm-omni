@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import threading
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
@@ -3744,29 +3743,17 @@ class MiniMaxH3Pipeline(
         # through the VAE decode peak. Decoding needs only the ViT decoder
         # half of the VAE, so the CNN encoder stays off the device.
         self._release_stage_cache()
-        # The two decodes are independent, and the audio DAC forward has no
-        # collective ops, so it can run on a worker thread while the video
-        # decode drives the TP barriers on this one. Holding both components
-        # resident during that window is cheap (the DiT is already offloaded)
-        # and skips a second onload round-trip.
-        audio_out: list[torch.Tensor] = []
-
-        def _decode_audio() -> None:
-            audio_out.append(self.audio_vae.decode_latent(audio_latent))
-
-        audio_thread = threading.Thread(target=_decode_audio, daemon=True)
-        with self._component_on_device(self.audio_vae):
-            audio_thread.start()
-            with self._component_on_device(self.video_vae.decoder_component):
-                with current_omni_platform.create_autocast_context(
-                    device_type=self.device.type,
-                    dtype=torch.float16,
-                    enabled=True,
-                ):
-                    video = self.video_vae.decode_latent(video_latent)
-            audio_thread.join()
+        with self._component_on_device(self.video_vae.decoder_component):
+            with current_omni_platform.create_autocast_context(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=True,
+            ):
+                video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
-        audio = self._offload_model_cpu_stage_output(audio_out[0])
+        with self._component_on_device(self.audio_vae):
+            audio = self.audio_vae.decode_latent(audio_latent)
+        audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
 
     def _resolve_latent_upscale(
