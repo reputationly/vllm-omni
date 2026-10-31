@@ -68,6 +68,11 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+try:
+    from tools.minimax_h3.convert_comfy_convrot_to_partition import plain_to_grouped
+except ImportError:  # direct script run from tools/minimax_h3/
+    from convert_comfy_convrot_to_partition import plain_to_grouped
+
 # LoRA factor suffixes. PEFT "default" adapters use lora_A/lora_B; Diffusers
 # adapters use lora.down/lora.up; some exports drop the ".default" level.
 _LORA_A_SUFFIXES = (".lora_A.default.weight", ".lora_A.weight", ".lora.down.weight")
@@ -89,6 +94,16 @@ _PREFIX_MAP: tuple[tuple[str, str], ...] = (
     ("token_refiner.refiner_blocks.", "token_refiner.blocks."),
     ("transformer_blocks.", "blocks."),
 )
+
+# ComfyUI-format LoRAs: ``diffusion_model.<native_module>.{lora_A,lora_B}.weight``
+# plus a scalar ``diffusion_model.<native_module>.alpha`` per module. Module
+# names already use the native partition layout (blocks.N.attn.qkv_proj), so the
+# base key is just <module>.weight. The one structural difference is
+# ``attn.qkv_proj``: the delta arrives in plain [all q; all k; all v] order and
+# must be regrouped to the partition's per-head layout — the same transform
+# convert_comfy_convrot_to_partition.plain_to_grouped applies to base weights.
+_COMFY_PREFIX = "diffusion_model."
+_COMFY_SUFFIXES = ("lora_A.weight", "lora_B.weight", "alpha")
 
 
 # --------------------------------------------------------------------------
@@ -155,10 +170,11 @@ class LoRAPair:
 
     module: str  # diffusers module path, e.g. transformer_blocks.0.attn.to_q
     base_key: str  # native tensor key, e.g. blocks.0.attn.qkv_proj.weight
-    slot: str  # q | k | v | plain | swiglu
+    slot: str  # q | k | v | plain | swiglu | comfy_qkv
     a_key: str
     b_key: str
     rank: int
+    alpha_key: str | None = None  # ComfyUI per-module scalar alpha tensor
 
 
 @dataclass
@@ -167,6 +183,7 @@ class BakePlan:
     rank: int = 0
     alpha: float | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    mode: str = "diffusers"  # diffusers | comfy
 
     @property
     def num_pairs(self) -> int:
@@ -192,10 +209,56 @@ def map_module(module: str) -> tuple[str, str]:
     raise ValueError(f"LoRA module has an unmapped suffix: {module}")
 
 
+def build_plan_comfy(header: dict) -> BakePlan:
+    """Plan a ComfyUI-export LoRA (``diffusion_model.`` prefix, per-module alpha tensor).
+
+    Module paths are already native (``blocks.N.attn.qkv_proj``); the base key is
+    ``<module>.weight``. One fused pair per base tensor, so rank may differ
+    across module types (qkv 768 vs the rest 256 in the Pika turbo export) —
+    per-pair ranks are stored and the single-rank invariant does not apply.
+    """
+    keys = [k for k in header if k != "__metadata__"]
+    modules: dict[str, dict[str, str]] = {}
+    for key in keys:
+        if not key.startswith(_COMFY_PREFIX):
+            raise ValueError(f"mixed layout: non-ComfyUI tensor {key!r} in a ComfyUI LoRA")
+        rest = key[len(_COMFY_PREFIX) :]
+        for suffix in _COMFY_SUFFIXES:
+            if rest.endswith("." + suffix):
+                modules.setdefault(rest[: -len(suffix) - 1], {})[suffix.split(".")[0]] = key
+                break
+        else:
+            raise ValueError(f"unrecognised ComfyUI LoRA tensor: {key}")
+
+    plan = BakePlan(metadata=header.get("__metadata__") or {}, mode="comfy")
+    for module, factors in sorted(modules.items()):
+        missing = [s for s in ("lora_A", "lora_B", "alpha") if s not in factors]
+        if missing:
+            raise ValueError(f"ComfyUI LoRA module {module} is missing {missing}")
+        base_key = module + ".weight"
+        slot = "comfy_qkv" if module.endswith(".attn.qkv_proj") else "plain"
+        rank = header[factors["lora_A"]]["shape"][0]
+        plan.pairs_by_base.setdefault(base_key, []).append(
+            LoRAPair(
+                module=module,
+                base_key=base_key,
+                slot=slot,
+                a_key=factors["lora_A"],
+                b_key=factors["lora_B"],
+                rank=rank,
+                alpha_key=factors["alpha"],
+            )
+        )
+    return plan
+
+
 def build_plan(lora_path: Path) -> BakePlan:
     header = read_safetensors_header(lora_path)
     metadata = header.get("__metadata__") or {}
     keys = [k for k in header if k != "__metadata__"]
+
+    if any(k.startswith(_COMFY_PREFIX) for k in keys):
+        return build_plan_comfy(header)
 
     modules: dict[str, dict[str, str]] = {}
     for key in keys:
@@ -243,9 +306,12 @@ def build_plan(lora_path: Path) -> BakePlan:
     return plan
 
 
-def resolve_scale(plan: BakePlan, override: float | None) -> float:
+def resolve_scale(plan: BakePlan, override: float | None) -> float | None:
     if override is not None:
         return override
+    if plan.mode == "comfy":
+        # Per-module scalar alpha tensors are resolved inside compute_delta.
+        return None
     if plan.alpha is None:
         raise SystemExit(
             "This LoRA has no `alpha` in its metadata, so the fusion scale cannot be derived.\n"
@@ -273,24 +339,34 @@ def compute_delta(
     src: safe_open,
     pairs: list[LoRAPair],
     *,
-    scale: float,
+    scale: float | None,
     num_heads: int,
     head_dim: int,
     compute_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Build the native-layout delta for one base tensor."""
     slots: dict[str, torch.Tensor] = {}
+    pair_scale = scale
     for pair in pairs:
         a = src.get_tensor(pair.a_key).to(compute_dtype)
         b = src.get_tensor(pair.b_key).to(compute_dtype)
         slots[pair.slot] = torch.mm(b, a)
+        if pair.alpha_key is not None and pair_scale is None:
+            alpha = float(src.get_tensor(pair.alpha_key))
+            pair_scale = alpha / pair.rank
+    if pair_scale is None:
+        raise SystemExit("LoRA carries no usable alpha and no --scale was given")
 
+    if "comfy_qkv" in slots:
+        # Plain [all q; all k; all v] -> the partition's per-head interleaved
+        # qkv, the same transform the base-weight converter applies.
+        return plain_to_grouped(slots["comfy_qkv"], num_heads, head_dim) * pair_scale
     if "plain" in slots:
-        return slots["plain"] * scale
+        return slots["plain"] * pair_scale
     if "swiglu" in slots:
-        return swap_swiglu_halves(slots["swiglu"]) * scale
+        return swap_swiglu_halves(slots["swiglu"]) * pair_scale
     fused = reorder_qkv_to_interleaved(slots["q"], slots["k"], slots["v"], num_heads=num_heads, head_dim=head_dim)
-    return fused * scale
+    return fused * pair_scale
 
 
 def bake(
@@ -299,7 +375,7 @@ def bake(
     lora_path: Path,
     out_dir: Path,
     plan: BakePlan,
-    scale: float,
+    scale: float | None,
     compute_dtype: torch.dtype,
 ) -> list[tuple[str, float]]:
     config = load_arch(base_dir)
@@ -600,15 +676,25 @@ def main() -> int:
         raise SystemExit("--output is required unless --dry-run is given")
 
     plan = build_plan(args.lora)
-    scale = resolve_scale(plan, args.scale) * args.strength
+    scale = resolve_scale(plan, args.scale)
+    if scale is not None:
+        scale *= args.strength
+    elif args.strength != 1.0:
+        raise SystemExit(
+            "--strength needs --scale for ComfyUI LoRAs (per-module alphas cannot share a strength multiplier)"
+        )
 
     blocks = {k.split(".")[1] for k in plan.pairs_by_base if k.startswith("blocks.")}
     refiner = {k.split(".")[2] for k in plan.pairs_by_base if k.startswith("token_refiner.blocks.")}
 
     print(f"LoRA      : {args.lora}")
     print(f"metadata  : {plan.metadata}")
-    print(f"rank      : {plan.rank}   alpha: {plan.alpha}")
-    print(f"scale     : {scale:g}" + ("" if args.scale is None else "  (--scale override)"))
+    if plan.mode == "comfy":
+        ranks = sorted({p.rank for pairs in plan.pairs_by_base.values() for p in pairs})
+        print(f"mode      : comfy   ranks: {ranks}   scale: per-module alpha/rank")
+    else:
+        print(f"rank      : {plan.rank}   alpha: {plan.alpha}")
+        print(f"scale     : {scale:g}" + ("" if args.scale is None else "  (--scale override)"))
     print(f"pairs     : {plan.num_pairs} factor pairs -> {len(plan.pairs_by_base)} base tensors")
     print(f"coverage  : {len(blocks)} transformer blocks, {len(refiner)} token-refiner blocks")
 
