@@ -344,3 +344,79 @@ def test_request_res_multistep_rejects_the_pinned_release_schedule():
 
     with pytest.raises(ValueError, match="res_multistep"):
         pipeline.forward(_request_batch({"sampler": "res_multistep"}))
+
+
+def test_packed_attention_slice_fallback_matches_masked_rows():
+    """Mask-incapable backends take the valid-prefix slice + zero-pad path.
+
+    The packed tail is a pad-only document (packed_sequence.py), so running the
+    attention mask-free on the first ``used`` rows and zero-padding the output
+    is equivalent to the key-mask path on every unpacked row.
+    """
+    import torch.nn.functional as F
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class _Backend:
+        def __init__(self, mask_ok: bool):
+            self._ok = mask_ok
+
+        supports_prefix_kv_slicing = False
+
+        def supports_attention_mask(self, spec=None):
+            return self._ok
+
+        def supports_packed_mask_free(self):
+            return False
+
+        def get_name(self):
+            return "TEST"
+
+    class _Attn(torch.nn.Module):
+        def __init__(self, backend):
+            super().__init__()
+            self.attn_backend = backend
+            self.attn_spec = None
+            self.use_ring = False
+            self.skip_sequence_parallel = False
+            self.seen_mask = None
+
+        def forward(self, q, k, v, metadata):
+            self.seen_mask = getattr(metadata, "attn_mask", None)
+            B, T, H, D = q.shape
+            qh, kh, vh = (t.transpose(1, 2) for t in (q, k, v))
+            am = None
+            if self.seen_mask is not None:
+                am = self.seen_mask[:, None, None, :].expand(B, H, T, T)
+            return F.scaled_dot_product_attention(qh, kh, vh, attn_mask=am).transpose(1, 2)
+
+    torch.manual_seed(0)
+    used, packed_total, heads, head_dim = 5, 8, 2, 4
+    q, k, v = (torch.randn(packed_total, heads, head_dim) for _ in range(3))
+    cu = torch.tensor([0, used], dtype=torch.int32)
+
+    def run(mask_ok: bool):
+        attn = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+        torch.nn.Module.__init__(attn)
+        attn.attention = _Attn(_Backend(mask_ok))
+        attn.vsa_sparsity = None
+        out = MiniMaxH3Attention._run_packed_attention(
+            attn,
+            q,
+            k,
+            v,
+            cu_seqlens=cu,
+            max_seqlen=used,
+            packed_total=packed_total,
+        )
+        return out, attn.attention.seen_mask
+
+    masked, seen_masked = run(mask_ok=True)
+    sliced, seen_sliced = run(mask_ok=False)
+
+    assert seen_masked is not None  # mask path builds the key mask
+    assert seen_sliced is None  # slice path never passes a mask
+    assert torch.allclose(masked[:used], sliced[:used], atol=1e-5)
+    assert (sliced[used:] == 0).all()

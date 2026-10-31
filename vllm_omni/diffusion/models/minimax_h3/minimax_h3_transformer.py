@@ -712,6 +712,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         attn_mask = None
         mask_free_packed_padding = False
+        out_padding = 0
         use_ring = _ring_sequence_parallel_is_active(self.attention)
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
@@ -748,7 +749,17 @@ class MiniMaxH3Attention(nn.Module):
             # query-length check. Ring consumes valid_kv_length directly and
             # trims the circulated K/V blocks instead.
             if used < packed_total and not no_mask and not use_ring:
-                attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+                if self.attention.attn_backend.supports_attention_mask(getattr(self.attention, "attn_spec", None)):
+                    attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+                else:
+                    # Backends without mask support still honor cu_seqlens as
+                    # document bounds, so the valid prefix alone is a legal
+                    # input: trim to it, run mask-free, and zero-pad the output
+                    # back to packed_total. Rows >= used are the tail pad
+                    # document (packed_sequence.py), never unpacked into the
+                    # text/cond/audio/video outputs.
+                    q, k, v = q[:used], k[:used], v[:used]
+                    out_padding = packed_total - used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
             packed_padding=(
@@ -799,12 +810,15 @@ class MiniMaxH3Attention(nn.Module):
         # split would pair the wrong ones; H3 is MHA today, and this keeps the knob from
         # silently doing that if it ever is not.
         if groups == 1 or heads != int(k.shape[1]):
-            return self.attention(
+            out = self.attention(
                 q.unsqueeze(0),
                 k.unsqueeze(0),
                 v.unsqueeze(0),
                 metadata,
             ).squeeze(0)
+            if out_padding:
+                out = nn.functional.pad(out, (0, 0, 0, 0, 0, out_padding))
+            return out
 
         step = (heads + groups - 1) // groups
         gate = metadata.extra.get("gate_compress")
@@ -828,6 +842,8 @@ class MiniMaxH3Attention(nn.Module):
             out[:, start:stop] = part
             del part
         assert out is not None
+        if out_padding:
+            out = nn.functional.pad(out, (0, 0, 0, 0, 0, out_padding))
         return out
 
     def forward(
