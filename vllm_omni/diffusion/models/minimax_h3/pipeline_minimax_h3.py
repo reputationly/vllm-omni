@@ -43,6 +43,10 @@ from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
     SupportsComponentDiscovery,
 )
+from vllm_omni.diffusion.models.minimax_h3.keyframes import (
+    MINIMAX_H3_KEYFRAME_RESIZE_SOURCE_CROP,
+    prepare_fl2va_keyframes,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import (
     BoundedAllocatorCache,
@@ -3930,11 +3934,18 @@ class MiniMaxH3Pipeline(
         cached = context.get(_REFINE_KEYFRAME_CONDITION)
         if cached is None:
             target = context["latent_upscale"]
-            cached = self._encode_visual_conditions(
-                [
+            mode = getattr(self.strategy, "fl2va_keyframe_resize_mode", None)
+            if mode == MINIMAX_H3_KEYFRAME_RESIZE_SOURCE_CROP:
+                keyframe_images = prepare_fl2va_keyframes(
+                    context["keyframe_images"], width=target.width, height=target.height, mode=mode
+                )
+            else:
+                keyframe_images = [
                     image.resize((target.width, target.height), Image.Resampling.LANCZOS)
                     for image in context["keyframe_images"]
-                ],
+                ]
+            cached = self._encode_visual_conditions(
+                keyframe_images,
                 None,
                 video_count=0,
             )
