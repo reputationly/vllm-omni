@@ -260,3 +260,60 @@ def test_build_plan_diffusers_unchanged(tmp_path):
     plan = build_plan(_write_named_lora(tmp_path, ".lora.down.weight", ".lora.up.weight", "lora_alpha"))
     assert plan.mode == "diffusers"
     assert plan.alpha == 128.0 and plan.rank == 16
+
+
+def _write_unprefixed_comfy_lora(tmp_path) -> Path:
+    """larryvrh-style: native module names, no diffusion_model. prefix, no alpha."""
+    from safetensors.torch import save_file
+
+    torch.manual_seed(13)
+    tensors = {
+        "blocks.0.attn.qkv_proj.lora_A.weight": torch.randn(64, 128, dtype=torch.bfloat16),
+        "blocks.0.attn.qkv_proj.lora_B.weight": torch.randn(384, 64, dtype=torch.bfloat16),
+        "blocks.0.adaln_proj.linear.lora_A.weight": torch.randn(16, 64, dtype=torch.bfloat16),
+        "blocks.0.adaln_proj.linear.lora_B.weight": torch.randn(192, 16, dtype=torch.bfloat16),
+        "final_layer.adaln_proj.linear.lora_A.weight": torch.randn(16, 64, dtype=torch.bfloat16),
+        "final_layer.adaln_proj.linear.lora_B.weight": torch.randn(192, 16, dtype=torch.bfloat16),
+    }
+    path = tmp_path / "unprefixed_comfy.safetensors"
+    save_file(tensors, str(path), metadata={"application": "W_eff = W + lora_B @ lora_A"})
+    return path
+
+
+def test_build_plan_unprefixed_comfy(tmp_path):
+    plan = build_plan(_write_unprefixed_comfy_lora(tmp_path))
+    assert plan.mode == "comfy"
+    assert set(plan.pairs_by_base) == {
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.0.adaln_proj.linear.weight",
+        "final_layer.adaln_proj.linear.weight",
+    }
+    assert plan.pairs_by_base["blocks.0.adaln_proj.linear.weight"][0].alpha_key is None
+
+
+def test_unprefixed_comfy_scale_defaults_one(tmp_path):
+    from safetensors import safe_open
+
+    from tools.minimax_h3.bake_turbo_lora import compute_delta
+
+    lora_path = _write_unprefixed_comfy_lora(tmp_path)
+    plan = build_plan(lora_path)
+    with safe_open(str(lora_path), framework="pt", device="cpu") as src:
+        delta = compute_delta(
+            src,
+            plan.pairs_by_base["blocks.0.adaln_proj.linear.weight"],
+            scale=None,
+            num_heads=4,
+            head_dim=16,
+            compute_dtype=torch.float32,
+            comfy_missing_alpha_default=plan.mode == "comfy",
+        )
+        a = src.get_tensor("blocks.0.adaln_proj.linear.lora_A.weight").to(torch.float32)
+        b = src.get_tensor("blocks.0.adaln_proj.linear.lora_B.weight").to(torch.float32)
+    assert torch.equal(delta, torch.mm(b, a))  # scale 1.0, no reorder
+
+
+def test_prefixed_comfy_still_detected(tmp_path):
+    plan = build_plan(_write_comfy_lora(tmp_path))
+    assert plan.mode == "comfy"
+    assert plan.pairs_by_base["blocks.0.attn.qkv_proj.weight"][0].alpha_key is not None

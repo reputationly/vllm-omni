@@ -209,20 +209,21 @@ def map_module(module: str) -> tuple[str, str]:
     raise ValueError(f"LoRA module has an unmapped suffix: {module}")
 
 
-def build_plan_comfy(header: dict) -> BakePlan:
-    """Plan a ComfyUI-export LoRA (``diffusion_model.`` prefix, per-module alpha tensor).
+def build_plan_comfy(header: dict, *, prefix: str = _COMFY_PREFIX) -> BakePlan:
+    """Plan a ComfyUI-export LoRA (``diffusion_model.`` or no prefix, optional per-module alpha).
 
     Module paths are already native (``blocks.N.attn.qkv_proj``); the base key is
     ``<module>.weight``. One fused pair per base tensor, so rank may differ
-    across module types (qkv 768 vs the rest 256 in the Pika turbo export) —
-    per-pair ranks are stored and the single-rank invariant does not apply.
+    across module types — per-pair ranks are stored and the single-rank invariant
+    does not apply. ``alpha`` is a per-module scalar tensor when present; files
+    without it (e.g. larryvrh's `W_eff = W + B @ A` exports) get scale 1.0.
     """
     keys = [k for k in header if k != "__metadata__"]
     modules: dict[str, dict[str, str]] = {}
     for key in keys:
-        if not key.startswith(_COMFY_PREFIX):
+        if prefix and not key.startswith(prefix):
             raise ValueError(f"mixed layout: non-ComfyUI tensor {key!r} in a ComfyUI LoRA")
-        rest = key[len(_COMFY_PREFIX) :]
+        rest = key[len(prefix) :]
         for suffix in _COMFY_SUFFIXES:
             if rest.endswith("." + suffix):
                 modules.setdefault(rest[: -len(suffix) - 1], {})[suffix.split(".")[0]] = key
@@ -231,8 +232,10 @@ def build_plan_comfy(header: dict) -> BakePlan:
             raise ValueError(f"unrecognised ComfyUI LoRA tensor: {key}")
 
     plan = BakePlan(metadata=header.get("__metadata__") or {}, mode="comfy")
+    has_alpha = any("alpha" in f for f in modules.values())
     for module, factors in sorted(modules.items()):
-        missing = [s for s in ("lora_A", "lora_B", "alpha") if s not in factors]
+        required = ["lora_A", "lora_B"] + (["alpha"] if has_alpha else [])
+        missing = [s for s in required if s not in factors]
         if missing:
             raise ValueError(f"ComfyUI LoRA module {module} is missing {missing}")
         base_key = module + ".weight"
@@ -246,10 +249,15 @@ def build_plan_comfy(header: dict) -> BakePlan:
                 a_key=factors["lora_A"],
                 b_key=factors["lora_B"],
                 rank=rank,
-                alpha_key=factors["alpha"],
+                alpha_key=factors.get("alpha"),
             )
         )
     return plan
+
+
+# Prefixes that mark a native-layout (ComfyUI-style) module path when no
+# ``diffusion_model.`` prefix is present — larryvrh's exports use this form.
+_UNPREFIXED_COMFY_ROOTS = ("blocks.", "token_refiner.blocks.", "final_layer.")
 
 
 def build_plan(lora_path: Path) -> BakePlan:
@@ -259,6 +267,13 @@ def build_plan(lora_path: Path) -> BakePlan:
 
     if any(k.startswith(_COMFY_PREFIX) for k in keys):
         return build_plan_comfy(header)
+
+    # Unprefixed ComfyUI layout (larryvrh): `<native_module>.lora_{A,B}.weight`
+    # — no diffusion_model. prefix and no Diffusers module names (to_q/to_out/
+    # .ff./refiner_blocks). Distinguish by the module root being native.
+    lora_modules = {k[: -len(".lora_A.weight")] for k in keys if k.endswith(".lora_A.weight")}
+    if lora_modules and all(m.startswith(_UNPREFIXED_COMFY_ROOTS) for m in lora_modules):
+        return build_plan_comfy(header, prefix="")
 
     modules: dict[str, dict[str, str]] = {}
     for key in keys:
@@ -343,6 +358,7 @@ def compute_delta(
     num_heads: int,
     head_dim: int,
     compute_dtype: torch.dtype,
+    comfy_missing_alpha_default: bool = False,
 ) -> torch.Tensor:
     """Build the native-layout delta for one base tensor."""
     slots: dict[str, torch.Tensor] = {}
@@ -355,7 +371,11 @@ def compute_delta(
             alpha = float(src.get_tensor(pair.alpha_key))
             pair_scale = alpha / pair.rank
     if pair_scale is None:
-        raise SystemExit("LoRA carries no usable alpha and no --scale was given")
+        if not comfy_missing_alpha_default:
+            raise SystemExit("LoRA carries no usable alpha and no --scale was given")
+        # No per-module alpha tensors (larryvrh-style `W_eff = W + B @ A`
+        # exports): the author documents alpha = rank, i.e. effective scale 1.0.
+        pair_scale = 1.0
 
     if "comfy_qkv" in slots:
         # Plain [all q; all k; all v] -> the partition's per-head interleaved
@@ -424,6 +444,7 @@ def bake(
                     num_heads=num_heads,
                     head_dim=head_dim,
                     compute_dtype=compute_dtype,
+                    comfy_missing_alpha_default=plan.mode == "comfy",
                 )
                 if delta.shape != weight.shape:
                     raise SystemExit(
