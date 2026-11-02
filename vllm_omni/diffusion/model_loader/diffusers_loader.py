@@ -64,6 +64,7 @@ from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.utils.page_cache import drop_file_page_cache, weight_file_cache_drop_enabled
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -185,6 +186,21 @@ def _is_distributed_rank_zero() -> bool:
         or not torch.distributed.is_initialized()
         or torch.distributed.get_rank() == 0
     )
+
+
+def _drop_cache_after_exhaustion(
+    weights_iterator: Generator[tuple[str, torch.Tensor], None, None],
+    hf_weights_files: Sequence[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield all weights, then fadvise-DONTNEED the shard files once exhausted.
+
+    The drop runs only on normal exhaustion: closing the generator early or a
+    downstream exception propagates through ``yield from`` and skips it.
+    """
+    yield from weights_iterator
+    advised = drop_file_page_cache(hf_weights_files)
+    total_bytes = sum(os.path.getsize(f) for f in hf_weights_files if os.path.isfile(f))
+    logger.info("Dropped page cache for %d weight files (%.1f GiB total)", advised, total_bytes / (1 << 30))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -448,6 +464,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self.load_config.use_tqdm_on_load,
                 self.load_config.safetensors_load_strategy,
             )
+        if weight_file_cache_drop_enabled():
+            weights_iterator = _drop_cache_after_exhaustion(weights_iterator, hf_weights_files)
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()

@@ -250,6 +250,7 @@ from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
+from vllm_omni.utils.page_cache import drop_file_page_cache, request_file_cache_drop_enabled
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -3340,6 +3341,8 @@ async def _run_audio_gen_job(
             # Surface the handler's error message; the except block below records
             # it as FAILED with the error text.
             raise RuntimeError(getattr(getattr(resp, "error", None), "message", None) or str(resp))
+        if not isinstance(resp, ChatCompletionResponse):
+            raise RuntimeError(f"Diffusion chat completion returned {type(resp).__name__}, expected a full response")
         # Diffusion audio returns a base64 WAV in choices[0].message.audio.data
         # (an OpenAIChatCompletionAudio). Decode it to raw bytes for the NFS write.
         audio_b64 = resp.choices[0].message.audio.data
@@ -3745,7 +3748,7 @@ async def _generate_task_images(
     if extra_args:
         gen_params.extra_args = extra_args
 
-    prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
+    prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
     if request.negative_prompt is not None:
         prompt["negative_prompt"] = request.negative_prompt
     multi_modal: dict[str, Any] = {}
@@ -4339,6 +4342,16 @@ async def _run_video_task_job(
                 "error_type": getattr(exc, "error_type", None) or type(exc).__name__,
             },
         )
+    finally:
+        if request_file_cache_drop_enabled():
+            try:
+                advised = await asyncio.to_thread(
+                    drop_file_page_cache,
+                    [*image_paths, *video_paths, *audio_paths, save_result_path],
+                )
+                logger.info("Video task %s dropped page cache for %d files", task_id, advised)
+            except Exception:
+                logger.warning("Video task %s page-cache drop failed", task_id, exc_info=True)
 
 
 @router.post(

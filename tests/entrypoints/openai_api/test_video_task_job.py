@@ -62,3 +62,87 @@ def test_video_task_job_persists_output_for_both_result_shapes(tmp_path, result)
     assert job.status is AudioTaskStatus.COMPLETED, job.error
     assert job.error is None
     assert out.read_bytes() == b"mp4-bytes"
+
+
+class _FailingHandler:
+    async def generate_video_bytes(self, request, reference_id, **_kwargs):
+        del request, reference_id
+        raise RuntimeError("engine exploded")
+
+
+def _run_job(handler, tmp_path, task_id, **paths):
+    out = tmp_path / "out.mp4"
+    image_paths = paths.get("image_paths", [])
+    video_paths = paths.get("video_paths", [])
+    audio_paths = paths.get("audio_paths", [])
+
+    async def run():
+        await AUDIO_TASK_STORE.upsert(task_id, AudioTaskResponse(task_id=task_id, status=AudioTaskStatus.PENDING))
+        await api_server._run_video_task_job(
+            handler,
+            VideoGenerationRequest(prompt="a cat stretching"),
+            task_id,
+            str(out),
+            image_paths=image_paths,
+            video_paths=video_paths,
+            audio_paths=audio_paths,
+            allowed_root=str(tmp_path),
+            app_state=SimpleNamespace(server=None, engine_client=None),
+        )
+        return await AUDIO_TASK_STORE.get(task_id)
+
+    return asyncio.run(run()), out
+
+
+def _record_drops(monkeypatch) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake_drop(paths):
+        calls.append(list(paths))
+        return len(calls[-1])
+
+    monkeypatch.setattr(api_server, "drop_file_page_cache", fake_drop)
+    return calls
+
+
+def test_video_task_job_drops_page_cache_on_success(tmp_path, monkeypatch):
+    from PIL import Image
+
+    inp = tmp_path / "ref.png"
+    Image.new("RGB", (8, 8)).save(inp)
+    monkeypatch.setenv("VLLM_OMNI_DROP_REQUEST_FILE_CACHE", "1")
+    calls = _record_drops(monkeypatch)
+
+    job, out = _run_job(
+        _FakeHandler((b"mp4-bytes", {}, 0.0, None)),
+        tmp_path,
+        "video-task-drop-ok",
+        image_paths=[str(inp)],
+    )
+
+    assert job.status is AudioTaskStatus.COMPLETED, job.error
+    assert calls == [[str(inp), str(out)]]
+
+
+def test_video_task_job_drops_page_cache_on_failure(tmp_path, monkeypatch):
+    from PIL import Image
+
+    inp = tmp_path / "ref.png"
+    Image.new("RGB", (8, 8)).save(inp)
+    monkeypatch.setenv("VLLM_OMNI_DROP_REQUEST_FILE_CACHE", "1")
+    calls = _record_drops(monkeypatch)
+
+    job, out = _run_job(_FailingHandler(), tmp_path, "video-task-drop-fail", image_paths=[str(inp)])
+
+    assert job.status is AudioTaskStatus.FAILED
+    assert calls == [[str(inp), str(out)]]
+
+
+def test_video_task_job_no_drop_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_DROP_REQUEST_FILE_CACHE", raising=False)
+    calls = _record_drops(monkeypatch)
+
+    job, _ = _run_job(_FakeHandler((b"mp4-bytes", {}, 0.0, None)), tmp_path, "video-task-drop-off")
+
+    assert job.status is AudioTaskStatus.COMPLETED, job.error
+    assert calls == []

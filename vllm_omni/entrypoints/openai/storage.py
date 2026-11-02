@@ -227,7 +227,8 @@ async def atomic_write_bytes(data: bytes, dest_path: str) -> str:
     return await asyncio.to_thread(_atomic_write_sync, data, dest_path)
 
 
-def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
+def get_storage_manager(storage_config: FileBackend) -> LocalStorageManager:
+    manager: LocalStorageManager
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
             manager = LocalStorageTTLManager(
