@@ -1,0 +1,61 @@
+# MiniMax-H3 Pika Ref2VA (BF16) — A100 PCIE 40G x4
+#
+# Pika official Ref2VA BF16 deployment (Pika-H3-Flex-Ref2VA-BF16-vLLM), captured
+# from the live `pika-p2-ref2va` container.
+#
+# Reference-image geometry: the stage env below is exactly what the tested
+# service applied (legacy / fixed_area / 1032192).  The Pika partition's
+# model_index carries `distilled`, so the pipeline resolves fixed_area to
+# `match` (pipeline_minimax_h3.py::_reference_image_strategy_for_release):
+# each reference image gets a pixel budget equal to the output canvas.  Do not
+# set VLLM_OMNI_H3_REF_IMAGE_* on the container: stage env overrides those keys
+# anyway, and the rest would only diverge from the tested geometry.
+#
+# Container env used with this profile in testing (pass it on the container,
+# not here): PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,
+# VLLM_OMNI_H3_VAE_REVERT_FRAME_CHUNK=8, VLLM_OMNI_H3_OFFLOAD_DIT_BEFORE_VAE=1,
+# VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=7200, VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT_S=7200,
+# VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200, VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0.
+pipeline: minimax_h3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    # Pin model partition selection at startup instead of relying on a path
+    # basename.  Per-request task=ref2va is still validated by the pipeline.
+    task_type: ref2va
+    max_num_seqs: 1
+    devices: "0,1,2,3"
+
+    env:
+      VLLM_OMNI_H3_INFERENCE_CONTRACT: legacy
+      VLLM_OMNI_H3_REF_IMAGE_GEOMETRY: fixed_area
+      VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS: "1032192"
+
+    enable_cpu_offload: true
+    vae_use_tiling: true
+    diffusion_attention_backend: FLASH_ATTN
+
+    # H3's whole graph is too large to compile as one unit.  Regional dynamic
+    # compile pays a cold-start cost and is reused by subsequent requests.
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+
+    enable_multithread_weight_load: false
+    enable_diffusion_pipeline_profiler: true
+
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 4
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
