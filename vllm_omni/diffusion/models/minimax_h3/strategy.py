@@ -40,6 +40,7 @@ from .reference_image_geometry import (
     MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
     MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV,
     MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
+    MINIMAX_H3_REFERENCE_IMAGE_TOTAL_PIXELS_ENV,
     parse_reference_image_max_pixels,
     parse_reference_image_no_upscale,
     parse_reference_image_short_edge,
@@ -361,6 +362,7 @@ _CONFLICTING_REFERENCE_IMAGE_ENVS = (
     MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
     MINIMAX_H3_REFERENCE_IMAGE_NO_UPSCALE_ENV,
     MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV,
+    MINIMAX_H3_REFERENCE_IMAGE_TOTAL_PIXELS_ENV,
 )
 
 
@@ -558,6 +560,24 @@ def resolve_strategy(
             raise ValueError(
                 f"{MINIMAX_H3_GEOMETRY_ENV}=fixed_area requires a positive {MINIMAX_H3_REFERENCE_IMAGE_MAX_PIXELS_ENV}"
             )
+        raw_budget = str(environ.get(MINIMAX_H3_REFERENCE_IMAGE_TOTAL_PIXELS_ENV, "")).strip()
+        if raw_budget:
+            try:
+                budget = int(raw_budget)
+            except ValueError:
+                raise ValueError(
+                    f"{MINIMAX_H3_REFERENCE_IMAGE_TOTAL_PIXELS_ENV} must be a non-negative integer, got {raw_budget!r}"
+                ) from None
+            if budget < 0:
+                raise ValueError(
+                    f"{MINIMAX_H3_REFERENCE_IMAGE_TOTAL_PIXELS_ENV} must be a non-negative integer, got {raw_budget!r}"
+                )
+            if budget > 0 and strategy.reference_image_geometry_mode != "official_short_edge":
+                raise ValueError(
+                    f"{MINIMAX_H3_REFERENCE_IMAGE_TOTAL_PIXELS_ENV} requires "
+                    f"{MINIMAX_H3_GEOMETRY_ENV}=official_short_edge, got "
+                    f"{strategy.reference_image_geometry_mode!r}"
+                )
         return strategy
 
     conflicting = [key for key in _CONFLICTING_REFERENCE_IMAGE_ENVS if str(environ.get(key, "")).strip()]

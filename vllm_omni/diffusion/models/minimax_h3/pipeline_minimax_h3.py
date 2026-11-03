@@ -4267,6 +4267,9 @@ class MiniMaxH3Pipeline(
                     sampling,
                     task=task,
                     fl2va_canvas_policy=contract_environ(self.od_config).get("VLLM_OMNI_H3_FL2VA_CANVAS_POLICY"),
+                    reference_image_total_pixels=int(
+                        contract_environ(self.od_config).get("VLLM_OMNI_H3_REF_IMAGE_TOTAL_PIXELS", "0") or "0"
+                    ),
                     prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
                     # The resolved contract governs the follower keyframe's
                     # resize, the reference order and the standalone-audio

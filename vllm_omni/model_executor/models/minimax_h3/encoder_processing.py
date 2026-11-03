@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.minimax_h3.keyframes import prepare_fl2va_keyframes
 from vllm_omni.diffusion.models.minimax_h3.ordered_references import (
@@ -44,6 +45,7 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     resolve_minimax_h3_aspect_ratio,
     resolve_minimax_h3_output_canvas,
     resolve_minimax_h3_reference_image_shape,
+    scale_minimax_h3_reference_sizes_to_budget,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
@@ -60,6 +62,8 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     MINIMAX_H3_TIMELINE_GUIDES_KEY,
     prepare_timeline_guides,
 )
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_FPS = 24
 # The audio VAE's rate; standalone references are normalized onto it exactly
@@ -260,6 +264,7 @@ def _prepare_encoder_images(
     width: int,
     keyframe_resize_mode: str | None = None,
     reference_image_shape: Callable[[Image.Image, int, int], tuple[int, int]] | None = None,
+    reference_image_sizes: list[tuple[int, int]] | None = None,
     guided: bool = False,
 ) -> list[Any]:
     """Resize references to the geometry the deployment's contract pins.
@@ -271,6 +276,13 @@ def _prepare_encoder_images(
     if not images:
         return []
     if task == "ref2va":
+        if reference_image_sizes is not None:
+            # Pre-resolved per-request sizes (e.g. the reference pixel budget):
+            # identical for the presentation and VAE paths by construction.
+            return [
+                image.resize(reference_image_sizes[index], Image.Resampling.LANCZOS)
+                for index, image in enumerate(images)
+            ]
         if reference_image_shape is not None:
             # Contract-owned callback (the production single-stage DIT path):
             # the pipeline resolved the geometry, so honour it verbatim.
@@ -515,6 +527,7 @@ def prepare_encoder_inputs(
     strategy: Any | None = None,
     reference_image_shape: Callable[[Image.Image, int, int], tuple[int, int]] | None = None,
     fl2va_canvas_policy: str | None = None,
+    reference_image_total_pixels: int = 0,
 ) -> PreparedEncoderInputs:
     """Decode references once and prepare the shared text/codec presentation."""
     if isinstance(prompt, str):
@@ -617,6 +630,18 @@ def prepare_encoder_inputs(
             raise OmniClientError("MiniMax H3 timeline guides cannot be combined with audio_mode=lock_source")
     timeline_guides = prepare_timeline_guides(raw_guides, width=width, height=height, num_frames=num_frames)
 
+    reference_image_sizes: list[tuple[int, int]] | None = None
+    if task == "ref2va" and reference_image_shape is not None and reference_image_total_pixels > 0 and raw_images:
+        targets = [reference_image_shape(image, width, height) for image in raw_images]
+        reference_image_sizes = scale_minimax_h3_reference_sizes_to_budget(targets, reference_image_total_pixels)
+        if reference_image_sizes is not None:
+            logger.info(
+                "MiniMax H3 reference image budget: total=%d budget=%d scale=%.4f sizes=%s",
+                sum(w * h for w, h in targets),
+                reference_image_total_pixels,
+                math.sqrt(reference_image_total_pixels / sum(w * h for w, h in targets)),
+                reference_image_sizes,
+            )
     images = _prepare_encoder_images(
         task,
         raw_images,
@@ -624,6 +649,7 @@ def prepare_encoder_inputs(
         width=width,
         keyframe_resize_mode=getattr(strategy, "fl2va_keyframe_resize_mode", None),
         reference_image_shape=reference_image_shape,
+        reference_image_sizes=reference_image_sizes,
         guided=bool(timeline_guides),
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []

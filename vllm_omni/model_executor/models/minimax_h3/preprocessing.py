@@ -227,6 +227,48 @@ def resolve_minimax_h3_reference_image_shape(
     )
 
 
+def scale_minimax_h3_reference_sizes_to_budget(
+    targets: list[tuple[int, int]],
+    budget: int,
+) -> list[tuple[int, int]] | None:
+    """Shrink per-image reference targets so their total area fits ``budget``.
+
+    Returns ``None`` when the targets already fit. Every target is scaled by
+    one shared factor so relative sizes — and each image's aspect, within
+    rounding — survive. First pass rounds to the 32-pixel grid; if the rounded
+    total still exceeds the budget a second pass floors to the grid, mirroring
+    the per-image cap's round-then-clamp pattern.
+    """
+    if budget <= 0 or not targets:
+        return None
+    total = sum(width * height for width, height in targets)
+    if total <= budget:
+        return None
+    scale = math.sqrt(budget / total)
+    scaled = [
+        (
+            _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+            _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        )
+        for width, height in targets
+    ]
+    if sum(width * height for width, height in scaled) > budget:
+        scaled = [
+            (
+                max(
+                    MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                    width // MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                ),
+                max(
+                    MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                    height // MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                ),
+            )
+            for width, height in scaled
+        ]
+    return scaled
+
+
 def resolve_minimax_h3_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
     """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
     if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:

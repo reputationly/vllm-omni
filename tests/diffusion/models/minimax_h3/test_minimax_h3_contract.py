@@ -3914,3 +3914,60 @@ def test_fl2va_canvas_policy_param_agrees_with_shape_resolver():
         h1, w1 = resolve_minimax_h3_output_canvas(via_aspect, 768)
         h2, w2, *_ = resolve_minimax_h3_shape("fl2va", sampling, img, "buckets")
         assert (h1, w1) == expected_hw == (h2, w2)
+
+
+def _budget_shape(image, canvas_w, canvas_h):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    return _reference_image_shape(image, short_edge=1536, no_upscale=False, max_pixels=None)
+
+
+def test_reference_budget_noop_below_budget():
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import scale_minimax_h3_reference_sizes_to_budget
+
+    targets = [(512, 512), (640, 480)]
+    assert scale_minimax_h3_reference_sizes_to_budget(targets, 10_000_000) is None
+    assert scale_minimax_h3_reference_sizes_to_budget(targets, 0) is None
+
+
+def test_reference_budget_nine_wide_images():
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import scale_minimax_h3_reference_sizes_to_budget
+
+    images = [Image.new("RGB", (1000, 2500)) for _ in range(9)]
+    targets = [_budget_shape(im, 1344, 768) for im in images]
+    budget = 24_000_000
+    scaled = scale_minimax_h3_reference_sizes_to_budget(targets, budget)
+    assert scaled is not None
+    assert sum(w * h for w, h in scaled) <= budget
+    # every image scaled by the same factor -> equal final sizes
+    assert len({s for s in scaled}) == 1
+    for (tw, th), (sw, sh) in zip(targets, scaled):
+        assert sw % 32 == 0 and sh % 32 == 0
+        assert abs((sw / sh) - (1000 / 2500)) < 0.05
+
+
+def test_reference_budget_rejects_non_official_geometry():
+    import pytest
+
+    from vllm_omni.diffusion.models.minimax_h3.strategy import resolve_strategy
+
+    env = {
+        "VLLM_OMNI_H3_REF_IMAGE_GEOMETRY": "fixed_area",
+        "VLLM_OMNI_H3_REF_IMAGE_MAX_PIXELS": "1032192",
+        "VLLM_OMNI_H3_REF_IMAGE_TOTAL_PIXELS": "24000000",
+    }
+    with pytest.raises((ValueError, Exception), match="official_short_edge|must be"):
+        resolve_strategy(inference_contract="legacy", admission_policy=None, environ=env)
+
+
+def test_reference_budget_prepare_images_uses_identical_sizes():
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import _prepare_encoder_images
+
+    sizes = [(640, 1600)] * 3
+    images = [Image.new("RGB", (1000, 2500)) for _ in range(3)]
+    out = _prepare_encoder_images("ref2va", images, height=768, width=1344, reference_image_sizes=sizes)
+    assert [im.size for im in out] == sizes
