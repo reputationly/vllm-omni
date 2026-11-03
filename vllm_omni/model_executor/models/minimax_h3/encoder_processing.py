@@ -168,6 +168,7 @@ def resolve_minimax_h3_shape(
     task: str,
     sampling: Any,
     image: Image.Image | None,
+    fl2va_canvas_policy: str | None = None,
 ) -> tuple[int, int, int, int, int]:
     # The diffusion package exports a pipeline that imports this shared module.
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
@@ -210,6 +211,7 @@ def resolve_minimax_h3_shape(
         task,
         target.get("aspect_ratio", extra.get("aspect_ratio")),
         image,
+        fl2va_canvas_policy,
     )
     raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
     if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
@@ -512,6 +514,7 @@ def prepare_encoder_inputs(
     prepared_reference_videos: list[dict[str, Any]] | None = None,
     strategy: Any | None = None,
     reference_image_shape: Callable[[Image.Image, int, int], tuple[int, int]] | None = None,
+    fl2va_canvas_policy: str | None = None,
 ) -> PreparedEncoderInputs:
     """Decode references once and prepare the shared text/codec presentation."""
     if isinstance(prompt, str):
@@ -562,6 +565,7 @@ def prepare_encoder_inputs(
         task,
         diffusion_sampling_params,
         raw_images[0] if raw_images else None,
+        fl2va_canvas_policy,
     )
     source_video = multi_modal_data.get("source_video")
     source_audio = multi_modal_data.get("source_audio")

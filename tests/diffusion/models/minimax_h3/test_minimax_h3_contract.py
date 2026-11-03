@@ -3896,3 +3896,21 @@ def test_fl2va_canvas_policy_buckets_exact_ratio_to_itself(monkeypatch, ratio_na
 def test_fl2va_768p_canvas_table(ratio_name, canvas):
     h, w = resolve_minimax_h3_output_canvas(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS[ratio_name], 768)
     assert (h, w) == canvas
+
+
+def test_fl2va_canvas_policy_param_agrees_with_shape_resolver():
+    """Both resolvers must return the same canvas when the policy arrives via the parameter only."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
+
+    sampling = SimpleNamespace(num_frames=None, height=None, width=None, target={}, extra_args={})
+    import os
+
+    os.environ.pop(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, None)
+    for aspect, expected_hw in ((1.6, (768, 1152)), (0.4615, (1536, 672))):
+        img = _img(round(1000 * aspect), 1000)
+        via_aspect = resolve_minimax_h3_aspect_ratio("fl2va", None, img, "buckets")
+        h1, w1 = resolve_minimax_h3_output_canvas(via_aspect, 768)
+        h2, w2, *_ = resolve_minimax_h3_shape("fl2va", sampling, img, "buckets")
+        assert (h1, w1) == expected_hw == (h2, w2)
