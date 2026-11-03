@@ -2536,6 +2536,7 @@ class MiniMaxH3Pipeline(
             task,
             aspect_ratio,
             image,
+            contract_environ(self.od_config).get("VLLM_OMNI_H3_FL2VA_CANVAS_POLICY"),
         )
         if not 0.25 <= aspect_ratio <= 4.0:
             raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be in [1:4, 4:1], got {aspect_ratio}")

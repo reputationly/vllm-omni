@@ -87,8 +87,13 @@ MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV = "VLLM_OMNI_H3_FL2VA_CANVAS_POLICY"
 _MINIMAX_H3_FL2VA_CANVAS_POLICIES = ("source_aspect", "buckets")
 
 
-def _fl2va_canvas_policy() -> str:
-    policy = os.environ.get(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, "source_aspect").strip().lower()
+def minimax_h3_fl2va_canvas_policy(policy: str | None = None) -> str:
+    """Resolve the fl2va canvas policy.
+
+    The caller may pass the stage-scoped value; without one the process
+    environment is consulted, so docker-level ``-e`` still works.
+    """
+    policy = (policy or os.environ.get(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, "source_aspect")).strip().lower()
     if policy not in _MINIMAX_H3_FL2VA_CANVAS_POLICIES:
         raise OmniClientError(
             f"{MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV} must be one of {_MINIMAX_H3_FL2VA_CANVAS_POLICIES}, got {policy!r}"
@@ -155,13 +160,14 @@ def resolve_minimax_h3_aspect_ratio(
     task: str,
     value: Any,
     image: Image.Image | None,
+    canvas_policy: str | None = None,
 ) -> float:
     """Resolve H3's task-specific output aspect-ratio policy."""
     if task == "fl2va":
         if image is None:
             raise OmniClientError("fl2va requires an input image to resolve its aspect ratio")
         aspect = float(image.width) / float(image.height)
-        if _fl2va_canvas_policy() == "buckets":
+        if minimax_h3_fl2va_canvas_policy(canvas_policy) == "buckets":
             return _snap_aspect_to_bucket(aspect)
         return aspect
 
