@@ -3971,3 +3971,16 @@ def test_reference_budget_prepare_images_uses_identical_sizes():
     images = [Image.new("RGB", (1000, 2500)) for _ in range(3)]
     out = _prepare_encoder_images("ref2va", images, height=768, width=1344, reference_image_sizes=sizes)
     assert [im.size for im in out] == sizes
+
+
+def test_reference_budget_floor_pass_when_rounding_overshoots():
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import scale_minimax_h3_reference_sizes_to_budget
+
+    # scaled floats 48.0 round-align to 64 (overshoot); floor must drop them to 32.
+    targets = [(64, 64)] * 4
+    budget = 4 * 48 * 48
+    scaled = scale_minimax_h3_reference_sizes_to_budget(targets, budget)
+    assert scaled is not None
+    assert sum(w * h for w, h in scaled) <= budget
+    for w, h in scaled:
+        assert w % 32 == 0 and h % 32 == 0 and w >= 32 and h >= 32

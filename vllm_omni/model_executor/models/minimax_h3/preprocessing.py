@@ -245,26 +245,29 @@ def scale_minimax_h3_reference_sizes_to_budget(
     if total <= budget:
         return None
     scale = math.sqrt(budget / total)
+    floats = [(width * scale, height * scale) for width, height in targets]
     scaled = [
         (
-            _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
-            _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+            _align_multiple(width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+            _align_multiple(height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         )
-        for width, height in targets
+        for width, height in floats
     ]
     if sum(width * height for width, height in scaled) > budget:
+        # Rounding overshot: floor the same floats instead so the aligned
+        # total fits — flooring the already-rounded values would be a no-op.
         scaled = [
             (
                 max(
                     MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-                    width // MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                    int(width) // MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
                 ),
                 max(
                     MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-                    height // MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                    int(height) // MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
                 ),
             )
-            for width, height in scaled
+            for width, height in floats
         ]
     return scaled
 

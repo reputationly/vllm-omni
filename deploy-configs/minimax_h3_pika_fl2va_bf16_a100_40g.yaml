@@ -24,6 +24,8 @@ stages:
 
     env:
       VLLM_OMNI_H3_FL2VA_KEYFRAME_RESIZE: source_center_crop
+      # Snap the first-image aspect to the nearest of the 11 official buckets.
+      VLLM_OMNI_H3_FL2VA_CANVAS_POLICY: buckets
 
     enable_cpu_offload: true
     vae_use_tiling: true
