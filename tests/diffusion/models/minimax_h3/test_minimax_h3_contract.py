@@ -13,8 +13,15 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from PIL import Image
 
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV,
+    MINIMAX_H3_SUPPORTED_ASPECT_RATIOS,
+    resolve_minimax_h3_aspect_ratio,
+    resolve_minimax_h3_output_canvas,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -3833,3 +3840,59 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
         pipeline.decode_to_mp4.assert_not_called()
     finally:
         registry.close()
+
+
+# --- fl2va canvas bucket policy ------------------------------------------------
+
+
+def _img(w: int, h: int) -> Image.Image:
+    return Image.new("RGB", (w, h))
+
+
+BUCKET_MAP = {1.6: 3 / 2, 1.85: 16 / 9, 2.0: 16 / 9, 2.39: 21 / 9, 0.7: 2 / 3, 0.4615: 9 / 21}
+BUCKET_CANVAS = {
+    "21:9": (672, 1536),
+    "16:9": (768, 1344),
+    "3:2": (768, 1152),
+    "4:3": (768, 1024),
+    "5:4": (768, 960),
+    "1:1": (768, 768),
+    "4:5": (960, 768),
+    "3:4": (1024, 768),
+    "2:3": (1152, 768),
+    "9:16": (1344, 768),
+    "9:21": (1536, 672),
+}
+
+
+def test_fl2va_canvas_policy_default_is_source_aspect(monkeypatch):
+    monkeypatch.delenv(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, raising=False)
+    got = resolve_minimax_h3_aspect_ratio("fl2va", None, _img(1600, 1000))
+    assert got == pytest.approx(1.6)
+
+
+def test_fl2va_canvas_policy_invalid_value(monkeypatch):
+    monkeypatch.setenv(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, "bogus")
+    with pytest.raises(Exception, match="VLLM_OMNI_H3_FL2VA_CANVAS_POLICY"):
+        resolve_minimax_h3_aspect_ratio("fl2va", None, _img(1600, 1000))
+
+
+@pytest.mark.parametrize("aspect,expected", BUCKET_MAP.items())
+def test_fl2va_canvas_policy_buckets_snap(monkeypatch, aspect, expected):
+    monkeypatch.setenv(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, "buckets")
+    got = resolve_minimax_h3_aspect_ratio("fl2va", None, _img(round(1000 * aspect), 1000))
+    assert got == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("ratio_name", list(BUCKET_CANVAS))
+def test_fl2va_canvas_policy_buckets_exact_ratio_to_itself(monkeypatch, ratio_name):
+    monkeypatch.setenv(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, "buckets")
+    r = MINIMAX_H3_SUPPORTED_ASPECT_RATIOS[ratio_name]
+    got = resolve_minimax_h3_aspect_ratio("fl2va", None, _img(round(2000 * r), 2000))
+    assert got == pytest.approx(r)
+
+
+@pytest.mark.parametrize("ratio_name,canvas", BUCKET_CANVAS.items())
+def test_fl2va_768p_canvas_table(ratio_name, canvas):
+    h, w = resolve_minimax_h3_output_canvas(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS[ratio_name], 768)
+    assert (h, w) == canvas

@@ -73,11 +73,37 @@ MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "21:9": 21.0 / 9.0,
     "16:9": 16.0 / 9.0,
+    "3:2": 3.0 / 2.0,
     "4:3": 4.0 / 3.0,
+    "5:4": 5.0 / 4.0,
     "1:1": 1.0,
+    "4:5": 4.0 / 5.0,
     "3:4": 3.0 / 4.0,
+    "2:3": 2.0 / 3.0,
     "9:16": 9.0 / 16.0,
+    "9:21": 9.0 / 21.0,
 }
+MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV = "VLLM_OMNI_H3_FL2VA_CANVAS_POLICY"
+_MINIMAX_H3_FL2VA_CANVAS_POLICIES = ("source_aspect", "buckets")
+
+
+def _fl2va_canvas_policy() -> str:
+    policy = os.environ.get(MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV, "source_aspect").strip().lower()
+    if policy not in _MINIMAX_H3_FL2VA_CANVAS_POLICIES:
+        raise OmniClientError(
+            f"{MINIMAX_H3_FL2VA_CANVAS_POLICY_ENV} must be one of {_MINIMAX_H3_FL2VA_CANVAS_POLICIES}, got {policy!r}"
+        )
+    return policy
+
+
+def _snap_aspect_to_bucket(aspect: float) -> float:
+    """Snap an aspect ratio to the official bucket by |log distance|, ties to lower index."""
+    return min(
+        MINIMAX_H3_SUPPORTED_ASPECT_RATIOS.values(),
+        key=lambda bucket: abs(math.log(aspect) - math.log(bucket)),
+    )
+
+
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 
@@ -134,7 +160,10 @@ def resolve_minimax_h3_aspect_ratio(
     if task == "fl2va":
         if image is None:
             raise OmniClientError("fl2va requires an input image to resolve its aspect ratio")
-        return float(image.width) / float(image.height)
+        aspect = float(image.width) / float(image.height)
+        if _fl2va_canvas_policy() == "buckets":
+            return _snap_aspect_to_bucket(aspect)
+        return aspect
 
     if value is None:
         if task == "t2va":
