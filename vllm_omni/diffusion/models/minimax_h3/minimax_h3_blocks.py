@@ -45,6 +45,17 @@ from .low_vram import attention_head_chunks, ffn_row_chunks
 from .vdn_hybrid import REQUIRED_ATTENTION_BACKEND, VDNHybridAttention, combine_hybrid_output
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
+# Dynamo treats an nn.Module's integer attributes as *static* and builds one guard
+# per value. ``MiniMaxH3DiTBlock.layer_index`` is such an attribute and is read on
+# every forward (it is the reference-KV cache slot), so under regional compilation
+# each of the 28 blocks produced its own guard: the process reached
+# ``torch._dynamo.config.recompile_limit`` (8) part-way down the stack and silently
+# fell back to eager for the remaining blocks. That made the first requests after
+# every container start both slower and non-deterministic. Keeping module ints
+# unspecialised is exactly what dynamo's own hint recommends for this pattern, and
+# widens guards only -- no math changes.
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
