@@ -261,7 +261,8 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
-from .vdn import VDNCheckpoint as LocalVDNCheckpoint, resolve_vdn_checkpoint
+from .vdn import VDNCheckpoint as LocalVDNCheckpoint
+from .vdn import resolve_vdn_checkpoint
 from .vdn_hybrid import validate_hybrid_runtime
 from .vdnh3 import VDNCheckpoint
 
@@ -2193,7 +2194,9 @@ class MiniMaxH3Pipeline(
                 # branch tensors are consumed once, so one object cannot feed two streams.
                 # Its OWN partition's stamp: this DiT's weights come from Ref2VA/, and
                 # a bake run stamps one transformer/ at a time.
-                self._vdn_ref_local = resolve_vdn_checkpoint(od_config, self.transformers_ref, model_path=ref2va_model_path)
+                self._vdn_ref_local = resolve_vdn_checkpoint(
+                    od_config, self.transformers_ref, model_path=ref2va_model_path
+                )
                 if self._vdn_ref_local is not None:
                     self.transformers_ref.enable_vdn_branches(**self._vdn_ref_local.spec.branch_kwargs())
         self._configure_adaln_sidecar(
@@ -5802,9 +5805,7 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ROWS: audio_rows,
                 _STEP_SAMPLER: step_sampler,
                 _STEP_SAMPLER_OBJECT: (
-                    None
-                    if renoise_generator is None
-                    else sampler_object(step_sampler, generator=renoise_generator)
+                    None if renoise_generator is None else sampler_object(step_sampler, generator=renoise_generator)
                 ),
                 _STEP_SAMPLING_STATE: SamplingState(
                     (video_rows[branch.update_mask_dev], audio_rows[branch.audio_update_mask_dev]),
