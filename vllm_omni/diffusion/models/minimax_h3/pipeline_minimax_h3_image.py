@@ -741,6 +741,7 @@ class MiniMaxH3ImagePipeline(
                 sigmas=sigmas,
                 deltas=deltas,
                 num_steps=num_steps,
+                reference_kv_state=reference_kv_state,
             )
         finally:
             minimax_h3_publish_denoise_progress(None, None, None)
@@ -759,6 +760,7 @@ class MiniMaxH3ImagePipeline(
         sigmas: list[float],
         deltas: torch.Tensor,
         num_steps: int,
+        reference_kv_state: Any | None = None,
     ) -> None:
         with self.progress_bar(total=num_steps) as progress_bar:
             for step in range(num_steps):
@@ -779,7 +781,15 @@ class MiniMaxH3ImagePipeline(
                 # writes only them, so the anchor rows need neither re-copying
                 # nor a zeroed velocity.
                 kwargs["skip_mask_out_condition"] = True
+                # The reference-KV cache is a request-local state machine: the step
+                # (and its sigma) must be announced before the forward reads it, and
+                # the step closed afterwards -- same contract the video sampler
+                # follows in ``sampling.MiniMaxH3Model``.
+                if reference_kv_state is not None:
+                    reference_kv_state.begin_step(step, sigma=float(sigmas[step]))
                 velocity, _ = self.transformer(pdd_step=step, **kwargs)
+                if reference_kv_state is not None:
+                    reference_kv_state.end_step()
                 _euler_target_step(video_rows, velocity, n_cond, deltas[step])
                 progress_bar.update()
 
