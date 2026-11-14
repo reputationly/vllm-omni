@@ -163,6 +163,18 @@ RUN PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_path("pureli
     uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
     --no-cache --no-binary lmcache --no-build-isolation-package lmcache --reinstall-package lmcache \
     -r ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-bootstrap.txt "lmcache==0.5.6"
+# aarch64 deviation: on the arm64 build the published base can end up with an
+# ``nvidia-cusparselt-cu13`` whose WHEEL tag says x86_64 (dependency resolved
+# from a foreign-arch wheel or cache entry), so upstream's ``uv pip check`` gate
+# -- which is clean on amd64 -- fails here with "built for a different platform".
+# Reinstall that same version from the aarch64 wheel and KEEP the gate: dropping
+# the check would hide real dependency drift in every future bump.
+RUN if [ "$(uname -m)" != "x86_64" ]; then \
+      V=$(python3 -c "import importlib.metadata as m; print(m.version('nvidia-cusparselt-cu13'))") && \
+      uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
+        --force-reinstall --no-deps --only-binary=:all: --no-cache-dir \
+        "nvidia-cusparselt-cu13==${V}"; \
+    fi
 RUN uv pip check --python "$(python3 -c 'import sys; print(sys.executable)')"
 
 # cuDNN 9.24 causes the original Qwen-Image 2.1 pixel gate to fail under
