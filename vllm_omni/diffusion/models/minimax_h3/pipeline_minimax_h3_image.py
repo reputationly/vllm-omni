@@ -66,6 +66,7 @@ from .denoise_loop import (
     MINIMAX_H3_AUDIO_ROW_WIDTH,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
     MiniMaxH3DenoiseBranch,
+    minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .image_resize import resize_lanczos_uint8
@@ -74,6 +75,7 @@ from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 from .packed_tokens import minimax_h3_patchify_video_latent, minimax_h3_unpatchify_video_tokens
 from .pipeline_minimax_h3 import MiniMaxH3Pipeline, _broadcast_tensor, _dit_rank_world
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import scale_minimax_h3_reference_sizes_to_budget
 
 logger = init_logger(__name__)
 
@@ -94,6 +96,11 @@ MINIMAX_H3_IMAGE_MAX_REFERENCES = 16
 # [min, max] (a short edge already inside keeps the original pixels).
 MINIMAX_H3_IMAGE_QWEN_SHORT_EDGE = (1024, 1024)
 MINIMAX_H3_IMAGE_VAE_SHORT_EDGE = (1024, 2048)
+# Opt-in total pixel budget over all edit references
+# (``--additional-config '{"reference_image_total_pixels": N}'``). Every reference is
+# shrunk by one shared factor so their relative sizes survive; 0/unset keeps the
+# released per-consumer short-edge bands, which is what the release was tuned on.
+MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY = "reference_image_total_pixels"
 _TEXT_SEGMENT_MAX_TOKENS = 4096
 _TEXT_TAG = 1
 _VISUAL_TAG = 0
@@ -404,6 +411,17 @@ class MiniMaxH3ImagePipeline(
         self._dit_rank = rank
         # VAE tiles are spread over every DiT rank; each tile keeps its
         # single-rank kernels, so outputs do not depend on the rank count.
+        raw_reference_budget = (od_config.additional_config or {}).get(MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY)
+        if raw_reference_budget is not None and (
+            isinstance(raw_reference_budget, bool)
+            or not isinstance(raw_reference_budget, int)
+            or raw_reference_budget < 0
+        ):
+            raise ValueError(
+                f"{MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY} must be a non-negative integer, "
+                f"got {raw_reference_budget!r}"
+            )
+        self._reference_total_pixels = int(raw_reference_budget or 0)
         tile_parallel = (od_config.additional_config or {}).get("vae_tile_parallel", True)
         if type(tile_parallel) is not bool:
             raise ValueError(f"vae_tile_parallel must be a bool, got {tile_parallel!r}")
@@ -702,9 +720,52 @@ class MiniMaxH3ImagePipeline(
         sigmas = minimax_h3_image_run_sigmas(self.pdd_sigmas)
         sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
         deltas = sigma_values[:-1] - sigma_values[1:]
+        # Opt-in reference-KV reuse: the same switch and semantics as the video path
+        # (``--kv-offload-config '{"mode":"on","kv_refresh_interval":N}'``). The
+        # reference rows' post-attention K/V are captured once per refresh interval
+        # and re-used instead of re-projected on every step. Lossy by construction
+        # (reference rows also attend to the target rows), so it stays off unless the
+        # deployment asks for it.
+        create_kv_state = getattr(self.transformer, "create_reference_kv_state", None)
+        reference_kv_state = (
+            create_kv_state(global_reference_rows=n_cond, device=self.device) if callable(create_kv_state) else None
+        )
+        if reference_kv_state is not None:
+            branch.static_kwargs["reference_kv_state"] = reference_kv_state
+        try:
+            self._run_pdd_steps(
+                branch=branch,
+                video_rows=video_rows,
+                audio_rows=audio_rows,
+                n_cond=n_cond,
+                sigmas=sigmas,
+                deltas=deltas,
+                num_steps=num_steps,
+            )
+        finally:
+            minimax_h3_publish_denoise_progress(None, None, None)
+            if reference_kv_state is not None:
+                branch.static_kwargs.pop("reference_kv_state", None)
+                reference_kv_state.close()
+        return video_rows[n_cond:]
+
+    def _run_pdd_steps(
+        self,
+        *,
+        branch: MiniMaxH3DenoiseBranch,
+        video_rows: torch.Tensor,
+        audio_rows: torch.Tensor,
+        n_cond: int,
+        sigmas: list[float],
+        deltas: torch.Tensor,
+        num_steps: int,
+    ) -> None:
         with self.progress_bar(total=num_steps) as progress_bar:
             for step in range(num_steps):
                 check_request_cancellation()
+                # Step-gated attention features and the reference-KV refresh schedule
+                # read the denoise step from the forward context.
+                minimax_h3_publish_denoise_progress(step, sigmas[step], num_steps)
                 t = 1.0 - sigmas[step]
                 kwargs = branch.forward_kwargs(
                     video_rows=video_rows,
@@ -721,7 +782,6 @@ class MiniMaxH3ImagePipeline(
                 velocity, _ = self.transformer(pdd_step=step, **kwargs)
                 _euler_target_step(video_rows, velocity, n_cond, deltas[step])
                 progress_bar.update()
-        return video_rows[n_cond:]
 
     # no_grad, not inference_mode: the runner selects no_grad for layerwise
     # offload (DLO), whose hooks read tensor version counters.
@@ -738,6 +798,21 @@ class MiniMaxH3ImagePipeline(
         # the VAE encode): per-reference posterior samples.
         target_noise = self._noise_rows(generator, latent_h, latent_w)
         vae_refs = [_bound_reference(image, MINIMAX_H3_IMAGE_VAE_SHORT_EDGE) for image in references]
+        if self._reference_total_pixels and vae_refs:
+            sizes = scale_minimax_h3_reference_sizes_to_budget(
+                [image.size for image in vae_refs], self._reference_total_pixels
+            )
+            if sizes is not None:
+                vae_refs = [
+                    image.resize(size, Image.Resampling.LANCZOS)
+                    for image, size in zip(vae_refs, sizes, strict=True)
+                ]
+                logger.info(
+                    "MiniMax-H3-Image: reference budget %d px shrunk %d references to %s",
+                    self._reference_total_pixels,
+                    len(vae_refs),
+                    sizes,
+                )
         grids = [minimax_h3_image_reference_grid(*image.size) for image in vae_refs]
         anchor_noise = [self._noise_rows(generator, h, w) for h, w in grids]
         clean_rows = self._encode_references(vae_refs, grids, generator)
