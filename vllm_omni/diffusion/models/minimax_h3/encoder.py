@@ -1446,6 +1446,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if missing:
             # Listed in full: this aborts startup, so the message is the only diagnostic.
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
+        return loaded
 
     def load_to_device(self) -> None:
         if not self.is_loaded:
