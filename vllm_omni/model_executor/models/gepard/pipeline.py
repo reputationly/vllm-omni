@@ -40,6 +40,11 @@ GEPARD_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [_GEPARD_STOP_TOKEN_ID],
             },
+            # A frame's 31 side-channel FSQ codes never enter the token stream,
+            # so a replay cannot rebuild the KV behind audio already delivered
+            # (#6179; the preemption warning at gepard_talker.py only reports
+            # the damage after it happens).
+            recompute_preemption="fail",
         ),
     ),
 )

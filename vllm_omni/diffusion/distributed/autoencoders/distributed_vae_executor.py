@@ -88,28 +88,29 @@ class DistributedVaeExecutor:
             raise torch.OutOfMemoryError(f"Distributed VAE {stage} failed: {detail}")
 
     def gather_tensors(self, tensor: torch.Tensor):
-        """把各 rank 的分块收到 rank 0。
+        """Gather tile data to WORLD rank zero with guarded receive allocations.
 
-        用 ``gather`` 而不是 ``all_gather``:两条调用路径(本文件的 ``execute`` 与
-        ``autoencoder_kl_ltx2.py`` 的 tile 版)**都只在 rank 0 用这个结果** ——
-        下面紧接着就是 ``if self.rank != 0: result = torch.empty(0)``。
-        all_gather 会让每张卡都分配 world_size 份缓冲、把整段解码后视频全收一遍,
-        非 rank 0 那几张收完即扔。
-
-        这不是省边角:2026-08-31 实测 LTX-2.5 的 4K 档就是**非 rank 0 的卡**先 OOM 的
-        (3840×2176×249 报 `GPU 2 has a total capacity of 39.49 GiB of which
-        10.19 GiB is free`),因为整段视频在每张卡上都有一份。改掉之后非 rank 0 的
-        这一份就不存在了。
-
-        NCCL 支持 gather(PyTorch 用 point-to-point 实现),已在 A100×2 上实跑验证。
-        分配包在 ``_sync_errors`` 里(2.1 分支引入):一张卡分配失败时让所有 rank 一起
-        报错,而不是别的 rank 卡在集合通信上等到 NCCL 看门狗。
+        ``gather`` (not ``all_gather``): both this file's ``execute`` and the
+        tile path in ``autoencoder_kl_ltx2.py`` consume the result on the
+        group's rank 0 only -- the caller drops it elsewhere right away -- and
+        ``all_gather`` would give every rank a full copy of the decoded video
+        (observed as a non-rank-0 OOM on an LTX-2.5 4K run). ``dist.gather``
+        addresses its root by global rank, so translate the group-local root.
         """
+        # torch_npu implements gather with hidden non-root allocations and
+        # all-gather. Keep those allocations inside our error agreement instead.
+        use_all_gather = dist.get_backend(self.group) == "hccl"
         dst = dist.get_global_rank(self.group, 0) if self.group is not None else 0
         with self._sync_errors("gather allocation"):
-            gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
-        dist.gather(tensor, gather_list, dst=dst, group=self.group)
-        return gather_list
+            gather_list = (
+                [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 or use_all_gather else None
+            )
+        if use_all_gather:
+            assert gather_list is not None
+            dist.all_gather(gather_list, tensor, group=self.group)
+        else:
+            dist.gather(tensor, gather_list=gather_list, dst=dst, group=self.group)
+        return gather_list if self.rank == 0 else None
 
     def broadcast_tensor(self, tensor: torch.Tensor):
         dist.broadcast(tensor, src=0, group=self.group)
@@ -188,10 +189,14 @@ class DistributedVaeExecutor:
             local_tile_tensor, local_meta_tensor = self._pack_local_tiles(
                 local_results, global_padding_shape, grid_spec, z.device, output_dtype
             )
+        # Packing copies each decoded tile into independent storage.
+        del local_results
 
         # 6. gather tiles & meta
         meta_gather = self.gather_tensors(local_meta_tensor)
         tile_gather = self.gather_tensors(local_tile_tensor)
+        # The synchronous collective owns separate receive buffers for merging.
+        del local_tile_tensor
 
         with self._sync_errors("tile merge"):
             if self.rank != 0:
@@ -238,8 +243,10 @@ class DistributedVaeMixin:
             self.distributed_executor.parallel_size <= 1
             or self.distributed_executor.parallel_mode == "batch"
             or not dist.is_initialized()
-            or not getattr(self, "use_tiling", False)
         ):
+            return False
+        # Only "tile" mode splits the tiled path's tiles; spatial_shard_* decodes the full frame.
+        if self.distributed_executor.parallel_mode == "tile" and not getattr(self, "use_tiling", False):
             return False
         world_size = dist.get_world_size(group=self.distributed_executor.group)
         pp_size = min(int(self.distributed_executor.parallel_size), int(world_size))

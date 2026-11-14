@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 cfg-distilled full denoise loop.
 
-Per step, the positive presentation is forwarded exactly once. Video and audio
+The sampler owns model evaluations and numerical integration. Video and audio
 target rows chain through the selected solver while visual and audio condition
 rows stay pinned to their noised step-0 anchors.
+
+``sampler="renoise"`` is the fork's Pika Flex sampler: it is the one stochastic
+algorithm, so the caller hands the loop a dedicated per-request
+``renoise_generator`` which the sampler object carries for the whole call.
+Without one the loop raises instead of sampling from the global RNG.
 """
 
 from __future__ import annotations
@@ -21,18 +26,17 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_sigma,
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
 from vllm_omni.diffusion.progress import PHASE_DENOISE, report_phase
+from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
-from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
-from .sampling import create_h3_sample_solver
-from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_rf_v_to_x0,
-)
+from .latent_mask import MiniMaxH3LatentEdit
+from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
 
 logger = init_logger(__name__)
 
@@ -167,12 +171,15 @@ def minimax_h3_publish_denoise_progress(
 ) -> None:
     """Publish denoise progress for step-gated attention features.
 
-    Both execution modes must publish the same trio: the step index drives the
+    Both execution modes must publish the same four values: the step index drives the
     dense warmup of RAINFUSION_ATTN, the normalized descending timestep
     drives the TRTLLM_ATTN skip gate (which stays dense while it is unset),
-    and the total step count enables the ``end_step`` tail fallback.
+    the total step count enables the ``end_step`` tail fallback, and the
+    video sigma selects the profile when sigma windows are bound.
     """
     set_forward_context_denoise_step_idx(step)
+    # H3 publishes its shifted rectified-flow video sigma; only bound sigma windows read it.
+    set_forward_context_denoise_sigma(sigma_video)
     set_forward_context_denoise_timestep(sigma_video)
     set_forward_context_denoise_total_steps(total_steps)
 
@@ -263,15 +270,15 @@ class MiniMaxH3DenoiseBranch:
                 for span in raw_spans
             )
             target_start = next(span.start for span in reversed(spans) if span.role == "target")
-            prefix_tags = token_tags[:target_start]
-            prefix_segments: list[int] = []
-            if prefix_tags.numel():
-                # Run-lengths preserve modality/reference boundaries without
-                # carrying CUDA tensors into every attention layer.
+            prefix_segments = packed.get("vsa_prefix_segments")
+            if prefix_segments is None:
+                # Native T2VA/FL2VA layouts use modality runs, including any
+                # vision-token overrides. Ref2VA supplies explicit boundaries.
+                prefix_tags = token_tags[:target_start]
                 boundaries = torch.nonzero(prefix_tags[1:] != prefix_tags[:-1]).flatten().tolist()
                 starts = [0, *(index + 1 for index in boundaries)]
                 stops = [*(index + 1 for index in boundaries), target_start]
-                prefix_segments = [stop - start for start, stop in zip(starts, stops, strict=True)]
+                prefix_segments = tuple(stop - start for start, stop in zip(starts, stops, strict=True) if stop > start)
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(
                 used_len=int(cu[1]),
                 video_spans=spans,
@@ -404,12 +411,12 @@ def minimax_h3_prepare_denoise_rows(
     keyframe_cond_rows: torch.Tensor | None,
     audio_ref_rows: torch.Tensor | None,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate the initial rows against the layout and pin the condition rows.
 
-    Returns ``(video_rows, audio_rows, cond_anchor, audio_anchor)`` with the
-    anchors already written into their rows, which is the state both the
-    request-mode loop and step-mode ``prepare_encode()`` start from.
+    Returns ``(video_rows, audio_rows)`` with the condition rows already written
+    in, which is the state both the request-mode loop and step-mode
+    ``prepare_encode()`` start from.
     """
     n_cond = int((~positive.update_mask).sum())
     if keyframe_cond_rows is None:
@@ -444,7 +451,7 @@ def minimax_h3_prepare_denoise_rows(
         video_rows[~update] = cond_anchor
     if audio_anchor is not None:
         audio_rows[~audio_update] = audio_anchor
-    return video_rows, audio_rows, cond_anchor, audio_anchor
+    return video_rows, audio_rows
 
 
 def minimax_h3_denoise_loop(
@@ -462,7 +469,7 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
-    on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    update_progress: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
     renoise_generator: torch.Generator | None = None,
@@ -483,7 +490,7 @@ def minimax_h3_denoise_loop(
     # Ascend-specific performance optimization and must not alter that path.
     if current_omni_platform.is_npu():
         positive.prepare_rope_table(model)
-    video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+    video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
         initial_audio_rows=initial_audio_rows,
@@ -498,115 +505,79 @@ def minimax_h3_denoise_loop(
     if audio_edit is not None:
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
-    # One generator feeds both streams; the loop steps video before audio on
-    # every iteration, which is the draw order the upstream sampler uses.
-    video_solver = create_h3_sample_solver(sampler, sigmas_video, generator=renoise_generator)
-    audio_solver = create_h3_sample_solver(sampler, sigmas_audio, generator=renoise_generator)
+    # Each call denoises one sequence and publishes its steps from 0 with its
+    # own num_steps. forward() runs one call per output seed and per
+    # continuation window, all with the main num_steps, and with latent_refine
+    # one more call per output seed over the tail of the sigma list, which has
+    # its own num_steps. Step ranges select profiles on each call from step 0.
+    # The pipeline checks them against the main num_steps before the first call
+    # and rejects them together with latent_refine, so a request with step
+    # ranges runs only calls with the main num_steps. Sigma windows select from
+    # the sigma each call publishes, including the refine call.
+    reference_kv_state = None
+    create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
+    if callable(create_reference_kv_state):
+        reference_kv_state = create_reference_kv_state(
+            global_reference_rows=int((~positive.update_mask).sum()),
+            device=device,
+        )
+    if reference_kv_state is not None:
+        positive.static_kwargs["reference_kv_state"] = reference_kv_state
+
+    adapter = MiniMaxH3Model(
+        model,
+        positive,
+        (video_rows, audio_rows),
+        (video_edit, audio_edit),
+        (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
+    )
+    state = SamplingState((video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio))
     num_steps = len(sigmas_video) - 1
-    for step in range(num_steps):
+
+    def write_back_and_update_progress(state):
+        nonlocal video_rows, audio_rows
+        adapter.validate_write_back(state)
+        video_rows, audio_rows = adapter.write_back(state)
+        step = state.step_index - 1
+        if update_progress is not None:
+            update_progress(step, video_rows, audio_rows)
+        # Status only -- throttled and a no-op outside a served request.
+        report_phase(PHASE_DENOISE, state.step_index, num_steps)
+        # Closes the per-step probe _snapshot_begin() opens in step_context().
+        _snapshot_end(step, num_steps)
+        check_request_cancellation(synchronize=True)
+
+    def step_context(states):
         check_request_cancellation()
-        step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
-        with step_cm:
-            # Our memory-attribution probe: pairs with the _snapshot_end() below
-            # to dump a torch allocator snapshot per step. Upstream has no such
-            # mechanism, so _snapshot_end() would be unpaired without this call.
-            _snapshot_begin(step)
-            # The solver objects built above own the sigma schedule, so only the
-            # current sigma is read here; the next-sigma locals the pre-refactor
-            # code passed explicitly are gone.
-            s_v = sigmas_video[step]
-            s_a = sigmas_audio[step]
-            # Publish where we are so step-gated attention features (the dense
-            # warmup of RAINFUSION_ATTN, the timestep gate of TRTLLM_ATTN) can
-            # see it. Gates use the scheduler-style descending timestep, which
-            # for a rectified-flow schedule is the video sigma.
-            minimax_h3_publish_denoise_progress(step, s_v, num_steps)
-            t_v, t_a = 1.0 - s_v, 1.0 - s_a
-            imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
-            audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
+        step = states[0].step_index
+        # Fork diagnostics, both env-gated and inert by default. The allocator probe
+        # has to start before this step's own allocations, and the step-memory line
+        # reads the rows the model is about to be fed, so both belong here, in the
+        # framework's per-step hook, rather than around the sampler call.
+        _snapshot_begin(step)
+        _log_step_memory(step, video_rows, audio_rows)
+        return step_profiler(step) if step_profiler is not None else nullcontext()
 
-            model_video_rows, video_target_timesteps = minimax_h3_prepare_edit_rows(
-                video_rows,
-                update,
-                video_edit,
-                t_v,
-                imgvid_cond_t,
-                sigma=s_v,
+    try:
+        with torch.inference_mode():
+            # The sampler object is the per-request algorithm instance, so it is also
+            # where a stochastic sampler's stream lives: renoise is handed the
+            # pipeline's dedicated generator here rather than owning a solver of its
+            # own per stream. Euler and res_multistep ignore it entirely.
+            sampler_object(sampler, generator=renoise_generator).sample(
+                MiniMaxH3ModelBatch({state: adapter}),
+                [state],
+                callback=write_back_and_update_progress,
+                step_context=step_context,
             )
-            model_audio_rows, audio_target_timesteps = minimax_h3_prepare_edit_rows(
-                audio_rows,
-                audio_update,
-                audio_edit,
-                t_a,
-                audio_ref_cond_t,
-                sigma=s_a,
-            )
-
-            fk = positive.forward_kwargs(
-                video_rows=model_video_rows,
-                audio_rows=model_audio_rows,
-                t_video=t_v,
-                t_audio=t_a,
-                imgvid_cond_timestep=imgvid_cond_t,
-                audio_ref_cond_timestep=audio_ref_cond_t,
-                video_target_timesteps=video_target_timesteps,
-                audio_target_timesteps=audio_target_timesteps,
-            )
-            _log_step_memory(step, video_rows, audio_rows)
-            with torch.inference_mode():
-                v_video, v_audio = model(**fk)
-            # 先按掩码取行、再转 fp32：反过来写（.float()[update]）会先给**整条 packed
-            # sequence** 分配 fp32 临时副本，而 update 只覆盖要去噪的目标帧。
-            # 注意量级：v_video 是 logits，行宽是 MINIMAX_H3_VIDEO_ROW_WIDTH=96（VAE latent
-            # 宽度），不是 DiT 内部的 hidden 5376。1344x768/15s 实测 115024 rows，瞬时峰值
-            # 85.6MB -> 62.1MB，只省约 23MB —— 相对该档位 2GiB 级的余量属噪声，**不解 OOM**。
-            # 保留仅因为严格不劣：布尔掩码索引两种写法都返回 copy、下游只读，取值必然一致。
-            mv_video_t = v_video[update].float()
-            mv_audio_t = v_audio[audio_update].float()
-
-            if video_edit is None:
-                x0_video = minimax_h3_rf_v_to_x0(
-                    video_rows[update],
-                    mv_video_t,
-                    torch.tensor(t_v, dtype=torch.float32, device=device),
-                )
-            else:
-                x0_video = video_edit.x0(
-                    model_video_rows[update],
-                    mv_video_t,
-                    t_v,
-                )
-            new_target = video_solver.step(video_rows[update], x0_video, step)
-            video_rows = video_rows.clone()
-            video_rows[update] = new_target
-            if cond_anchor is not None:
-                video_rows[~update] = cond_anchor  # per-step imgvid cond reset
-
-            if audio_edit is None:
-                x0_audio = minimax_h3_rf_v_to_x0(
-                    audio_rows[audio_update],
-                    mv_audio_t,
-                    torch.tensor(t_a, dtype=torch.float32, device=device),
-                )
-            else:
-                x0_audio = audio_edit.x0(
-                    model_audio_rows[audio_update],
-                    mv_audio_t,
-                    t_a,
-                )
-            new_audio = audio_solver.step(audio_rows[audio_update], x0_audio, step)
-            audio_rows = audio_rows.clone()
-            audio_rows[audio_update] = new_audio if positive.locked_audio_rows is None else positive.locked_audio_rows
-            if audio_anchor is not None:
-                audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
-            if on_step is not None:
-                on_step(step, video_rows, audio_rows)
-            # Status only -- throttled and a no-op outside a served request.
-            report_phase(PHASE_DENOISE, step + 1, num_steps)
-            _snapshot_end(step, num_steps)
-            check_request_cancellation(synchronize=True)
-
-    minimax_h3_publish_denoise_progress(None, None, None)
+    finally:
+        minimax_h3_publish_denoise_progress(None, None, None)
+        if reference_kv_state is not None:
+            positive.static_kwargs.pop("reference_kv_state", None)
+            reference_kv_state.close()
+    # Fork diagnostic: one sha256 per rank per request, so a renoise draw that
+    # diverges across tensor-parallel ranks is a file diff rather than a silent
+    # quality loss.
     _log_final_latent_sha256(video_rows)
     return video_rows, audio_rows
 

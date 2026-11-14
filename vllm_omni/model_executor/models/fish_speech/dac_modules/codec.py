@@ -320,8 +320,7 @@ class DAC(nn.Module):
             audio_lengths = torch.LongTensor([length + right_pad]).to(audio_data.device)
 
         z = self.encoder(audio_data)
-        vq_results = self.quantizer(z, n_quantizers, **kwargs)
-        indices = vq_results.codes
+        indices = self.quantizer.encode(z, n_quantizers, **kwargs)
         indices_lens = torch.ceil(audio_lengths / self.frame_length).long()
         return indices, indices_lens
 

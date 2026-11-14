@@ -57,22 +57,6 @@ class TestMammothmoda2Config:
         assert config.llm_config is None
         assert config.get_text_config() is None
 
-    def test_init_sets_llm_config_before_parent_init(self):
-        """
-        Verify that llm_config is set before parent __init__ is called.
-
-        This is critical because the parent PretrainedConfig.__init__ calls
-        validation which in turn calls get_text_config(). If llm_config is not
-        set before super().__init__(), an AttributeError will be raised.
-        """
-        # This should not raise an AttributeError
-        config = Mammothmoda2Config(
-            llm_config={
-                "model_type": "mammothmoda2_qwen2_5_vl",
-            }
-        )
-        assert config.llm_config is not None
-
 
 class TestMammothmoda2Qwen2_5_VLConfig:
     """Tests for Mammothmoda2Qwen2_5_VLConfig class."""

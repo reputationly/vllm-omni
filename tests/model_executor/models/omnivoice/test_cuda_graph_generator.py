@@ -22,6 +22,7 @@ import pytest
 import torch
 from vllm.utils.math_utils import round_up
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
     OmniVoiceGenerator,
     _OmniVoiceCUDAGraphForward,
@@ -30,7 +31,7 @@ from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 

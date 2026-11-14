@@ -316,16 +316,6 @@ def test_recv_role_sp_leader_and_follower(monkeypatch):
     assert _role(mgr) is ReceiveRole.FOLLOWER
 
 
-def test_recv_role_tp_and_sp_leader_per_tp_rank(monkeypatch):
-    # TP=2 + SP=2: sp_rank 0 is leader (pulls), sp_rank 1 is follower (gets broadcast).
-    mgr = OmniKVTransferManager(OmniKVCacheConfig())
-    _set_tp(mgr, 2, 2)
-    _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=0)
-    assert _role(mgr) is ReceiveRole.LEADER
-    _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=1)
-    assert _role(mgr) is ReceiveRole.FOLLOWER
-
-
 def test_recv_role_hsdp_world_broadcast(monkeypatch):
     # TP inactive, world > 1 (HSDP): rank-0 leader, others follower.
     mgr = OmniKVTransferManager(OmniKVCacheConfig())

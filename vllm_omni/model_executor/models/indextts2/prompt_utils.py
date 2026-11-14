@@ -55,15 +55,18 @@ def _count_indextts2_text_tokens_cached(
     lang: str,
     text_normalization: bool,
     tokenizer_file: str,
+    text_preprocessed: bool,
 ) -> int:
     """Cache-keyed worker. Takes every argument positionally on purpose.
 
     ``lru_cache`` keys on the literal call signature, so an omitted keyword and
     an explicitly-passed default are two different entries. Callers here do
     both — ``validate()`` omits the defaults while
-    ``estimate_indextts2_prefill_prompt_len`` passes all four — which would
-    make every lookup a miss. Funnelling through one fully-positional
-    signature is what actually makes the cache hit.
+    ``estimate_indextts2_prefill_prompt_len`` passes all four (plus
+    ``text_preprocessed``, which changes the normalized text and therefore the
+    count, so it is part of the key) — which would make every lookup a miss.
+    Funnelling through one fully-positional signature is what actually makes
+    the cache hit.
     """
     if model_type == "indextts2_5":
         text_ids, _ = prepare_indextts25_text(
@@ -72,6 +75,7 @@ def _count_indextts2_text_tokens_cached(
             model_dir=model_id_or_path,
             text_normalization=text_normalization,
             tokenizer_file=tokenizer_file,
+            text_preprocessed=text_preprocessed,
         )
         return sum(token_id not in _V25_TEXT_WRAPPER_TOKEN_IDS for token_id in text_ids) + _V25_TEXT_WRAPPER_TOKENS
     tokenizer = _get_text_tokenizer(model_id_or_path)
@@ -86,6 +90,7 @@ def count_indextts2_text_tokens(
     lang: str = "zh",
     text_normalization: bool = True,
     tokenizer_file: str = INDEXTTS25_TOKENIZER_FILE,
+    text_preprocessed: bool = False,
 ) -> int:
     """Return the text-token sequence length the talker feeds to the GPT.
 
@@ -108,6 +113,7 @@ def count_indextts2_text_tokens(
         lang,
         text_normalization,
         tokenizer_file,
+        text_preprocessed,
     )
 
 
@@ -144,6 +150,7 @@ def estimate_indextts2_prefill_prompt_len(
     lang: str = "zh",
     text_normalization: bool = True,
     tokenizer_file: str = INDEXTTS25_TOKENIZER_FILE,
+    text_preprocessed: bool = False,
 ) -> int:
     """Return the placeholder prompt length expected by the IndexTTS2 talker.
 
@@ -157,6 +164,7 @@ def estimate_indextts2_prefill_prompt_len(
         lang=lang,
         text_normalization=text_normalization,
         tokenizer_file=tokenizer_file,
+        text_preprocessed=text_preprocessed,
     )
     conditioning_prefix_tokens = (
         _V25_CONDITIONING_PREFIX_TOKENS if model_type == "indextts2_5" else _V2_CONDITIONING_PREFIX_TOKENS

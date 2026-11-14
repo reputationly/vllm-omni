@@ -59,29 +59,28 @@ def _pipeline() -> Any:
     return instance
 
 
-def test_normalize_h3_sampler_accepts_renoise():
-    from vllm_omni.diffusion.models.minimax_h3.sampling import normalize_h3_sampler
+def test_resolve_sampler_name_accepts_renoise():
+    from vllm_omni.diffusion.sampler import resolve_sampler_name
 
-    assert normalize_h3_sampler(None) == "euler"
-    assert normalize_h3_sampler("euler") == "euler"
-    assert normalize_h3_sampler("res_multistep") == "res_multistep"
-    assert normalize_h3_sampler("renoise") == "renoise"
-    with pytest.raises(ValueError, match="Unsupported MiniMax H3 sampler"):
-        normalize_h3_sampler("dpm")
+    assert resolve_sampler_name(None) == "euler"
+    assert resolve_sampler_name("euler") == "euler"
+    assert resolve_sampler_name("res_multistep") == "res_multistep"
+    assert resolve_sampler_name("renoise") == "renoise"
+    with pytest.raises(ValueError, match="Unsupported sampler"):
+        resolve_sampler_name("dpm")
 
 
-def test_renoise_solver_requires_a_generator():
-    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+def test_renoise_sampler_requires_a_generator():
+    from vllm_omni.diffusion.sampler import sampler_object
 
     with pytest.raises(ValueError, match="requires a dedicated torch.Generator"):
-        create_h3_sample_solver("renoise", _SIGMAS)
+        sampler_object("renoise")
 
 
 def test_renoise_final_step_returns_x0_without_drawing_noise(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+    from vllm_omni.diffusion.sampler import renoise_step
 
     generator = torch.Generator().manual_seed(43)
-    solver = create_h3_sample_solver("renoise", _SIGMAS, generator=generator)
     state = torch.randn(6, 96, generator=torch.Generator().manual_seed(1))
     x0 = torch.randn(6, 96, generator=torch.Generator().manual_seed(2)) * 0.1
 
@@ -93,12 +92,12 @@ def test_renoise_final_step_returns_x0_without_drawing_noise(monkeypatch):
         return real_randn(*args, **kwargs)
 
     monkeypatch.setattr(torch, "randn", counting_randn)
-    solver.step(state, x0, 0)
-    solver.step(state, x0, 1)
+    renoise_step(state, x0, sigma_next=_SIGMAS[1], generator=generator)
+    renoise_step(state, x0, sigma_next=_SIGMAS[2], generator=generator)
     assert len(draws) == 2
 
     generator_state = generator.get_state().clone()
-    out = solver.step(state, x0, 2)
+    out = renoise_step(state, x0, sigma_next=_SIGMAS[3], generator=generator)
 
     assert len(draws) == 2
     assert torch.equal(generator.get_state(), generator_state)
@@ -107,7 +106,7 @@ def test_renoise_final_step_returns_x0_without_drawing_noise(monkeypatch):
 
 
 def test_renoise_intermediate_step_matches_the_formula():
-    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+    from vllm_omni.diffusion.sampler import renoise_step
 
     seed = 7
     state = torch.randn(4, 96, generator=torch.Generator().manual_seed(1))
@@ -115,8 +114,7 @@ def test_renoise_intermediate_step_matches_the_formula():
     eps = torch.randn(state.shape, generator=torch.Generator().manual_seed(seed), dtype=torch.float32)
 
     generator = torch.Generator().manual_seed(seed)
-    solver = create_h3_sample_solver("renoise", _SIGMAS, generator=generator)
-    out = solver.step(state, x0, 0)
+    out = renoise_step(state, x0, sigma_next=_SIGMAS[1], generator=generator)
 
     sigma_next = _SIGMAS[1]
     expected = ((1.0 - sigma_next) * x0.float() + sigma_next * eps).to(state.dtype)
@@ -126,17 +124,17 @@ def test_renoise_intermediate_step_matches_the_formula():
 
 
 def test_renoise_same_seed_reproduces_the_update():
-    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+    from vllm_omni.diffusion.sampler import renoise_step
 
     state = torch.randn(4, 96, generator=torch.Generator().manual_seed(1))
     x0 = torch.randn(4, 96, generator=torch.Generator().manual_seed(2)) * 0.1
 
     def run(seed: int) -> list[torch.Tensor]:
-        solver = create_h3_sample_solver("renoise", _SIGMAS, generator=torch.Generator().manual_seed(seed))
+        generator = torch.Generator().manual_seed(seed)
         outs = []
         out = state
         for step in range(len(_SIGMAS) - 1):
-            out = solver.step(out, x0, step)
+            out = renoise_step(out, x0, sigma_next=_SIGMAS[step + 1], generator=generator)
             outs.append(out)
         return outs
 
@@ -150,9 +148,9 @@ def test_renoise_same_seed_reproduces_the_update():
     assert torch.equal(first[2], other[2])
 
 
-def test_renoise_video_steps_before_audio_on_one_generator():
-    """Both solvers share one generator, and the video draw comes first."""
-    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+def test_renoise_draws_video_before_audio_on_one_generator():
+    """One sampler object drives both streams, and the video draw comes first."""
+    from vllm_omni.diffusion.sampler import SamplingState, sample_renoise
 
     sigmas_video = [1.0, 0.9, 0.4, 0.0]
     sigmas_audio = [1.0, 0.8, 0.3, 0.0]
@@ -161,18 +159,22 @@ def test_renoise_video_steps_before_audio_on_one_generator():
     video_x0 = torch.randn(6, 96, generator=torch.Generator().manual_seed(3)) * 0.1
     audio_x0 = torch.randn(4, 32, generator=torch.Generator().manual_seed(4)) * 0.1
 
-    generator = torch.Generator().manual_seed(11)
-    video_solver = create_h3_sample_solver("renoise", sigmas_video, generator=generator)
-    audio_solver = create_h3_sample_solver("renoise", sigmas_audio, generator=generator)
+    state = SamplingState(latents=(video_state, audio_state), sigmas=(sigmas_video, sigmas_audio))
 
-    out_video = video_solver.step(video_state, video_x0, 0)
-    out_audio = audio_solver.step(audio_state, audio_x0, 0)
+    def model(evaluations):
+        # The x0 prediction is fixed, so the only thing under test is the update.
+        return [(video_x0, audio_x0) for _ in evaluations]
+
+    generator = torch.Generator().manual_seed(11)
+    sample_renoise(model, [state], num_steps=1, generator=generator)
 
     reference = torch.Generator().manual_seed(11)
     eps_video = torch.randn(video_state.shape, generator=reference, dtype=torch.float32)
     eps_audio = torch.randn(audio_state.shape, generator=reference, dtype=torch.float32)
-    torch.testing.assert_close(out_video, (1.0 - 0.9) * video_x0 + 0.9 * eps_video)
-    torch.testing.assert_close(out_audio, (1.0 - 0.8) * audio_x0 + 0.8 * eps_audio)
+    expected_video = ((1.0 - 0.9) * video_x0.float() + 0.9 * eps_video).to(video_state.dtype)
+    expected_audio = ((1.0 - 0.8) * audio_x0.float() + 0.8 * eps_audio).to(audio_state.dtype)
+    torch.testing.assert_close(state.latents[0], expected_video)
+    torch.testing.assert_close(state.latents[1], expected_audio)
 
 
 def test_release_metadata_reads_sampler_and_conditioning_numerics():

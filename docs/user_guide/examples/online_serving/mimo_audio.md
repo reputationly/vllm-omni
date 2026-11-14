@@ -25,6 +25,14 @@ vllm serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
 
 ### Send Multi-modal Request
 
+MiMo samples local speech codes with temperature `0.9` and top-p `0.95`, including
+when the text sampling temperature is `0`. Set the stage-0 `seed` in
+`sampling_params_list` for repeatable speech generation with the same serving
+configuration. A fixed seed does not guarantee identical audio across different
+batch shapes, hardware, or numerical precision.
+The template preserves explicit system messages and does not insert one for
+ordinary requests without a system message, matching the reference TTS prompt.
+
 Get into the example folder
 
 ```bash

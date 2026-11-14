@@ -6,7 +6,7 @@ Supports online (dynamic) NF4/FP4 weight-only quantization from BF16/FP16
 checkpoints on CUDA GPUs.
 """
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Module
@@ -123,7 +123,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
             # ``is_layer_skipped`` defaults to whole-prefix equality, which is
             # what offline checkpoints need: their ``modules_to_not_convert``

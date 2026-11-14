@@ -112,7 +112,10 @@ python openai_chat_client.py --prompt "A beautiful landscape painting" --output 
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 ```bash
 python gradio_demo.py
@@ -166,7 +169,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
 
 LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors

@@ -9,5 +9,5 @@ because "flow matching", "fm" and "cfm" were three names for one concept here:
 * cfm_dit       - the DiT used as the CFM velocity model
 * cfm_solver    - timestep schedules and the ODE/SDE integrator
 * cfm_head      - inference-only CFM wrapper preserving cfm.model.* names
-* cfm_cudagraph - batch-1 CUDA-graph executor for the sampling loop
+* cfm_cudagraph - fixed-batch CUDA-graph executor for the sampling loop
 """

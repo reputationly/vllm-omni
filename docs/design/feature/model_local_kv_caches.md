@@ -24,7 +24,7 @@ per-stage number predicted.
 
 The consumer therefore reports and does not subtract.
 
-## What the four models declare
+## What models declare
 
 | Model | Cache | Bounded by | Per row | Rows |
 | --- | --- | --- | --- | --- |
@@ -34,9 +34,13 @@ The consumer therefore reports and does not subtract.
 | MiMo-Audio graph pool | captured | same | 704 KiB | fixed 261 (bucket sum) |
 | MiniCPM-o Whisper encoder (streaming only) | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | fixed 1, per session |
 | ming_flash_omni talker | `StaticCache` | hardcoded `max_cache_len = 2048` | 24.00 MiB | fixed 1 |
+| LFM3-Omni temporal model (reference attention) | request-owned full and sliding KV tensors | `max_model_len` for full attention; `sliding_window - 1` for retained sliding KV | computed from checkpoint geometry | `max_num_seqs` |
 
-**No cache is bounded by `max_model_len`.** Each has its own mechanism: a
-sliding window, a decode-loop trip count, an encoder frame limit, a constant.
+Most caches have their own bound: a sliding window, a decode-loop trip count,
+an encoder frame limit, or a constant. LFM3-Omni's full-attention cache instead
+follows the scheduler's `max_model_len`. Its optional paged-attention path
+declares no model-local KV. Temporary concatenation buffers during reference
+attention are additional working memory, not retained request state.
 
 **ming's geometry does not exist in this repo.** `self._llm_config` is a
 `Qwen2Config` from the checkpoint, so layers, kv-heads, head-dim and dtype are

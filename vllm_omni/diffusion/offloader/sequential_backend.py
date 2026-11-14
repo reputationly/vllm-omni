@@ -14,7 +14,7 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
-from .module_residency import PinnedModuleStager
+from .module_residency import PinnedModuleStager, _move_module_to_packed_pinned_cpu
 from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
@@ -228,6 +228,13 @@ class SequentialOffloadHook(ModelHook):
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
+        # ROCm gets one packed pinned host buffer per module (upstream); the
+        # per-tensor CPU-home reuse below is the CUDA/generic path.
+        if pin_memory and target_device.type == "cpu" and current_omni_platform.is_rocm():
+            moved = _move_module_to_packed_pinned_cpu(module, non_blocking=non_blocking)
+            if moved is not None:
+                return moved
+
         to_cpu = target_device.type == "cpu"
         moved = False
         for owner in (*module.parameters(), *module.buffers()):

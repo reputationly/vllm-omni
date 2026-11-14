@@ -1061,13 +1061,16 @@ class RVQEARTTSModel(nn.Module):
             self.audio_prompt_encoder = AutoModel.from_config(ape_cfg)
 
         if self.config.get("use_audio_prompt_frozen_projection", False):
-            with fp32_precision():
-                U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
-                V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
-                smin, smax = 0.4, 2.5
-                s = smin + (smax - smin) * torch.rand(self.hidden_size)
-                W = U @ torch.diag(s) @ V.T
-                self.register_buffer("audio_prompt_projection_W", W)  # register as buffer to avoid weight update
+            # This vendored model is inference-only, and the checkpoint owns
+            # this frozen projection. A deterministic NaN sentinel avoids the
+            # CPU QR/LAPACK startup cost and lets the talker fail closed if a
+            # partial checkpoint load does not replace the complete buffer.
+            W = torch.full(
+                (self.hidden_size, self.hidden_size),
+                float("nan"),
+                dtype=torch.float32,
+            )
+            self.register_buffer("audio_prompt_projection_W", W)  # register as buffer to avoid weight update
 
         # Prediction Heads
         if not self.config.disable_eos_prediction:

@@ -12,7 +12,7 @@
 
 The `async_chunk` feature enables asynchronous, chunked processing of data across multiple stages in a multi-stage pipeline (e.g., Qwen3-Omni with Thinker → Talker → Code2Wav stages). Instead of waiting for a complete stage output before forwarding to the next stage, this feature allows stages to process and forward data in chunks as it becomes available, significantly reducing latency and improving throughput.
 
-**Chunk Size Definition**
+### Chunk Size Definition
 
 - **Prefill Phase**: `chunk_size = num_scheduled_tokens` for chunked prefill processing
 - **Decode Phase**: `chunk_size = num_scheduled_tokens = 1` for per-token streaming
@@ -39,17 +39,17 @@ With `async_chunk`:
 4. **Non-blocking Scheduler**: Requests waiting for chunks don't block the entire scheduler
 5. **Code2Wav Batch Inference**: Supports batched processing in code2wav stage
 
-| Input     | Output           | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E   | Mean TTFT  | Mean TPOT | Mean TTFP   | Mean RTF | Mean ITL |
-|-----------|------------------|---------------------|---------------------|----------------|---------|------------|------------|-----------|-------------|----------|----------|
-| text 100  | text 100+audio   | False               | 1                   | 1              | 50      | 6581.80    | 43.22      | 8.31      | 6459.34     | 0.24     | 8.22     |
-| text 100  | text 100+audio   | False               | 1                   | 4              | 50      | 7398.63    | 67.57      | 9.14      | 7285.35     | 0.27     | 9.05     |
-| text 100  | text 100+audio   | False               | 1                   | 10             | 50      | 13522.99   | 131.82     | 12.72     | 13410.44    | 0.49     | 12.60    |
-| text 100  | text 100+audio   | False               | 64                  | 1              | 50      | 6505.13    | 43.14      | 8.52      | 6395.40     | 0.24     | 8.44     |
-| text 100  | text 100+audio   | False               | 64                  | 4              | 50      | 7668.15    | 51.15      | 9.36      | 7562.37     | 0.28     | 9.27     |
-| text 100  | text 100+audio   | False               | 64                  | 10             | 50      | 9516.18    | 138.06     | 14.75     | 9409.26     | 0.34     | 14.60    |
-| text 100  | text 100+audio   | True                | 1                   | 1              | 50      | 6179.79    | 44.58      | 8.69      | 522.99      | 0.22     | 8.60     |
-| text 100  | text 100+audio   | True                | 1                   | 4              | 50      | 7692.69    | 103.96     | 10.22     | 785.85      | 0.29     | 10.12    |
-| text 100  | text 100+audio   | True                | 1                   | 10             | 50      | 11152.71   | 685.60     | 17.64     | 1628.88     | 0.41     | 17.62    |
+| Input | Output | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E | Mean TTFT | Mean TPOT | Mean TTFP | Mean RTF | Mean ITL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| text 100 | text 100+audio | False | 1 | 1 | 50 | 6581.80 | 43.22 | 8.31 | 6459.34 | 0.24 | 8.22 |
+| text 100 | text 100+audio | False | 1 | 4 | 50 | 7398.63 | 67.57 | 9.14 | 7285.35 | 0.27 | 9.05 |
+| text 100 | text 100+audio | False | 1 | 10 | 50 | 13522.99 | 131.82 | 12.72 | 13410.44 | 0.49 | 12.60 |
+| text 100 | text 100+audio | False | 64 | 1 | 50 | 6505.13 | 43.14 | 8.52 | 6395.40 | 0.24 | 8.44 |
+| text 100 | text 100+audio | False | 64 | 4 | 50 | 7668.15 | 51.15 | 9.36 | 7562.37 | 0.28 | 9.27 |
+| text 100 | text 100+audio | False | 64 | 10 | 50 | 9516.18 | 138.06 | 14.75 | 9409.26 | 0.34 | 14.60 |
+| text 100 | text 100+audio | True | 1 | 1 | 50 | 6179.79 | 44.58 | 8.69 | 522.99 | 0.22 | 8.60 |
+| text 100 | text 100+audio | True | 1 | 4 | 50 | 7692.69 | 103.96 | 10.22 | 785.85 | 0.29 | 10.12 |
+| text 100 | text 100+audio | True | 1 | 10 | 50 | 11152.71 | 685.60 | 17.64 | 1628.88 | 0.41 | 17.62 |
 
 Performance data collected on H800 GPUs through comprehensive benchmarking with cudagraph enabled. text input uses random dataset.
 
@@ -92,7 +92,7 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 **Diagram Legend:**
 
 | Step | Stage Type | Description |
-| ------ | ----------- | ------------ |
+| --- | --- | --- |
 | `prefill` | Initialization | Context processing, KV cache initialization |
 | `decode` | Autoregressive | Token-by-token generation in AR stages |
 | `codes` | Audio Encoding | RVQ codec codes from Talker stage |
@@ -131,7 +131,7 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 
 ### Execution Timeline
 
-```
+```text
 Timeline: Parallel vs Sequential
 
 Sequential (async_chunk=false):
@@ -182,7 +182,8 @@ In sequential mode, each stage must wait for the previous stage to complete enti
    - **OmniChunkTransferAdapter**: Chunk-specific implementation that owns the full chunk lifecycle when async_chunk is enabled
      - **Chunk ID and key construction**: Builds keys like `{req_id}_{stage_id}_{chunk_id}` for put/get
      - **Async get**: `load_async(request)` enqueues the request; background **recv_loop** polls the connector (non-blocking); when data is available, updates the request and marks it in `_finished_load_reqs`; scheduler calls `get_finished_requests()` to learn which requests have chunks ready
-     - **Async put**: `save_async(pooling_output, request)` invokes `custom_process_next_stage_input_func` in the main thread to build the payload, then enqueues a save task; background **save_loop** performs `connector.put()`; payload processing and chunk accumulation (e.g. code2wav chunk_size) remain in the main thread
+     - **Async put**: `save_async(pooling_output, request)` admits the request and enqueues a save task; background **save_loop** runs `custom_process_next_stage_input_func` to build the payload (chunk accumulation, e.g. code2wav chunk_size, lives in the processor's per-request state) and performs `connector.put()`
+     - **Batched put**: when the processor module also defines `<func>_batch(transfer_manager, pooling_outputs, requests, is_finished) -> list[payload | None]`, the batch form opts in with `per_step_batch = True`, and the stage needs no per-step token updates, `OmniARScheduler` hands a whole step's saves to `save_async_batch`: one queued task and one processor call per step, with payloads in request order. Requests are not snapshotted for it, so an opted-in batch form reads nothing of a request but its ids and takes finishing from the flags it is given; while it runs, every live request is marked in flight as around the single processor, so a cancel's sender cleanup defers to the save loop
 
 3. **Stage Input Processors**: Custom functions that process stage outputs into chunks for different models
    - Receive **transfer_manager** (OmniChunkTransferAdapter)
@@ -191,12 +192,19 @@ In sequential mode, each stage must wait for the previous stage to complete enti
 4. **Schedulers**: Modified to handle chunk-based scheduling with async IO-compute overlap
    - `OmniARScheduler`: For autoregressive stages
    - `OmniGenerationScheduler`: For generation stages
-   - Both schedulers use **OmniChunkTransferAdapter** and **before/after** hooks around `super().schedule()`:
+   - On the legacy receive path, both schedulers use **OmniChunkTransferAdapter** and **before/after** hooks around scheduling:
      - **Before** `super().schedule()`: `process_pending_chunks(waiting, running)` moves requests waiting for chunks to `WAITING_FOR_CHUNK`, enqueues load tasks for background polling
-     - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information, clears chunk-ready flags
+     - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information and clears chunk-ready flags. Generation stages declaring `supports_pending_generation` retain the ready input until their runner stops reporting it as pending. This capability also serializes executions of that input on the legacy path; ordinary stateless legacy stages retain their existing overlap.
    - **put_chunk** `save_async(pooler_output, request)`; **get_chunk** / **get_chunk_for_generation** `load_async(request)`
+   - On the native MRv2 receive path, `chunk_transfer_adapter` is `None`; **OmniSchedulingCoordinator** tracks input readiness from the runner's connector events instead. Its public `receives_chunks` property defines the receive predicate used by both chunk processing and generation scheduling, matching the legacy adapter's public contract. An async coordinator on stage zero is bookkeeping, not evidence of a downstream chunk receiver; sender-only stages and full-payload coordinators are not async-chunk receivers.
+   - **OmniGenerationScheduler atomic scheduling contract**: Connector-delivered async chunks are indivisible scheduling units on both the legacy adapter and native MRv2 coordinator receive paths. Atomicity follows the async-chunk receive contract, not the presence of a legacy adapter. The generation scheduler must either admit a ready chunk in its entirety or defer it intact with its codes and metadata unchanged. This applies to waiting and running requests, including when chunked prefill is enabled. It must never slice a chunk to fit the remaining step token budget, because consumers such as the Qwen3-TTS ICL first chunk validate received chunks against their declared metadata.
+   - Oversized rejection inspects only chunks already handed to the scheduler, using the adapter's `requests_with_ready_chunks` on the legacy path or the coordinator's set on the native path. A ready chunk larger than the full step budget (`max_num_scheduled_tokens`) can never be admitted in any step. Such a request is terminated through the standard cleanup path with `FINISHED_ERROR` and exactly one terminal ERROR engine output carrying the rejection reason. Placeholders and requests still waiting for a chunk must not be rejected based on their prompt length.
+   - Native requests retain the in-flight execution fence: a ready chunk must neither be admitted nor rejected as oversized while a previous execution still owns that request's state. Preserve readiness, deliver the previous execution's valid output first, and reject an oversized chunk on a later scheduling step after the fence clears. Budget deferral must likewise preserve readiness so the unchanged chunk remains eligible for a later step.
+   - Budget-based deferral stops scanning the current queue rather than skipping a ready chunk to pack smaller chunks behind it. This preserves queue order at that admission point, but can reduce step utilization under mixed chunk sizes; it does not guarantee priority for the deferred chunk in the next step.
+   - Non-chunk prompt inputs, including orchestrator-fed sender-only stages and full-payload inputs, retain their existing scheduling behavior rather than acquiring async-chunk atomicity.
 
 5. **Model Runners**: Handle chunk processing
+   - Stage zero has no upstream connector payload to receive. Its output drain must skip receive-side TP broadcasts: native MRv2 materializes output on the reply rank only, so other ranks cannot consume such broadcasts. Downstream async-chunk stages retain receive payload fanout.
    - `OmniGPUModelRunner`: Processes chunks in AR stages
    - `GPUGenerationModelRunner`: Processes chunks in generation stages
      - Uses `ubatch_slices` from `get_forward_context()` to track per-request sequence lengths in batched inference
@@ -230,12 +238,12 @@ As a result, the downstream request already exists when the first chunk lands. S
 
 A stage can also receive data derived from the original request together with its placeholder, and use its idle steps to prepare for chunk 0. MiniCPM-o's Code2Wav uses this to prepare the reference audio (see the MiniCPM-o recipe). The contract spans four layers:
 
-| Layer | Touchpoint | Behavior |
-| --- | --- | --- |
-| Pipeline config | `StagePipelineConfig.async_chunk_prewarm_payload_func` | Dotted path to `fn(prompt) -> dict[str, Tensor \| scalar] \| None`. It is resolved in `stage_init_utils` and exposed on the stage client. |
-| Orchestrator | `_attach_async_chunk_prewarm_payload` | Runs on the initial add only. It is skipped on a streaming re-prewarm and for session-owned or resumable requests. It calls the function with the original prompt and adds the result to the placeholder's `additional_information` under flat keys `f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`. If the function fails or returns nothing, the placeholder is submitted unchanged. |
-| Scheduler | `OmniSchedulerMixin._take_async_chunk_prewarm` | In `add_request`, it pops those keys off a new request, so they never reach the runner's per-request buffer. The payload is delivered once, as an `OmniRequestPrewarm` in `OmniSchedulerOutput.pending_request_prewarms`. Finish and abort drop payloads that were never delivered. |
-| Runner and model | `on_requests_added(prewarms)`, `run_idle_prefetch()` | Optional model hooks in the GPU and NPU generation runners. `on_requests_added` runs right after `on_requests_finished`. `run_idle_prefetch` runs only on a zero-token step that follows another zero-token step, and the runner ignores its return value. A hook exception is logged and never reaches the EngineCore. |
+| Layer            | Touchpoint                                             | Behavior                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pipeline config  | `StagePipelineConfig.async_chunk_prewarm_payload_func` | Dotted path to a function taking `prompt` and returning a flat dict of tensors/scalars or `None`. It is resolved in `stage_init_utils` and exposed on the stage client.                                                                                                                                                                                                     |
+| Orchestrator     | `_attach_async_chunk_prewarm_payload`                  | Runs on the initial add only. It is skipped on a streaming re-prewarm and for session-owned or resumable requests. It calls the function with the original prompt and adds the result to the placeholder's `additional_information` under flat keys `f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`. If the function fails or returns nothing, the placeholder is submitted unchanged. |
+| Scheduler        | `OmniSchedulerMixin._take_async_chunk_prewarm`         | In `add_request`, it pops those keys off a new request, so they never reach the runner's per-request buffer. The payload is delivered once, as an `OmniRequestPrewarm` in `OmniSchedulerOutput.pending_request_prewarms`. Finish and abort drop payloads that were never delivered.                                                                                         |
+| Runner and model | `on_requests_added(prewarms)`, `run_idle_prefetch()`   | Optional model hooks in the GPU and NPU generation runners. `on_requests_added` runs right after `on_requests_finished`. `run_idle_prefetch` runs only on a zero-token step that follows another zero-token step, and the runner ignores its return value. A hook exception is logged and never reaches the EngineCore.                                                     |
 
 Constraints for a new integration:
 
@@ -279,6 +287,28 @@ stages:
     input_connectors:
       from_stage_0: connector_of_shared_memory
 ```
+
+### Scheduling Under Load
+
+Connector `extra` keys tune when a chunked AR stage admits new requests:
+
+```yaml
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # AR stage: while >= 32 requests run, a new request waits until 6
+      # requests wait or the oldest has waited 100 ms.
+      ar_prefill_admission_min_batch: 6
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 32
+```
+
+- `ar_prefill_admission_min_batch` / `ar_prefill_admission_max_wait_ms` / `ar_prefill_admission_min_running`: arrivals share one prefill / mixed step instead of each turning a decode step into one. Off unless `ar_prefill_admission_min_batch` > 1, which requires a positive `ar_prefill_admission_max_wait_ms`; below `ar_prefill_admission_min_running` running requests, arrivals are admitted at once. The wait counts against time to first audio, so keep it well under the first chunk's latency (Fish Audio Drama 3 at 128 streams: RTF 0.578 -> 0.513 with the values above).
+
+Single-stage pipelines without a connector set the same three keys in the
+stage's `additional_config`. When both sources are present, connector `extra`
+overrides `additional_config` per key. The policy remains disabled by default.
 
 ### Code2Wav Batch Configuration
 

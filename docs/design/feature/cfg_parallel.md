@@ -56,6 +56,9 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
 - **Sequential mode** (when `cfg_world_size == 1`):
     - Single rank computes both positive and negative predictions
     - Directly combines them with CFG formula
+    - **CFG batching**: pipelines that set `supports_cfg_batching = True` compute both predictions in one
+    `predict_noise()` call on the branches concatenated along dim 0, then split the output at the positive batch
+    size (`enable_cfg_batching`, default off). See [Opt in to CFG batching](#opt-in-to-cfg-batching).
 
 `scheduler_step_maybe_with_cfg()` ensures consistent latent states across all ranks:
 
@@ -166,6 +169,32 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             current_model = self.transformer
         return current_model(**kwargs)[0]
 ```
+
+### Opt in to CFG batching
+
+With one CFG rank, a pipeline can run both branches as one batched denoiser call. Opt in only when both branches
+always have the same shapes beyond the batch dimension (prompts padded to a fixed length, shared latents) and the
+denoiser keeps no per-branch state:
+
+```python
+class MyPipeline(nn.Module, CFGParallelMixin):
+    supports_cfg_batching = True
+    # Optional: kwarg whose dim 0 is the branch batch size (default "hidden_states").
+    cfg_batching_batch_kwarg = "hidden_states"
+    # Optional: unbatched kwargs that are equal in both branches but built per branch,
+    # e.g. Flux's [L, 3] text and image position ids. The positive value is passed through.
+    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids"})
+```
+
+`merge_cfg_branch_kwargs()` concatenates every tensor whose dim 0 is the branch batch size, merges dicts, lists and
+tuples element by element, and passes through values that are the same object in both branches (or equal plain
+scalars). Anything else, such as different prompt lengths or `None` in one branch, makes that step run sequentially
+with a one-time warning. Declare every unbatched tensor in `cfg_batching_shared_kwargs`: the dim-0 check runs before
+the identity check, so an unbatched tensor whose length happens to equal the branch batch size (one image token at
+batch 1, for example) would otherwise be concatenated. Override `merge_cfg_branch_kwargs()` for custom merging. Batching is skipped with
+CFG-Parallel, pipeline parallelism and any `cache_backend`; the merged call is not stamped with
+`transformer.cfg_branch`. Parity is tested in `tests/diffusion/models/test_cfg_batching_parity.py`; add the pipeline
+there when opting in.
 
 ### Override `cfg_normalize_function()` for Custom Normalization
 

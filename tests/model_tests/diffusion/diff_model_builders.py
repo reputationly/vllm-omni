@@ -53,6 +53,18 @@ def tiny_ltx2_builder() -> str:
     return build_tiny_from_configs("LTX2Pipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline")
 
 
+def tiny_ltx2_audio_builder() -> str:
+    """Build the shared tiny LTX checkpoint used by the audio-only runtime."""
+    model_dir = build_tiny_from_configs(
+        "LTX2TextToAudioPipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline"
+    )
+    index_path = Path(model_dir) / "model_index.json"
+    index = json.loads(index_path.read_text())
+    index["_class_name"] = "LTX2TextToAudioPipeline"
+    index_path.write_text(json.dumps(index, indent=2))
+    return model_dir
+
+
 def _build_tiny_sana_video(pipeline_name: str) -> str:
     """Build a tiny 480p SANA-Video model without downloading model weights.
 
@@ -277,6 +289,20 @@ def tiny_sd3_builder() -> str:
             "text_encoder_2": _shrink_flux_clip_text_encoder,
             "text_encoder_3": _shrink_flux_t5_text_encoder,
             "transformer": _shrink_sd3_transformer,
+        },
+    )
+
+
+def tiny_sdxl_builder() -> str:
+    # The UNet's architecture (block_out_channels, transformer_layers_per_block, etc.)
+    # is hardcoded in SDXLUNet2DConditionModel rather than read from config, so it
+    # can't be shrunk here; only the two CLIP text encoders are reduced.
+    return build_tiny_from_configs(
+        "StableDiffusionXLPipeline",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        transform={
+            "text_encoder": _shrink_flux_clip_text_encoder,
+            "text_encoder_2": _shrink_flux_clip_text_encoder,
         },
     )
 

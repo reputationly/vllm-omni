@@ -79,7 +79,7 @@ def _upstream_sparse_moe_reference(block, hidden_states, padding_mask=None):
     return output, top_indices, top_scores
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_grouped_mm_matches_per_expert_reference() -> None:
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
@@ -112,7 +112,7 @@ def test_grouped_mm_matches_per_expert_reference() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_sparse_moe_block_matches_upstream_reference() -> None:
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 

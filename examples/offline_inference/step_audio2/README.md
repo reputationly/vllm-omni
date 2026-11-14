@@ -14,6 +14,12 @@ Step-Audio2 is a two-stage audio model:
     - Input: Audio tokens + Speaker prompt wav
     - Output: Synthesized audio waveform (24kHz)
 
+Long audio inputs are automatically split into chunks of up to 25 seconds before encoding,
+following the [official implementation](https://github.com/stepfun-ai/Step-Audio2/issues/65#issuecomment-3349733269).
+Pass the full audio as a single input item; no caller-side splitting is needed.
+Each audio item is limited to 60 seconds, based on the upstream guidance about quality
+beyond one minute. Longer inputs raise `ValueError` instead of being truncated.
+
 ## Hardware Requirements
 
 | Mode | GPU Configuration | VRAM Required |
@@ -129,7 +135,7 @@ python end2end.py --query-type audio_to_text --model ./models/Step-Audio-2-mini
 
 Ensure the model directory contains:
 
-```
+```text
 Step-Audio-2-mini/
 ├── config.json
 ├── model.safetensors (or pytorch_model.bin)
@@ -312,7 +318,7 @@ pip install vllm-omni
 
 The script generates files in the output directory (default: `output_step_audio2/`):
 
-```
+```text
 output_step_audio2/
 ├── 00000_text.txt        # Text output from Thinker stage
 ├── 00000_output.wav      # Audio output from Token2Wav stage (24kHz)

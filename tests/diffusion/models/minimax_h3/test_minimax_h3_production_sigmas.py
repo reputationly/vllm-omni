@@ -54,7 +54,7 @@ def _find_key(node: Any, key: str) -> Any:
 def test_production_h3_sigma_schedules_are_accepted_by_the_solver(
     config_name: str, num_steps: int, video_shift: float, audio_shift: float
 ) -> None:
-    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+    from vllm_omni.diffusion.sampler import sampler_object
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
     repo_root = Path(__file__).resolve().parents[4]
@@ -77,9 +77,9 @@ def test_production_h3_sigma_schedules_are_accepted_by_the_solver(
         assert all(0.0 <= s <= 1.0 for s in sigmas), f"{label}: sigmas must lie in [0, 1], got {sigmas}"
         assert all(a > b for a, b in zip(sigmas, sigmas[1:])), f"{label}: sigmas must strictly decrease, got {sigmas}"
 
-        # The regression this file exists for: constructing the solver must not raise.
-        solver = create_h3_sample_solver("euler", sigmas)
-        assert solver is not None
+        # The regression this file exists for: building the sampler must not raise.
+        sampler = sampler_object("euler")
+        assert sampler is not None
 
 
 def test_production_sigma_schedules_differ_between_video_and_audio() -> None:

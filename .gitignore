@@ -243,15 +243,19 @@ datasets/
 *.csv
 *.json
 !vllm_omni/diffusion/layers/mot/configs/*.json
+!vllm_omni/diffusion/models/hy_nomas/camera_trajectories.json
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !tests/assets/soulxsinger/*.json
 !tests/diffusion/models/minimax_h3/fixtures/*.json
-!recipes/cosmos3/negative_prompt.json
+!apps/ComfyUI-ABC-Preview/example_workflows/*.json
+!vllm_omni/model_executor/models/ming_flash_omni/talker_tn/talker_re.json
 # Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
 !tests/e2e/accuracy/omni_duplex_eval/*.json
+!tests/e2e/accuracy/sensenova_u1_reference.json
+!tests/e2e/accuracy/qwen_image_21/thresholds.json
 *.jsonl
 # Shared Hunyuan IT2I input for accuracy tests and vllm bench.
 !tests/assets/hunyuan_image3/it2i.jsonl
@@ -289,6 +293,10 @@ vllm_omni/_version.py
 # looks fine locally, while a clean checkout builds an image where warmup logs
 # one warning and no-ops, leaving the 96s first-request penalty in place.
 !vllm_omni/**/assets/*.wav
+# Bundled Ming IP voice catalog.
+!vllm_omni/model_executor/models/ming_flash_omni/data/
+vllm_omni/model_executor/models/ming_flash_omni/data/*
+!vllm_omni/model_executor/models/ming_flash_omni/data/ip_voices.json
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/

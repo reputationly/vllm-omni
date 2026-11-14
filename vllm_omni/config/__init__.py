@@ -13,6 +13,7 @@ from vllm_omni.config.omni_config import (
     OmniStageConnectorConfig,
     OmniStageDiffusionParallelConfig,
     OmniStageLoadConfig,
+    OmniStageLoRAConfig,
     OmniStageModelConfig,
     OmniStageParallelConfig,
     OmniStageRuntimeConfig,
@@ -36,6 +37,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.config.yaml_util import (
     create_config,
     load_yaml_config,
@@ -72,6 +74,7 @@ __all__ = [
     "OmniStageConnectorConfig",
     "OmniStageDiffusionParallelConfig",
     "OmniStageLoadConfig",
+    "OmniStageLoRAConfig",
     "OmniStageModelConfig",
     "VllmOmniOrchestratorConfig",
     "OmniStageParallelConfig",
@@ -85,6 +88,7 @@ __all__ = [
     "StageConfigFactory",
     "StageDeployConfig",
     "StageType",
+    "WatermarkConfig",
     "StageExecutionType",
     "StagePipelineConfig",
     "load_deploy_config",

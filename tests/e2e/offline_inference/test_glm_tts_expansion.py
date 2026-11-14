@@ -81,7 +81,7 @@ def _get_deploy_config(*, async_chunk: bool) -> str:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
 def test_offline_voice_clone_zh(async_chunk: bool) -> None:
     """

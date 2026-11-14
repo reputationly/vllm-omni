@@ -36,6 +36,9 @@ FISH_SPEECH_PIPELINE = PipelineConfig(
                 # <|im_end|> — stop when the model emits end-of-turn.
                 "stop_token_ids": [151645],
             },
+            # talker_mtp adds the sampled codebook embeddings to this step's
+            # inputs_embeds; a replay pads the unbuilt rows (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

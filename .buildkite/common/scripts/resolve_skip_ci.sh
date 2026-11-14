@@ -7,6 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_CI_PY="${SCRIPT_DIR}/skip_ci.py"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/release_line_branch.sh"
 
 # Resolve git diff once. Exit 0 when this bootstrap should stop uploading.
 # Decision details are logged by skip_ci.py; this helper only annotates skip-all.

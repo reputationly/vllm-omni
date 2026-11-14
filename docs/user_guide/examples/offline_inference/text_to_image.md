@@ -101,7 +101,7 @@ python text_to_image.py \
 | `--use-norm` | flag | off | Apply layer normalization to sampled tokens |
 
 > If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
-
+>
 > Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
 
 ## More CLI Examples
@@ -241,7 +241,7 @@ python text_to_image.py \
 
 LoRA adapters must be in PEFT format. A typical adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
@@ -256,7 +256,10 @@ lora_adapter/
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 Launch the Gradio demo:
 

@@ -61,9 +61,7 @@ def get_audio_to_text_query(
     if question is None:
         question = "请记录下你所听到的语音内容。"
 
-    prompt = (
-        f"<|im_start|>system\n{question}<|im_end|>\n<|im_start|>user\n<audio_patch><|im_end|>\n<|im_start|>assistant\n"
-    )
+    prompt = f"<|BOT|>system\n{question}<|EOT|><|BOT|>human\n<audio_patch><|EOT|><|BOT|>assistant\n"
 
     # Load audio
     if audio_path:
@@ -488,12 +486,6 @@ def parse_args():
         type=int,
         default=300,
         help="Initialization timeout in seconds (default: 300)",
-    )
-    parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Shared memory threshold in bytes (default: 65536)",
     )
     parser.add_argument(
         "--worker-backend",

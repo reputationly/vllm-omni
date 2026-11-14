@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.entrypoints.openai_api.conftest_video import (
+from tests.entrypoints.openai_api.helpers import (
     make_gradient_jpeg,
     make_jpeg,
 )
