@@ -114,6 +114,12 @@ MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO = "auto"
 # through at 2048 px short edge each -- get trimmed instead of taking ~5x the time.
 # Deployments that need full reference fidelity can set the key to 0 to disable it.
 MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER = ((8, 8_388_608), (12, 8_388_608), (16, 6_291_456))
+# Ceiling for the single OOM retry. Measured: with 16 references a 33.5 Mpx budget peaks at
+# ~38.5 GiB per card, i.e. 98% of the 39.49 GiB a 40 GiB card reports, and the first request
+# after an OOM carries an extra ~1 GiB of allocator fragments -- so halving a very large
+# budget can still land above the line. 16.8 Mpx peaks at ~36.5 GiB with 16 references, which
+# leaves room for that fragmentation.
+MINIMAX_H3_IMAGE_OOM_RETRY_MAX_PIXELS = 16_777_216
 _TEXT_SEGMENT_MAX_TOKENS = 4096
 _TEXT_TAG = 1
 _VISUAL_TAG = 0
@@ -864,17 +870,17 @@ class MiniMaxH3ImagePipeline(
             # card. A second OOM is a genuine 500: the caller should send fewer or
             # smaller references. The seed draws are reproduced identically because the
             # generator is re-created inside ``_generate`` from ``parsed["seed"]``.
-            halved = reference_budget // 2
-            if reference_budget <= 0 or halved <= 0:
+            retry_budget = min(reference_budget // 2, MINIMAX_H3_IMAGE_OOM_RETRY_MAX_PIXELS)
+            if reference_budget <= 0 or retry_budget <= 0:
                 raise
             logger.warning(
                 "MiniMax-H3-Image: CUDA OOM with reference budget %d px; retrying once at %d px",
                 reference_budget,
-                halved,
+                retry_budget,
             )
             if current_omni_platform.is_cuda_alike():
                 torch.cuda.empty_cache()
-            return self._generate(parsed, halved)
+            return self._generate(parsed, retry_budget)
 
     def _generate(self, parsed: dict[str, Any], reference_budget: int) -> DiffusionOutput:
         canvas_w, canvas_h = parsed["canvas"]
