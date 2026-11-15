@@ -107,7 +107,13 @@ MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY = "reference_image_total_pixels"
 # 13-16 to 6 Mpx -- the settings that keep 10/14/16 large references inside a 40 GiB
 # card while staying ~2x faster than an unscaled 14-reference request.
 MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO = "auto"
-MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER = ((8, 0), (12, 8_388_608), (16, 6_291_456))
+# The first rung is 8.4 Mpx rather than "off": 8 references at the release's minimum
+# short edge are exactly 8 x 1024 x 1024 = 8_388_608 px, so a normal 8-reference request
+# is still left untouched (``total <= budget`` short-circuits), while 8 oversized
+# references -- e.g. eight 4K stills, which the per-consumer short-edge bands alone let
+# through at 2048 px short edge each -- get trimmed instead of taking ~5x the time.
+# Deployments that need full reference fidelity can set the key to 0 to disable it.
+MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER = ((8, 8_388_608), (12, 8_388_608), (16, 6_291_456))
 _TEXT_SEGMENT_MAX_TOKENS = 4096
 _TEXT_TAG = 1
 _VISUAL_TAG = 0
