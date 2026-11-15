@@ -1275,7 +1275,11 @@ class OmniServeCommand(CLISubcommand):
         # Diffusion model mixed precision
         omni_config_group.add_argument(
             "--max-generated-image-size",
-            default=7680 * 4320,  # 8K resolution
+            # MiniMax-H3-Image's released working range is about 4-20 MP (best around
+            # 16 MP, e.g. 4096x4096 .. 6272x2688), so 20 MP is the ceiling that keeps
+            # requests inside the range the checkpoint was calibrated on while still
+            # allowing every official 16 MP aspect ratio.
+            default=20_000_000,
             type=int,
             help="Maximum generated image size in pixels (height * width).",
         )

@@ -107,13 +107,25 @@ MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY = "reference_image_total_pixels"
 # 13-16 to 6 Mpx -- the settings that keep 10/14/16 large references inside a 40 GiB
 # card while staying ~2x faster than an unscaled 14-reference request.
 MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO = "auto"
-# The first rung is 8.4 Mpx rather than "off": 8 references at the release's minimum
-# short edge are exactly 8 x 1024 x 1024 = 8_388_608 px, so a normal 8-reference request
-# is still left untouched (``total <= budget`` short-circuits), while 8 oversized
-# references -- e.g. eight 4K stills, which the per-consumer short-edge bands alone let
-# through at 2048 px short edge each -- get trimmed instead of taking ~5x the time.
-# Deployments that need full reference fidelity can set the key to 0 to disable it.
-MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER = ((8, 8_388_608), (12, 8_388_608), (16, 6_291_456))
+# ``reference_image_total_pixels_cap`` is the ceiling an ``"auto"`` deployment uses. 8
+# references at the release's per-consumer short edges are 8 x 1024 x 1024 = 8.4 Mpx, so a
+# normal 8-reference request stays untouched (``total <= budget`` short-circuits); eight 4K
+# stills reach 8 x 2048 x 2048 = 33.5 Mpx (151 s, 38.5 GiB/card, measured) and sit exactly
+# at this default.
+MINIMAX_H3_IMAGE_REFERENCE_BUDGET_CAP_KEY = "reference_image_total_pixels_cap"
+MINIMAX_H3_IMAGE_REFERENCE_BUDGET_CAP_DEFAULT = 33_554_432
+# Measured peak model for one card (4x A100-40G, TP4 + TE TP4, 2048x2048 output):
+#   peak ~= resident weights + 0.19 GiB per Mpx of reference + 0.8 GiB when >8 references
+#            + 0.2 GiB at a ~16 MP canvas
+# Fitted against 8.4/16.8/25/33.5 Mpx at 8 and 16 references and 2K/3K/4K/8K canvases
+# (32.8 / 34.6 / 36.8 / 37.6 / 38.5 / 38.6 GiB). The guard spends it before the request
+# runs, so an oversized request is degraded once instead of failing with OOM.
+MINIMAX_H3_IMAGE_REFERENCE_GIB_PER_MPX = 0.19
+MINIMAX_H3_IMAGE_MANY_REFERENCE_PENALTY_GIB = 0.8
+MINIMAX_H3_IMAGE_MANY_REFERENCE_COUNT = 8
+MINIMAX_H3_IMAGE_LARGE_CANVAS_PENALTY_GIB = 0.2
+MINIMAX_H3_IMAGE_LARGE_CANVAS_MPX = 16.0
+MINIMAX_H3_IMAGE_MEMORY_SAFETY_GIB = 2.0
 # Ceiling for the single OOM retry. Measured: with 16 references a 33.5 Mpx budget peaks at
 # ~38.5 GiB per card, i.e. 98% of the 39.49 GiB a 40 GiB card reports, and the first request
 # after an OOM carries an extra ~1 GiB of allocator fragments -- so halving a very large
@@ -166,14 +178,7 @@ def minimax_h3_image_reference_size(
     return _nearest_grid_multiple(width * scale), _nearest_grid_multiple(height * scale)
 
 
-def _reference_budget_ladder(count: int) -> int:
-    """Budget implied by the auto ladder for a request carrying ``count`` references."""
-    if count <= 0:
-        return 0
-    for limit, budget in MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER:
-        if count <= limit:
-            return budget
-    return MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER[-1][1]
+
 
 
 def _bound_references(
@@ -468,6 +473,16 @@ class MiniMaxH3ImagePipeline(
         # VAE tiles are spread over every DiT rank; each tile keeps its
         # single-rank kernels, so outputs do not depend on the rank count.
         raw_reference_budget = (od_config.additional_config or {}).get(MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY)
+        raw_reference_cap = (od_config.additional_config or {}).get(MINIMAX_H3_IMAGE_REFERENCE_BUDGET_CAP_KEY)
+        if raw_reference_cap is None:
+            self._reference_budget_cap = MINIMAX_H3_IMAGE_REFERENCE_BUDGET_CAP_DEFAULT
+        elif isinstance(raw_reference_cap, bool) or not isinstance(raw_reference_cap, int) or raw_reference_cap < 0:
+            raise ValueError(
+                f"{MINIMAX_H3_IMAGE_REFERENCE_BUDGET_CAP_KEY} must be a non-negative integer, "
+                f"got {raw_reference_cap!r}"
+            )
+        else:
+            self._reference_budget_cap = int(raw_reference_cap)
         self._reference_budget_auto = raw_reference_budget == MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO
         if self._reference_budget_auto or raw_reference_budget is None:
             self._reference_total_pixels = 0
@@ -533,6 +548,64 @@ class MiniMaxH3ImagePipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
         )
+        # The reference-budget guard needs the resident bytes of this rank (the chunks that
+        # never get freed) and the device's total memory; both are read once here.
+        self._resident_bytes = self._count_resident_bytes()
+        self._device_total_bytes = self._read_device_total_bytes()
+
+    def _count_resident_bytes(self) -> int:
+        """Bytes of DiT + text-encoder weights held by this rank."""
+        total = 0
+        for module in (getattr(self, "transformer", None), getattr(self, "text_encoder", None)):
+            if module is None:
+                continue
+            for tensor in module.parameters():
+                total += tensor.numel() * tensor.element_size()
+            for tensor in module.buffers():
+                total += tensor.numel() * tensor.element_size()
+        return total
+
+    def _read_device_total_bytes(self) -> int:
+        if not current_omni_platform.is_cuda_alike():
+            return 0
+        try:
+            return int(torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory)
+        except Exception:  # pragma: no cover - best effort only
+            return 0
+
+    def _fit_reference_budget(self, budget: int, count: int, canvas_mpx: float) -> int:
+        """Lower ``budget`` so the predicted peak stays inside the device allowance.
+
+        Pure arithmetic on integers (microseconds), so it costs nothing per request and
+        removes the need to discover the ceiling by failing a request first. It only ever
+        lowers the configured budget; a deployment that explicitly disabled the budget
+        (0) is left alone.
+        """
+        if budget <= 0 or self._device_total_bytes <= 0:
+            return budget
+        gib = 1024**3
+        allowance = self._device_total_bytes - MINIMAX_H3_IMAGE_MEMORY_SAFETY_GIB * gib
+        headroom = allowance - self._resident_bytes
+        if count > MINIMAX_H3_IMAGE_MANY_REFERENCE_COUNT:
+            headroom -= MINIMAX_H3_IMAGE_MANY_REFERENCE_PENALTY_GIB * gib
+        if canvas_mpx >= MINIMAX_H3_IMAGE_LARGE_CANVAS_MPX:
+            headroom -= MINIMAX_H3_IMAGE_LARGE_CANVAS_PENALTY_GIB * gib
+        if headroom <= 0:
+            return budget
+        affordable = int(headroom / (MINIMAX_H3_IMAGE_REFERENCE_GIB_PER_MPX * gib) * 1e6)
+        if affordable <= 0 or budget <= affordable:
+            return budget
+        logger.info(
+            "MiniMax-H3-Image: reference budget %d px exceeds the device allowance "
+            "(resident %.1f GiB, allowance %.1f GiB, %d references, %.1f Mpx canvas); using %d px",
+            budget,
+            self._resident_bytes / gib,
+            allowance / gib,
+            count,
+            canvas_mpx,
+            affordable,
+        )
+        return affordable
 
     def setup_compile(self) -> None:
         """Keep the DiT eager; CUDA graphs still replay the VAE tile decode.
@@ -857,10 +930,12 @@ class MiniMaxH3ImagePipeline(
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         check_request_cancellation()
         parsed = self._parse_request(request)
+        canvas_w, canvas_h = parsed["canvas"]
         reference_budget = (
-            _reference_budget_ladder(len(parsed["references"]))
-            if self._reference_budget_auto
-            else self._reference_total_pixels
+            self._reference_budget_cap if self._reference_budget_auto else self._reference_total_pixels
+        )
+        reference_budget = self._fit_reference_budget(
+            reference_budget, len(parsed["references"]), canvas_w * canvas_h / 1e6
         )
         try:
             return self._generate(parsed, reference_budget)
