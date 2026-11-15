@@ -120,6 +120,12 @@ MINIMAX_H3_IMAGE_REFERENCE_BUDGET_CAP_DEFAULT = 33_554_432
 # Fitted against 8.4/16.8/25/33.5 Mpx at 8 and 16 references and 2K/3K/4K/8K canvases
 # (32.8 / 34.6 / 36.8 / 37.6 / 38.5 / 38.6 GiB). The guard spends it before the request
 # runs, so an oversized request is degraded once instead of failing with OOM.
+# Fixed activation/workspace floor on top of the resident weights: measured peak at the
+# cheapest reference set (8 references, 8.4 Mpx, 2048x2048) is 32.8 GiB while the resident
+# weights are 28.3 GiB, i.e. 4.5 GiB, of which 1.6 GiB is the reference term below -- the
+# remaining 2.9 GiB is the floor. Folding it in makes the model match every measured point
+# (32.8 / 34.6 / 36.8 / 37.6 GiB at 8.4 / 16.8 / 25 / 33.5 Mpx).
+MINIMAX_H3_IMAGE_ACTIVATION_FLOOR_GIB = 2.9
 MINIMAX_H3_IMAGE_REFERENCE_GIB_PER_MPX = 0.19
 MINIMAX_H3_IMAGE_MANY_REFERENCE_PENALTY_GIB = 0.8
 MINIMAX_H3_IMAGE_MANY_REFERENCE_COUNT = 8
@@ -552,6 +558,14 @@ class MiniMaxH3ImagePipeline(
         # never get freed) and the device's total memory; both are read once here.
         self._resident_bytes = self._count_resident_bytes()
         self._device_total_bytes = self._read_device_total_bytes()
+        logger.info(
+            "MiniMax-H3-Image: reference-budget guard sees %.1f GiB resident, %.1f GiB device, "
+            "auto=%s cap=%d px",
+            self._resident_bytes / 1024**3,
+            self._device_total_bytes / 1024**3,
+            self._reference_budget_auto,
+            self._reference_budget_cap,
+        )
 
     def _count_resident_bytes(self) -> int:
         """Bytes of DiT + text-encoder weights held by this rank."""
@@ -585,7 +599,7 @@ class MiniMaxH3ImagePipeline(
             return budget
         gib = 1024**3
         allowance = self._device_total_bytes - MINIMAX_H3_IMAGE_MEMORY_SAFETY_GIB * gib
-        headroom = allowance - self._resident_bytes
+        headroom = allowance - self._resident_bytes - MINIMAX_H3_IMAGE_ACTIVATION_FLOOR_GIB * gib
         if count > MINIMAX_H3_IMAGE_MANY_REFERENCE_COUNT:
             headroom -= MINIMAX_H3_IMAGE_MANY_REFERENCE_PENALTY_GIB * gib
         if canvas_mpx >= MINIMAX_H3_IMAGE_LARGE_CANVAS_MPX:
