@@ -101,6 +101,13 @@ MINIMAX_H3_IMAGE_VAE_SHORT_EDGE = (1024, 2048)
 # shrunk by one shared factor so their relative sizes survive; 0/unset keeps the
 # released per-consumer short-edge bands, which is what the release was tuned on.
 MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY = "reference_image_total_pixels"
+# ``"auto"`` picks the budget from the request's reference count instead of one fixed
+# number: up to 8 references keep the released per-consumer bands untouched (measured
+# pixel-identical to running without a budget), 9-12 shrink the set to 8.4 Mpx and
+# 13-16 to 6 Mpx -- the settings that keep 10/14/16 large references inside a 40 GiB
+# card while staying ~2x faster than an unscaled 14-reference request.
+MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO = "auto"
+MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER = ((8, 0), (12, 8_388_608), (16, 6_291_456))
 _TEXT_SEGMENT_MAX_TOKENS = 4096
 _TEXT_TAG = 1
 _VISUAL_TAG = 0
@@ -145,6 +152,16 @@ def minimax_h3_image_reference_size(
     bound = min_short_edge if short_edge < min_short_edge else max_short_edge
     scale = bound / short_edge
     return _nearest_grid_multiple(width * scale), _nearest_grid_multiple(height * scale)
+
+
+def _reference_budget_ladder(count: int) -> int:
+    """Budget implied by the auto ladder for a request carrying ``count`` references."""
+    if count <= 0:
+        return 0
+    for limit, budget in MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER:
+        if count <= limit:
+            return budget
+    return MINIMAX_H3_IMAGE_REFERENCE_BUDGET_LADDER[-1][1]
 
 
 def _bound_references(
@@ -439,16 +456,16 @@ class MiniMaxH3ImagePipeline(
         # VAE tiles are spread over every DiT rank; each tile keeps its
         # single-rank kernels, so outputs do not depend on the rank count.
         raw_reference_budget = (od_config.additional_config or {}).get(MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY)
-        if raw_reference_budget is not None and (
-            isinstance(raw_reference_budget, bool)
-            or not isinstance(raw_reference_budget, int)
-            or raw_reference_budget < 0
-        ):
+        self._reference_budget_auto = raw_reference_budget == MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO
+        if self._reference_budget_auto or raw_reference_budget is None:
+            self._reference_total_pixels = 0
+        elif isinstance(raw_reference_budget, bool) or not isinstance(raw_reference_budget, int) or raw_reference_budget < 0:
             raise ValueError(
-                f"{MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY} must be a non-negative integer, "
-                f"got {raw_reference_budget!r}"
+                f"{MINIMAX_H3_IMAGE_REFERENCE_TOTAL_PIXELS_KEY} must be a non-negative integer or "
+                f"{MINIMAX_H3_IMAGE_REFERENCE_BUDGET_AUTO!r}, got {raw_reference_budget!r}"
             )
-        self._reference_total_pixels = int(raw_reference_budget or 0)
+        else:
+            self._reference_total_pixels = int(raw_reference_budget)
         tile_parallel = (od_config.additional_config or {}).get("vae_tile_parallel", True)
         if type(tile_parallel) is not bool:
             raise ValueError(f"vae_tile_parallel must be a bool, got {tile_parallel!r}")
@@ -675,12 +692,14 @@ class MiniMaxH3ImagePipeline(
         )
         return minimax_h3_patchify_video_latent(noise.cpu(), patch_size=list(_PATCH))
 
-    def _encode_text(self, prompt: str, references: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_text(
+        self, prompt: str, references: list[Image.Image], budget: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Layer-50 Qwen states of the positive presentation, on every DiT rank."""
         vision: dict[str, torch.Tensor] = {}
         counts: list[int] = []
         if references:
-            images = _bound_references(references, MINIMAX_H3_IMAGE_QWEN_SHORT_EDGE, self._reference_total_pixels)
+            images = _bound_references(references, MINIMAX_H3_IMAGE_QWEN_SHORT_EDGE, budget)
             processed = self.processor.image_processor(images=images, return_tensors="pt")
             vision = {key: processed[key] for key in ("pixel_values", "image_grid_thw")}
             merge = int(self.processor.image_processor.merge_size) ** 2
@@ -834,7 +853,10 @@ class MiniMaxH3ImagePipeline(
         # Draw 1: target noise; draw 2: per-reference anchor noise; draw 3 (in
         # the VAE encode): per-reference posterior samples.
         target_noise = self._noise_rows(generator, latent_h, latent_w)
-        vae_refs = _bound_references(references, MINIMAX_H3_IMAGE_VAE_SHORT_EDGE, self._reference_total_pixels)
+        reference_budget = (
+            _reference_budget_ladder(len(references)) if self._reference_budget_auto else self._reference_total_pixels
+        )
+        vae_refs = _bound_references(references, MINIMAX_H3_IMAGE_VAE_SHORT_EDGE, reference_budget)
         grids = [minimax_h3_image_reference_grid(*image.size) for image in vae_refs]
         anchor_noise = [self._noise_rows(generator, h, w) for h, w in grids]
         clean_rows = self._encode_references(vae_refs, grids, generator)
@@ -846,7 +868,7 @@ class MiniMaxH3ImagePipeline(
         )
 
         check_request_cancellation()
-        hidden, text_tags = self._encode_text(parsed["prompt"], references)
+        hidden, text_tags = self._encode_text(parsed["prompt"], references, reference_budget)
         # DLO keeps resident DiT layers on the host outside the denoise loop.
         with self._resident_dit_layers_on_device():
             target = self._denoise(
