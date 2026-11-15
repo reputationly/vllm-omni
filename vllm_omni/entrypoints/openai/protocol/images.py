@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
@@ -79,12 +79,36 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Image dimensions in WIDTHxHEIGHT format (e.g., '1024x1024', uses model defaults if omitted)",
     )
+    aspect_ratio: str | None = Field(
+        default=None,
+        description="Aspect-ratio preset, e.g. '1:1', '4:3', '16:9', '21:9', '5:4'. Mutually exclusive with 'size'.",
+    )
+    resolution: str | None = Field(
+        default=None,
+        description="Resolution class for 'aspect_ratio': '1k', '2k' or '4k' (default '4k' = ~16 MP).",
+    )
     response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
     user: str | None = Field(default=None, description="User identifier for tracking")
     layers: int | None = Field(
         default=None,
         description="Number of output layers for layered image models. Supported range: 2-10.",
     )
+
+    @model_validator(mode="after")
+    def _resolve_aspect_ratio(self):
+        """Turn ``aspect_ratio`` (+``resolution``) into ``size`` so downstream sees one form."""
+        if self.aspect_ratio is None:
+            return self
+        if self.size is not None:
+            raise ValueError("pass either 'size' or 'aspect_ratio', not both")
+        from vllm_omni.entrypoints.openai.image_api_utils import resolve_aspect_ratio_size
+
+        try:
+            width, height = resolve_aspect_ratio_size(self.aspect_ratio, self.resolution)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        self.size = f"{width}x{height}"
+        return self
 
     @field_validator("size")
     @classmethod

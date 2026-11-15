@@ -83,12 +83,25 @@ MINIMAX_H3_IMAGE_PIXEL_GRID = 32
 MINIMAX_H3_IMAGE_DEFAULT_MIN_GENERATION_AREA = 2048 * 2048
 # 32x32 never enlarges a request; 4096x4096 is the top tier.
 MINIMAX_H3_IMAGE_MIN_GENERATION_AREA_RANGE = (32 * 32, 4096 * 4096)
-MINIMAX_H3_IMAGE_DEFAULT_SIZE = 1024
+# The release generates ~16 MP at every aspect ratio and gives its best results there
+# (README: "best results at around 16 MP"), so an unspecified size is 4096x4096 rather
+# than a small square.
+MINIMAX_H3_IMAGE_DEFAULT_SIZE = 4096
 # A reference is resized to a 1024px short edge, so its aspect ratio bounds the
 # pixels the Qwen preprocessing and the VAE encoder receive (a 32x16384 upload
 # would otherwise become a 1024x524288 input). The output size is bounded by the
 # server's --max-generated-image-size.
-MINIMAX_H3_IMAGE_MAX_REFERENCE_ASPECT = 8
+MINIMAX_H3_IMAGE_MAX_REFERENCE_ASPECT = 4
+# Released request contract (MiniMax H3-Image): each reference at most 64 MiB with sides of
+# 128..8192 px and an aspect ratio up to 4:1; the output area stays within
+# 655_360..20_000_000 px at an aspect ratio of 1:3..3:1. Out-of-spec inputs are rejected
+# instead of being silently resampled, so a request always means the same thing.
+MINIMAX_H3_IMAGE_REFERENCE_MIN_SIDE = 128
+MINIMAX_H3_IMAGE_REFERENCE_MAX_SIDE = 8192
+MINIMAX_H3_IMAGE_REFERENCE_MAX_BYTES = 64 * 1024 * 1024
+MINIMAX_H3_IMAGE_MIN_OUTPUT_AREA = 655_360
+MINIMAX_H3_IMAGE_MAX_OUTPUT_AREA = 20_000_000
+MINIMAX_H3_IMAGE_MAX_OUTPUT_ASPECT = 3
 # Edit accepts up to 16 ordered references ("Picture 1" .. "Picture 16"); keep
 # model_metadata's max_multimodal_image_inputs in sync.
 MINIMAX_H3_IMAGE_MAX_REFERENCES = 16
@@ -351,8 +364,23 @@ def _load_reference(value: Any) -> Image.Image:
             image = _upright_rgb(source)
     else:
         raise OmniClientError(f"unsupported image reference type {type(value).__name__}")
-    if min(image.size) < 32:
-        raise OmniClientError("image reference must retain at least 32 pixels on each axis")
+    if isinstance(value, (str, os.PathLike)) and os.path.isfile(value):
+        size_bytes = os.path.getsize(value)
+        if size_bytes > MINIMAX_H3_IMAGE_REFERENCE_MAX_BYTES:
+            raise OmniClientError(
+                "image reference exceeds 64 MiB "
+                f"({size_bytes / 1024 / 1024:.1f} MiB)"
+            )
+    if min(image.size) < MINIMAX_H3_IMAGE_REFERENCE_MIN_SIDE:
+        raise OmniClientError(
+            "image reference must retain at least "
+            f"{MINIMAX_H3_IMAGE_REFERENCE_MIN_SIDE} pixels on each axis"
+        )
+    if max(image.size) > MINIMAX_H3_IMAGE_REFERENCE_MAX_SIDE:
+        raise OmniClientError(
+            "image reference must not exceed "
+            f"{MINIMAX_H3_IMAGE_REFERENCE_MAX_SIDE} pixels on either axis"
+        )
     if max(image.size) > MINIMAX_H3_IMAGE_MAX_REFERENCE_ASPECT * min(image.size):
         raise OmniClientError(
             f"image reference aspect ratio must be at most {MINIMAX_H3_IMAGE_MAX_REFERENCE_ASPECT}:1, "
@@ -759,6 +787,19 @@ class MiniMaxH3ImagePipeline(
             min_area = minimax_h3_validate_min_generation_area(extra["min_generation_area"])
         if width < 1 or height < 1:
             raise OmniClientError("width and height must be positive")
+        if not request.is_dummy_run():
+            area = width * height
+            if not MINIMAX_H3_IMAGE_MIN_OUTPUT_AREA <= area <= MINIMAX_H3_IMAGE_MAX_OUTPUT_AREA:
+                raise OmniClientError(
+                    "requested size must cover "
+                    f"{MINIMAX_H3_IMAGE_MIN_OUTPUT_AREA}..{MINIMAX_H3_IMAGE_MAX_OUTPUT_AREA} pixels, "
+                    f"got {width}x{height} ({area} px)"
+                )
+            if max(width, height) > MINIMAX_H3_IMAGE_MAX_OUTPUT_ASPECT * min(width, height):
+                raise OmniClientError(
+                    f"requested size must stay within {MINIMAX_H3_IMAGE_MAX_OUTPUT_ASPECT}:1, "
+                    f"got {width}x{height}"
+                )
         if min_area is None and (width % 32 or height % 32 or width < 32 or height < 32):
             raise OmniClientError("width and height must be multiples of 32 when min_generation_area is disabled")
         canvas_w, canvas_h = minimax_h3_image_generation_canvas(width, height, min_area)

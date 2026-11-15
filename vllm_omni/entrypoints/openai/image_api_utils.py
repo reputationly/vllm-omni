@@ -76,6 +76,56 @@ def parse_size(size_str: str) -> tuple[int, int]:
     return width, height
 
 
+# Released 16 MP sizes for the aspect-ratio presets of the 16-megapixel image class
+# (MiniMax-H3-Image README: 4096x4096 .. 6272x2688, "best results at around 16 MP", plus the
+# 5:4 pair from its ``size_for`` helper). Lower resolutions keep the ratio on a 32-px grid.
+ASPECT_RATIO_PRESETS_16MP: dict[str, tuple[int, int]] = {
+    "1:1": (4096, 4096),
+    "4:3": (4736, 3552),
+    "3:4": (3552, 4736),
+    "3:2": (5024, 3360),
+    "2:3": (3360, 5024),
+    "16:9": (5472, 3072),
+    "9:16": (3072, 5472),
+    "21:9": (6272, 2688),
+    "9:21": (2688, 6272),
+    "5:4": (4576, 3648),
+    "4:5": (3648, 4576),
+}
+RESOLUTION_AREA_PX: dict[str, int] = {
+    "1k": 1024 * 1024,
+    "2k": 2048 * 2048,
+    "4k": 4096 * 4096,
+}
+
+
+def _align32(value: float) -> int:
+    return max(32, int(round(value / 32.0)) * 32)
+
+
+def resolve_aspect_ratio_size(aspect_ratio: str, resolution: str | None = None) -> tuple[int, int]:
+    """Map an ``aspect_ratio`` (+ optional ``resolution``) onto a concrete ``WIDTHxHEIGHT``.
+
+    ``"4k"`` (the default) returns the released 16 MP size verbatim; ``"2k"``/``"1k"`` keep
+    the aspect ratio and the 32-pixel grid while scaling the area down.
+    """
+    key = str(aspect_ratio).strip().replace(" ", "")
+    if key not in ASPECT_RATIO_PRESETS_16MP:
+        raise ValueError(
+            f"unsupported aspect_ratio {aspect_ratio!r}; supported: {', '.join(ASPECT_RATIO_PRESETS_16MP)}"
+        )
+    width, height = ASPECT_RATIO_PRESETS_16MP[key]
+    scaled = str(resolution or "4k").strip().lower()
+    if scaled not in RESOLUTION_AREA_PX:
+        raise ValueError(
+            f"unsupported resolution {resolution!r}; supported: {', '.join(RESOLUTION_AREA_PX)}"
+        )
+    if scaled == "4k":
+        return width, height
+    factor = (RESOLUTION_AREA_PX[scaled] / (width * height)) ** 0.5
+    return _align32(width * factor), _align32(height * factor)
+
+
 def encode_image_base64(image: PIL.Image.Image) -> str:
     """Encode PIL Image to base64 PNG string.
 
