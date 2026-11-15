@@ -147,6 +147,33 @@ def minimax_h3_image_reference_size(
     return _nearest_grid_multiple(width * scale), _nearest_grid_multiple(height * scale)
 
 
+def _bound_references(
+    references: list[Image.Image], bounds: tuple[int, int], budget: int
+) -> list[Image.Image]:
+    """Resize a reference set for one consumer, then apply the shared pixel budget.
+
+    The budget has to be applied on BOTH consumers: the VAE side decides the packed
+    reference rows the DiT attends to, while the Qwen side decides how many vision
+    tokens the text encoder and the packed sequence carry. Capping only the VAE side
+    still OOMs once the source images are large (16 references at 1024 px short edge
+    is tens of thousands of vision tokens).
+    """
+    bounded = [_bound_reference(image, bounds) for image in references]
+    if not budget or not bounded:
+        return bounded
+    sizes = scale_minimax_h3_reference_sizes_to_budget([image.size for image in bounded], budget)
+    if sizes is None:
+        return bounded
+    logger.info(
+        "MiniMax-H3-Image: reference budget %d px resized %d references to %s for bounds %s",
+        budget,
+        len(bounded),
+        sizes,
+        bounds,
+    )
+    return [image.resize(size, Image.Resampling.LANCZOS) for image, size in zip(bounded, sizes, strict=True)]
+
+
 def _bound_reference(image: Image.Image, bounds: tuple[int, int]) -> Image.Image:
     size = minimax_h3_image_reference_size(*image.size, min_short_edge=bounds[0], max_short_edge=bounds[1])
     if size is None or size == image.size:
@@ -653,7 +680,7 @@ class MiniMaxH3ImagePipeline(
         vision: dict[str, torch.Tensor] = {}
         counts: list[int] = []
         if references:
-            images = [_bound_reference(image, MINIMAX_H3_IMAGE_QWEN_SHORT_EDGE) for image in references]
+            images = _bound_references(references, MINIMAX_H3_IMAGE_QWEN_SHORT_EDGE, self._reference_total_pixels)
             processed = self.processor.image_processor(images=images, return_tensors="pt")
             vision = {key: processed[key] for key in ("pixel_values", "image_grid_thw")}
             merge = int(self.processor.image_processor.merge_size) ** 2
@@ -807,22 +834,7 @@ class MiniMaxH3ImagePipeline(
         # Draw 1: target noise; draw 2: per-reference anchor noise; draw 3 (in
         # the VAE encode): per-reference posterior samples.
         target_noise = self._noise_rows(generator, latent_h, latent_w)
-        vae_refs = [_bound_reference(image, MINIMAX_H3_IMAGE_VAE_SHORT_EDGE) for image in references]
-        if self._reference_total_pixels and vae_refs:
-            sizes = scale_minimax_h3_reference_sizes_to_budget(
-                [image.size for image in vae_refs], self._reference_total_pixels
-            )
-            if sizes is not None:
-                vae_refs = [
-                    image.resize(size, Image.Resampling.LANCZOS)
-                    for image, size in zip(vae_refs, sizes, strict=True)
-                ]
-                logger.info(
-                    "MiniMax-H3-Image: reference budget %d px shrunk %d references to %s",
-                    self._reference_total_pixels,
-                    len(vae_refs),
-                    sizes,
-                )
+        vae_refs = _bound_references(references, MINIMAX_H3_IMAGE_VAE_SHORT_EDGE, self._reference_total_pixels)
         grids = [minimax_h3_image_reference_grid(*image.size) for image in vae_refs]
         anchor_noise = [self._noise_rows(generator, h, w) for h, w in grids]
         clean_rows = self._encode_references(vae_refs, grids, generator)
