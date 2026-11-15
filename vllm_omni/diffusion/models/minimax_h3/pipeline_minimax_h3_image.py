@@ -851,6 +851,32 @@ class MiniMaxH3ImagePipeline(
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         check_request_cancellation()
         parsed = self._parse_request(request)
+        reference_budget = (
+            _reference_budget_ladder(len(parsed["references"]))
+            if self._reference_budget_auto
+            else self._reference_total_pixels
+        )
+        try:
+            return self._generate(parsed, reference_budget)
+        except torch.OutOfMemoryError:
+            # One retry at half the reference budget. The reference rows dominate the
+            # activation peak, so halving the pixel budget recovers roughly 3 GiB per
+            # card. A second OOM is a genuine 500: the caller should send fewer or
+            # smaller references. The seed draws are reproduced identically because the
+            # generator is re-created inside ``_generate`` from ``parsed["seed"]``.
+            halved = reference_budget // 2
+            if reference_budget <= 0 or halved <= 0:
+                raise
+            logger.warning(
+                "MiniMax-H3-Image: CUDA OOM with reference budget %d px; retrying once at %d px",
+                reference_budget,
+                halved,
+            )
+            if current_omni_platform.is_cuda_alike():
+                torch.cuda.empty_cache()
+            return self._generate(parsed, halved)
+
+    def _generate(self, parsed: dict[str, Any], reference_budget: int) -> DiffusionOutput:
         canvas_w, canvas_h = parsed["canvas"]
         latent_h, latent_w = canvas_h // 16, canvas_w // 16
         references = parsed["references"]
@@ -859,9 +885,6 @@ class MiniMaxH3ImagePipeline(
         # Draw 1: target noise; draw 2: per-reference anchor noise; draw 3 (in
         # the VAE encode): per-reference posterior samples.
         target_noise = self._noise_rows(generator, latent_h, latent_w)
-        reference_budget = (
-            _reference_budget_ladder(len(references)) if self._reference_budget_auto else self._reference_total_pixels
-        )
         vae_refs = _bound_references(references, MINIMAX_H3_IMAGE_VAE_SHORT_EDGE, reference_budget)
         grids = [minimax_h3_image_reference_grid(*image.size) for image in vae_refs]
         anchor_noise = [self._noise_rows(generator, h, w) for h, w in grids]
