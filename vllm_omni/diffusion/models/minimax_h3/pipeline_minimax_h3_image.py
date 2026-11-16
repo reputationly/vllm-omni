@@ -1105,6 +1105,9 @@ class MiniMaxH3ImagePipeline(
             )
         )
         if problems:
+            # Extension field: lets the metrics layer count violations without a
+            # second side channel. Clients that only know the vendor schema ignore it.
+            usage["problems"] = list(problems)
             logger.warning("H3-Image usage invariants violated: %s (usage=%s)", problems, usage)
         if parsed["output_type"] == "latent":
             return DiffusionOutput(output=latent, usage=usage)

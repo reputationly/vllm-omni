@@ -713,11 +713,18 @@ class OmniBase(PDDisaggregationMixin):
                 # Token counters — aggregate across all stages for this request.
                 _prompt_tok = 0
                 _gen_tok = 0
+                _usage = None
                 for evt in metrics.stage_events.get(rid_key, [])[stage_event_cursor:]:
                     if evt.stage_id == 0:
                         _prompt_tok += int(evt.num_tokens_in)
                     _gen_tok += int(evt.num_tokens_out)
+                    if getattr(evt, "usage", None) is not None:
+                        _usage = evt.usage
                 self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
+                # Billable usage (image/video media only; text stages never emit it, so
+                # they must not be counted as "missing").
+                if output_type in ("image", "video"):
+                    self.prom_metrics.observe_usage(_usage)
 
                 queue_wait_s = extract_queue_wait_s(_m.pipeline_timings if _m is not None else None)
                 if queue_wait_s is not None:

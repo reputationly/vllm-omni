@@ -138,6 +138,16 @@ VLLM_PREFILL_MS = "vllm_prefill_ms"
 VLLM_DECODE_MS = "vllm_decode_ms"
 VLLM_NUM_PREEMPTIONS = "vllm_num_preemptions"
 NUM_TOKENS_IN = "num_tokens_in"
+# Billable usage (vllm_omni.metrics.usage). These are observability counters only:
+# money is computed from the per-request usage record in the HTTP response, never
+# from a scrape. ``USAGE_MISSING`` is the alarm that a billable request produced no
+# usage record; ``USAGE_INVARIANT_VIOLATION`` fires when a usage record breaks an
+# internal consistency rule (e.g. generated canvas != delivered size).
+INPUT_TEXT_TOKENS = "input_text_tokens"
+INPUT_IMAGE_TOKENS = "input_image_tokens"
+OUTPUT_IMAGE_TOKENS = "output_image_tokens"
+USAGE_MISSING = "usage_missing"
+USAGE_INVARIANT_VIOLATION = "usage_invariant_violation"
 NUM_TOKENS_OUT = "num_tokens_out"
 AUDIO_SAMPLE_RATE = "audio_sample_rate"
 
@@ -211,6 +221,11 @@ STAGE_WAITING_REQUESTS = METRIC_PREFIX + "stage_waiting_requests"
 NUM_INFERENCE_STEPS = METRIC_PREFIX + "num_inference_steps"
 IMAGE_COUNT_METRIC = METRIC_PREFIX + IMAGE_COUNT
 IMAGE_PIXELS_METRIC = METRIC_PREFIX + IMAGE_PIXELS
+INPUT_TEXT_TOKENS_METRIC = METRIC_PREFIX + INPUT_TEXT_TOKENS
+INPUT_IMAGE_TOKENS_METRIC = METRIC_PREFIX + INPUT_IMAGE_TOKENS
+OUTPUT_IMAGE_TOKENS_METRIC = METRIC_PREFIX + OUTPUT_IMAGE_TOKENS
+USAGE_MISSING_METRIC = METRIC_PREFIX + USAGE_MISSING
+USAGE_INVARIANT_VIOLATION_METRIC = METRIC_PREFIX + USAGE_INVARIANT_VIOLATION
 PEAK_MEMORY_MB_METRIC = METRIC_PREFIX + "peak_memory_mb"
 REQUESTS_FAILED = METRIC_PREFIX + "requests_failed"
 KV_WAIT_S = METRIC_PREFIX + "kv_wait_s"

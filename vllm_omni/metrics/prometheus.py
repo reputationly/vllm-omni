@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from threading import Lock
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -40,6 +41,35 @@ _prompt_tokens_family = Counter(
 _generation_tokens_family = Counter(
     defs.GENERATION_TOKENS,
     "Total generation (output) tokens produced across all pipeline stages.",
+    labelnames=_labelnames,
+)
+
+_input_text_tokens_family = Counter(
+    defs.INPUT_TEXT_TOKENS_METRIC,
+    "Billable input text tokens (prompt side) of image requests, from the pipeline's "
+    "usage record. Observability only - billing reads the per-request usage payload.",
+    labelnames=_labelnames,
+)
+_input_image_tokens_family = Counter(
+    defs.INPUT_IMAGE_TOKENS_METRIC,
+    "Billable input image tokens (reference vision tokens) of image requests.",
+    labelnames=_labelnames,
+)
+_output_image_tokens_family = Counter(
+    defs.OUTPUT_IMAGE_TOKENS_METRIC,
+    "Billable output image tokens of image requests (delivered pixels / 1024).",
+    labelnames=_labelnames,
+)
+_usage_missing_family = Counter(
+    defs.USAGE_MISSING_METRIC,
+    "Billable requests that produced no usage record. Must stay 0: a non-zero value "
+    "means some image requests cannot be billed and reconciliation will fail.",
+    labelnames=_labelnames,
+)
+_usage_invariant_family = Counter(
+    defs.USAGE_INVARIANT_VIOLATION_METRIC,
+    "Usage records that violated an internal consistency rule (canvas != delivered, "
+    "token budget mismatch). Must stay 0.",
     labelnames=_labelnames,
 )
 
@@ -148,6 +178,11 @@ class OmniPrometheusMetrics:
         self._num_inference_steps = _num_inference_steps_family.labels(model_name=model_name)
         self._image_count = _image_count_family.labels(model_name=model_name)
         self._image_pixels = _image_pixels_family.labels(model_name=model_name)
+        self._input_text_tokens = _input_text_tokens_family.labels(model_name=model_name)
+        self._input_image_tokens = _input_image_tokens_family.labels(model_name=model_name)
+        self._output_image_tokens = _output_image_tokens_family.labels(model_name=model_name)
+        self._usage_missing = _usage_missing_family.labels(model_name=model_name)
+        self._usage_invariant = _usage_invariant_family.labels(model_name=model_name)
 
     def set_running(self, n: int) -> None:
         if not self._log_stats:
@@ -204,6 +239,35 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             stage=str(stage),
         ).observe(max(in_queue_s, 0.0))
+
+    def observe_usage(self, usage: dict[str, Any] | None) -> None:
+        """Account one request's billable usage into the token counters.
+
+        Vendor-compatible payload from ``vllm_omni.metrics.usage``: the token split is
+        nested, so read it defensively - a malformed record must never crash finalize.
+        """
+        if not self._log_stats:
+            return
+        if not isinstance(usage, dict):
+            self._usage_missing.inc()
+            return
+        details_in = usage.get("input_tokens_details") or {}
+        details_out = usage.get("output_tokens_details") or {}
+        text_tokens = details_in.get("text_tokens")
+        image_tokens = details_in.get("image_tokens")
+        output_tokens = details_out.get("image_tokens")
+        if text_tokens is None and image_tokens is None and output_tokens is None:
+            self._usage_missing.inc()
+            return
+        if isinstance(text_tokens, int) and text_tokens > 0:
+            self._input_text_tokens.inc(text_tokens)
+        if isinstance(image_tokens, int) and image_tokens > 0:
+            self._input_image_tokens.inc(image_tokens)
+        if isinstance(output_tokens, int) and output_tokens > 0:
+            self._output_image_tokens.inc(output_tokens)
+        problems = usage.get("problems") or []
+        if problems:
+            self._usage_invariant.inc(len(problems))
 
     def observe_queue_wait(self, queue_wait_s: float) -> None:
         if not self._log_stats:

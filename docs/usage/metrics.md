@@ -163,3 +163,52 @@ the active turn context.
 
 No per-token or per-chunk spans, prompts, generated content or media are recorded
 by the pipeline instrumentation.
+
+## Billable Usage Metrics (`vllm_omni:`)
+
+Per-request billable usage for image/video models, derived from the pipeline's usage
+record (`vllm_omni/metrics/usage.py`). **These counters are for dashboards and alerts
+only** — money is computed from the usage payload in each HTTP response, never from a
+scrape: counters lose data between scrapes and reset with the process, while a bill has
+to survive both.
+
+| Metric | Type | Labels | Description |
+| -------- | ------ | -------- | ------------- |
+| `vllm_omni:input_text_tokens_total` | Counter | `model_name` | Prompt-side tokens billed for image requests (multiplied by `n`, matching the vendor) |
+| `vllm_omni:input_image_tokens_total` | Counter | `model_name` | Reference-image vision tokens billed (per reference: patches + 2 vision markers) |
+| `vllm_omni:output_image_tokens_total` | Counter | `model_name` | Output image tokens billed: `floor(W/32) * floor(H/32)` per delivered image |
+| `vllm_omni:usage_missing_total` | Counter | `model_name` | Media requests finalized without a usage record. **Must stay 0** |
+| `vllm_omni:usage_invariant_violation_total` | Counter | `model_name` | Usage records that broke a consistency rule (e.g. canvas != delivered size) |
+
+`usage_missing_total` is the guard that matters operationally: it turns "we silently
+stopped emitting a billable field" into a page instead of a quarterly revenue surprise.
+It is only incremented for media outputs (`image` / `video`); text stages never emit
+usage and are not counted.
+
+Suggested panel queries:
+
+```promql
+# Tokens per second by model
+sum by (model_name) (rate(vllm_omni:output_image_tokens_total[5m]))
+
+# Billable token mix (text : reference : output)
+sum(rate(vllm_omni:input_text_tokens_total[1h]))
+  / sum(rate(vllm_omni:output_image_tokens_total[1h]))
+
+# Cross-check against the gateway's billed tokens (should track each other)
+sum(rate(vllm_omni:output_image_tokens_total[1h])) * 3600
+```
+
+Alert on the two anomaly counters:
+
+```yaml
+- alert: OmniUsageMissing
+  expr: increase(vllm_omni:usage_missing_total[10m]) > 0
+  for: 0m
+  annotations:
+    summary: "影像请求没有 usage 记录，计费将漏单"
+- alert: OmniUsageInvariantViolation
+  expr: increase(vllm_omni:usage_invariant_violation_total[10m]) > 0
+  annotations:
+    summary: "usage 违反一致性规则（画布≠交付/token 预算不符），需核对口径"
+```
