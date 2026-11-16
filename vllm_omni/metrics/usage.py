@@ -52,7 +52,7 @@ class UsageSpec:
     """The contract a usage record was built under.
 
     Bumping ``version`` is how a口径 change stays auditable: old records keep their
-    version, and reconciliation can tell "we changed the rule" from "we mis-billed".
+    version, and reconciliation can tell "we changed the rule" from "the rule was misapplied".
     """
 
     version: str = USAGE_VERSION
