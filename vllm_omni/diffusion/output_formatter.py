@@ -139,6 +139,9 @@ def format_diffusion_outputs(
     outputs = _ensure_list(primary_payload)
     metrics = {
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
+        # Billable usage rides the existing metrics dict so it reaches StagePool and
+        # the API layer without a second plumbing path.
+        **({"usage": diffusion_output.usage} if getattr(diffusion_output, "usage", None) else {}),
         "resolution": (
             int(request.sampling_params.resolution) if request.sampling_params.resolution is not None else None
         ),

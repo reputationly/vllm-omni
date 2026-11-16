@@ -281,6 +281,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
+from vllm_omni.metrics.usage import record_usage
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.page_cache import drop_file_page_cache, request_file_cache_drop_enabled
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
@@ -2381,6 +2382,31 @@ def _image_json_response(response: Any) -> Any:
     return Response(content=orjson.dumps(response.model_dump(mode="json")), media_type="application/json")
 
 
+def _record_usage_audit(request_id: str | None, usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Emit the engine-side usage ledger line for this request."""
+    if usage is None:
+        return None
+    try:
+        record_usage(request_id=str(request_id or ""), usage=usage, status="success")
+    except Exception:  # noqa: BLE001 - auditing must never fail a served request
+        logger.debug("usage audit write failed", exc_info=True)
+    return usage
+
+
+def _extract_usage(result: Any) -> dict[str, Any] | None:
+    """Pull the billable usage record off an engine result.
+
+    Billing must never depend on ``return_stage_metrics`` (a diagnostics switch), so
+    this reads the always-present ``metrics`` payload and ignores everything else in it.
+    """
+    metrics = getattr(result, "metrics", None)
+    if isinstance(metrics, dict):
+        usage = metrics.get("usage")
+        if isinstance(usage, dict):
+            return usage
+    return None
+
+
 def _build_image_generation_response(
     *,
     images: list[Image.Image],
@@ -2388,6 +2414,8 @@ def _build_image_generation_response(
     stage_durations: Any,
     peak_memory_mb: Any,
     response_metrics: Any = None,
+    usage: dict[str, Any] | None = None,
+    request_id: str | None = None,
 ) -> ImageGenerationResponse | StreamingResponse:
     """Encode generated images and apply the requested response format."""
     output_format = _choose_output_format(request.output_format or "png", None)
@@ -2400,6 +2428,11 @@ def _build_image_generation_response(
         )
         for image in images
     ]
+    if usage is not None and isinstance(usage.get("generated_images"), int):
+        # Only the successes carry the delivered size; failures are added by the gateway.
+        delivered = _generated_size_str(images, request.size)
+        for item in image_data[: int(usage["generated_images"])]:
+            item.size = delivered
     response_kwargs: dict[str, Any] = {
         "created": int(time.time()),
         "data": image_data,
@@ -2409,6 +2442,8 @@ def _build_image_generation_response(
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
         ),
+        "usage": usage,
+        "request_id": request_id,
     }
     size = _generated_size_str(images, request.size)
     if size is not None:
@@ -2652,6 +2687,8 @@ async def generate_images(
                 stage_durations=stage_durations,
                 peak_memory_mb=peak_memory_mb,
                 response_metrics=response_metrics,
+                usage=_record_usage_audit(request_id, _extract_usage(result)),
+                request_id=request_id,
             )
         )
 
@@ -3052,6 +3089,8 @@ async def edit_images(
                     stage_durations=stage_durations,
                     peak_memory_mb=peak_memory_mb,
                 ),
+                usage=_record_usage_audit(request_id, _extract_usage(result)),
+                request_id=request_id,
             )
         )
 

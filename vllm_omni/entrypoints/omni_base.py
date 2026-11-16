@@ -762,6 +762,9 @@ class OmniBase(PDDisaggregationMixin):
             )
             stage_metrics[sid_key]["stage_name"] = stage_name or f"stage_{sid}"
             stage_metrics[sid_key]["final_output_type"] = evt_output_type
+            evt_usage = getattr(evt, "usage", None)
+            if evt_usage is not None:
+                stage_metrics[sid_key]["usage"] = evt_usage
         if stage_metrics:
             response_metrics["stage_metrics"] = stage_metrics
             current_stage_metrics = stage_metrics.get(str(stage_id))
@@ -770,6 +773,8 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
                 response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
+                if current_stage_metrics.get("usage") is not None:
+                    response_metrics["usage"] = current_stage_metrics["usage"]
         # Generation content (outputs, prompt, images, trajectory_*, ...) is
         # copied from engine_outputs onto the returned object by
         # OmniRequestOutput.from_stage_output().

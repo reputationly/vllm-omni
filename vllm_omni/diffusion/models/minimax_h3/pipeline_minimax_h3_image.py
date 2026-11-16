@@ -53,6 +53,7 @@ from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.metrics.usage import build_usage, validate_usage
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -101,6 +102,14 @@ MINIMAX_H3_IMAGE_REFERENCE_MAX_SIDE = 8192
 MINIMAX_H3_IMAGE_REFERENCE_MAX_BYTES = 64 * 1024 * 1024
 MINIMAX_H3_IMAGE_MIN_OUTPUT_AREA = 655_360
 MINIMAX_H3_IMAGE_MAX_OUTPUT_AREA = 20_000_000
+# Billed tiers only (2026-11-16 decision). Areas are ranges because a tier is a
+# ratio family, not one size: 2K covers 2048x2048 / 2720x1536 / 3136x1344, 16MP
+# covers 4096x4096 / 5472x3072 / 7104x2368. Anything outside them is rejected at
+# the gateway *and* here, so the charged canvas always equals the delivered image.
+MINIMAX_H3_IMAGE_BILLABLE_AREA_BANDS = (
+    ("2k", 4_000_000, 4_300_000),
+    ("16mp", 16_500_000, 16_900_000),
+)
 MINIMAX_H3_IMAGE_MAX_OUTPUT_ASPECT = 3
 # Edit accepts up to 16 ordered references ("Picture 1" .. "Picture 16"); keep
 # model_metadata's max_multimodal_image_inputs in sync.
@@ -795,6 +804,24 @@ class MiniMaxH3ImagePipeline(
                     f"{MINIMAX_H3_IMAGE_MIN_OUTPUT_AREA}..{MINIMAX_H3_IMAGE_MAX_OUTPUT_AREA} pixels, "
                     f"got {width}x{height} ({area} px)"
                 )
+            # Billing requires the generated canvas to equal the delivered image, which
+            # only holds for 32-aligned sizes inside a billed tier. Reject early with a
+            # machine-readable code so the gateway can show the allowed tier table.
+            if width % 32 or height % 32:
+                raise OmniClientError(
+                    f"width and height must be multiples of 32, got {width}x{height}",
+                    status_code=400,
+                )
+            tier = next(
+                (name for name, low, high in MINIMAX_H3_IMAGE_BILLABLE_AREA_BANDS if low <= area <= high),
+                None,
+            )
+            if tier is None:
+                bands = ", ".join(f"{name}: {low}..{high} px" for name, low, high in MINIMAX_H3_IMAGE_BILLABLE_AREA_BANDS)
+                raise OmniClientError(
+                    f"unsupported_size: {width}x{height} ({area} px) is outside the billed tiers ({bands})",
+                    status_code=400,
+                )
             if max(width, height) > MINIMAX_H3_IMAGE_MAX_OUTPUT_ASPECT * min(width, height):
                 raise OmniClientError(
                     f"requested size must stay within {MINIMAX_H3_IMAGE_MAX_OUTPUT_ASPECT}:1, "
@@ -834,8 +861,15 @@ class MiniMaxH3ImagePipeline(
 
     def _encode_text(
         self, prompt: str, references: list[Image.Image], budget: int = 0
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Layer-50 Qwen states of the positive presentation, on every DiT rank."""
+    ) -> tuple[torch.Tensor, torch.Tensor, int, tuple[int, ...]]:
+        """Layer-50 Qwen states plus the token facts billing needs.
+
+        Returns ``(hidden, tags, text_tokens, reference_vision_counts)`` where
+        ``text_tokens`` counts the prompt-side tokens of the presentation (labels plus
+        the prompt, excluding the image blocks) and ``reference_vision_counts`` is the
+        per-reference vision-patch count. Both feed
+        ``vllm_omni.metrics.usage`` verbatim.
+        """
         vision: dict[str, torch.Tensor] = {}
         counts: list[int] = []
         if references:
@@ -857,7 +891,8 @@ class MiniMaxH3ImagePipeline(
                 hidden = self.text_encoder.encode_ids(ids, **vision)
             hidden = hidden[:text_len]
         hidden = _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device)
-        return hidden.cpu(), tags
+        text_tokens = int((tags == _TEXT_TAG).sum().item())
+        return hidden.cpu(), tags, text_tokens, tuple(int(count) for count in counts)
 
     def _encode_references(
         self, references: list[Image.Image], grids: list[tuple[int, int]], generator: torch.Generator
@@ -1033,7 +1068,9 @@ class MiniMaxH3ImagePipeline(
         )
 
         check_request_cancellation()
-        hidden, text_tags = self._encode_text(parsed["prompt"], references, reference_budget)
+        hidden, text_tags, text_tokens, reference_vision_counts = self._encode_text(
+            parsed["prompt"], references, reference_budget
+        )
         # DLO keeps resident DiT layers on the host outside the denoise loop.
         with self._resident_dit_layers_on_device():
             target = self._denoise(
@@ -1049,8 +1086,28 @@ class MiniMaxH3ImagePipeline(
         latent = minimax_h3_unpatchify_video_tokens(
             target.float(), latent_shape=(1, latent_h // 2, latent_w // 2, _LATENT_CHANNELS), patch_size=_PATCH
         )
+        usage = build_usage(
+            width=parsed["width"],
+            height=parsed["height"],
+            generated_images=1,
+            text_tokens=text_tokens,
+            reference_vision_counts=reference_vision_counts,
+            canvas=(canvas_w, canvas_h),
+        ).to_dict()
+        problems = validate_usage(
+            build_usage(
+                width=parsed["width"],
+                height=parsed["height"],
+                generated_images=1,
+                text_tokens=text_tokens,
+                reference_vision_counts=reference_vision_counts,
+                canvas=(canvas_w, canvas_h),
+            )
+        )
+        if problems:
+            logger.warning("H3-Image usage invariants violated: %s (usage=%s)", problems, usage)
         if parsed["output_type"] == "latent":
-            return DiffusionOutput(output=latent)
+            return DiffusionOutput(output=latent, usage=usage)
         check_request_cancellation()
         pixels = self.vae.decode_latent(latent, group=self._vae_group, use_cuda_graph=self._vae_cuda_graph)
         # Quantize on the device (the same FP32 arithmetic as on the host) so
@@ -1060,7 +1117,7 @@ class MiniMaxH3ImagePipeline(
             pixels = minimax_h3_resize_image_output(pixels, parsed["width"], parsed["height"])
         # Hand the host uint8 HWC images: the writer needs no layout copy.
         pixels = pixels.permute(0, 2, 3, 1).contiguous().cpu()
-        return DiffusionOutput(output=pixels)
+        return DiffusionOutput(output=pixels, usage=usage)
 
 
 __all__ = [

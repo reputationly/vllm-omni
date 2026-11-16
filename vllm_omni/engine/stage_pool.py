@@ -914,6 +914,16 @@ class StagePool:
                 if ptids is not None:
                     num_tokens_in += len(ptids)
 
+        # Diffusion pipelines publish vendor-compatible usage through their output
+        # metrics (see ``vllm_omni.metrics.usage``); it is the billable record, so it
+        # must survive to the HTTP response untouched.
+        usage = None
+        for ro in request_outputs:
+            candidate = getattr(ro, "metrics", None)
+            if isinstance(candidate, dict) and isinstance(candidate.get("usage"), dict):
+                usage = candidate["usage"]
+                break
+
         metrics = self._replica_metrics[replica_id]
         metrics.batch_seq += 1
         batch_id = metrics.batch_seq
@@ -922,6 +932,7 @@ class StagePool:
 
         # Preserve required fields and completion/usage without optional diagnostics.
         stage_metrics = StageRequestMetrics(
+            usage=usage,
             num_tokens_in=num_tokens_in,
             num_tokens_out=num_tokens_out,
             finish_reason=finish_reason,

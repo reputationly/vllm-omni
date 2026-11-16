@@ -234,6 +234,18 @@ class ImageData(BaseModel):
     b64_json: str | None = Field(default=None, description="Base64-encoded PNG image")
     url: str | None = Field(default=None, description="Image URL (not implemented)")
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    size: str | None = Field(
+        default=None,
+        description="Delivered WIDTHxHEIGHT of this image (MiniMax H3-Image response shape).",
+    )
+    error: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-image failure, MiniMax H3-Image response shape ({code, message}). "
+            "Only technical failures are reported by the engine; the gateway adds its "
+            "own `output_content_filtered` entries."
+        ),
+    )
 
 
 class ImageGenerationResponse(BaseModel):
@@ -254,7 +266,19 @@ class ImageGenerationResponse(BaseModel):
     )
     metrics: dict[str, Any] | None = Field(
         default=None,
-        description="Per-request generation metrics.",
+        description="Per-request generation metrics (diagnostics; only with return_stage_metrics).",
+    )
+    request_id: str | None = Field(
+        default=None,
+        description="Request id echoed back so a gateway can correlate billing with engine logs.",
+    )
+    usage: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Billable usage, MiniMax H3-Image compatible: generated_images, total/input/"
+            "output tokens with text/image splits. Always returned; do not gate on "
+            "return_stage_metrics, billing depends on it."
+        ),
     )
 
     def stream_response(self) -> StreamingResponse:

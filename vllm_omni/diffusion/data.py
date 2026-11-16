@@ -2096,6 +2096,11 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
+    # Billable usage of this request (``vllm_omni.metrics.usage.Usage.to_dict()``).
+    # Produced by the pipeline, surfaced verbatim in the HTTP response so the gateway
+    # never has to re-derive token counts from request parameters.
+    usage: dict[str, Any] | None = None
+
     # Typed video-media contract. Appended so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.

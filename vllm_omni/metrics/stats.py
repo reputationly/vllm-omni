@@ -69,6 +69,12 @@ class StageRequestStats:
     vllm_tpot_ms: float = 0.0
     vllm_itl_ms: float = 0.0
     vllm_itls_ms: list[float] | None = None
+    # Billable usage of this request, as produced by the model pipeline
+    # (``vllm_omni.metrics.usage.Usage.to_dict()``). Kept separate from
+    # ``num_tokens_in``/``num_tokens_out`` on purpose: those describe AR generation
+    # and stay 0 for diffusion models, while this carries the vendor-compatible
+    # text/vision/image token split that the gateway bills on.
+    usage: dict[str, Any] | None = None
     # Engine-core phase split of a finished vLLM request: queued -> scheduled
     # -> first token -> last token, as in vLLM's FinishedRequestStats.
     # None means not observed (diffusion stage, --log-stats off, or a missing
