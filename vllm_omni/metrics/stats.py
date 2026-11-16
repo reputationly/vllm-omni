@@ -830,6 +830,11 @@ class OrchestratorAggregator:
         for key, value in diffusion_metrics.items():
             if value is None:
                 continue
+            # The metrics dict also carries non-numeric payloads (e.g. the billable
+            # ``usage`` record). Skip them instead of coercing: this accumulator only
+            # sums numbers, and a new non-numeric key must not fail a served request.
+            if not isinstance(value, int | float):
+                continue
             if key in self._MS_TO_S:
                 bucket[self._MS_TO_S[key]] += float(value) / 1000.0
             else:

@@ -2437,10 +2437,16 @@ def _build_image_generation_response(
         "created": int(time.time()),
         "data": image_data,
         "output_format": output_format,
-        "metrics": _build_image_response_metrics(
-            response_metrics=response_metrics,
-            stage_durations=stage_durations,
-            peak_memory_mb=peak_memory_mb,
+        # Diagnostics stay opt-in (decision: non-standard fields hidden by default);
+        # usage is the opposite and must always be present.
+        "metrics": (
+            _build_image_response_metrics(
+                response_metrics=response_metrics,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
+            )
+            if response_metrics is not None
+            else None
         ),
         "usage": usage,
         "request_id": request_id,
@@ -3084,10 +3090,14 @@ async def edit_images(
                 output_format=output_format,
                 size=_generated_size_str(images, size_str),
                 cot_output=cot_output,
-                metrics=_build_image_response_metrics(
-                    response_metrics=response_metrics,
-                    stage_durations=stage_durations,
-                    peak_memory_mb=peak_memory_mb,
+                metrics=(
+                    _build_image_response_metrics(
+                        response_metrics=response_metrics,
+                        stage_durations=stage_durations,
+                        peak_memory_mb=peak_memory_mb,
+                    )
+                    if response_metrics is not None
+                    else None
                 ),
                 usage=_record_usage_audit(request_id, _extract_usage(result)),
                 request_id=request_id,

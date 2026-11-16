@@ -1086,31 +1086,27 @@ class MiniMaxH3ImagePipeline(
         latent = minimax_h3_unpatchify_video_tokens(
             target.float(), latent_shape=(1, latent_h // 2, latent_w // 2, _LATENT_CHANNELS), patch_size=_PATCH
         )
-        usage = build_usage(
-            width=parsed["width"],
-            height=parsed["height"],
-            generated_images=1,
-            text_tokens=text_tokens,
-            reference_vision_counts=reference_vision_counts,
-            canvas=(canvas_w, canvas_h),
-        ).to_dict()
-        problems = validate_usage(
-            build_usage(
+        def _usage_for(generated_images: int) -> dict:
+            """Usage record for ``generated_images`` produced images (n can be > 1)."""
+            record = build_usage(
                 width=parsed["width"],
                 height=parsed["height"],
-                generated_images=1,
+                generated_images=generated_images,
                 text_tokens=text_tokens,
                 reference_vision_counts=reference_vision_counts,
                 canvas=(canvas_w, canvas_h),
             )
-        )
-        if problems:
-            # Extension field: lets the metrics layer count violations without a
-            # second side channel. Clients that only know the vendor schema ignore it.
-            usage["problems"] = list(problems)
-            logger.warning("H3-Image usage invariants violated: %s (usage=%s)", problems, usage)
+            problems = validate_usage(record)
+            payload = record.to_dict()
+            if problems:
+                # Extension field: lets the metrics layer count violations without a
+                # second side channel. Clients that only know the vendor schema ignore it.
+                payload["problems"] = list(problems)
+                logger.warning("H3-Image usage invariants violated: %s (usage=%s)", problems, payload)
+            return payload
+
         if parsed["output_type"] == "latent":
-            return DiffusionOutput(output=latent, usage=usage)
+            return DiffusionOutput(output=latent, usage=_usage_for(int(latent.shape[0])))
         check_request_cancellation()
         pixels = self.vae.decode_latent(latent, group=self._vae_group, use_cuda_graph=self._vae_cuda_graph)
         # Quantize on the device (the same FP32 arithmetic as on the host) so
@@ -1120,7 +1116,8 @@ class MiniMaxH3ImagePipeline(
             pixels = minimax_h3_resize_image_output(pixels, parsed["width"], parsed["height"])
         # Hand the host uint8 HWC images: the writer needs no layout copy.
         pixels = pixels.permute(0, 2, 3, 1).contiguous().cpu()
-        return DiffusionOutput(output=pixels, usage=usage)
+        # One image per ``num_outputs_per_prompt``; the batch dim is the billed count.
+        return DiffusionOutput(output=pixels, usage=_usage_for(int(pixels.shape[0])))
 
 
 __all__ = [
