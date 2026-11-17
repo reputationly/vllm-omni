@@ -4137,8 +4137,14 @@ async def _generate_task_images(
     n: int,
     task_id: str,
     bridge: dict[str, Any] | None = None,
-) -> list[Image.Image]:
-    """Render the images for one task, on whichever engine shape is deployed."""
+) -> tuple[list[Image.Image], dict[str, Any] | None]:
+    """Render the images for one task, on whichever engine shape is deployed.
+
+    Returns ``(images, usage)``: ``usage`` is the pipeline's billable record (token split
+    in the vendor-compatible shape) or ``None`` when the engine shape does not report
+    one. Billing travels the async task path — facade polls /v1/tasks/{id}/status — so
+    the record has to be parked on the task, not just returned to the submitter.
+    """
     if width is not None and height is not None:
         extra_body["width"] = width
         extra_body["height"] = height
@@ -4174,7 +4180,7 @@ async def _generate_task_images(
         if isinstance(result, ErrorResponse):
             raise RuntimeError(getattr(getattr(result, "error", None), "message", None) or str(result))
         images, _, _, _ = result
-        return list(images)
+        return list(images), None
 
     # Single diffusion stage. This also covers the terminal engine of an
     # exclusive-residency deployment, where AR already ran as its own engine and
@@ -4281,7 +4287,7 @@ async def _generate_task_images(
         # Bare task id, same reason as the multi-stage branch above.
         request_id=task_id,
     )
-    return _extract_images_from_result(gen_result)
+    return _extract_images_from_result(gen_result), _extract_usage(gen_result)
 
 
 async def _run_ar_phase(
@@ -4499,7 +4505,7 @@ async def _run_image_job(
                 # the diffusion engine can take the whole card.
                 await residency_stack.enter_async_context(session.awake(bundle.deployment.terminal.label))
 
-            images = await _generate_task_images(
+            images, usage = await _generate_task_images(
                 request=request,
                 app_state=app_state,
                 engine_client=engine_client,
@@ -4531,7 +4537,17 @@ async def _run_image_job(
         images[0].save(buf, format="PNG")
         await atomic_write_bytes(buf.getvalue(), save_result_path)
         logger.info("Image task %s wrote %s", task_id, save_result_path)
-        await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.COMPLETED, "end_time": time.time()})
+        # Park the billable usage on the task: the facade reads it off
+        # /v1/tasks/{id}/status and the gateway prices it. Losing it silently
+        # under-bills, so it rides the same atomic row update as the status.
+        await AUDIO_TASK_STORE.update_fields(
+            task_id,
+            {
+                "status": AudioTaskStatus.COMPLETED,
+                "end_time": time.time(),
+                **({"usage": usage} if usage is not None else {}),
+            },
+        )
     except asyncio.CancelledError:
         await AUDIO_TASK_STORE.update_fields(task_id, {"status": AudioTaskStatus.CANCELLED, "end_time": time.time()})
         raise

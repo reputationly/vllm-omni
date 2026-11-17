@@ -16,6 +16,7 @@ Status strings and the status-response field names match LightX2V's
 import os
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from pydantic import AliasChoices, BaseModel, Field
 
@@ -170,6 +171,11 @@ class AudioTaskResponse(BaseModel):
     error: str | None = None
     error_type: str = ""
     save_result_path: str | None = None
+    # Billable usage of the finished task (vllm_omni.metrics.usage shape). Present on
+    # DONE only: the gateway bills from it, and the facade forwards it verbatim. None
+    # means "engine reported no usage" (older engine, or a task that never generated),
+    # which the gateway must read as unbillable rather than as zero.
+    usage: dict[str, Any] | None = None
     # Progress contract shared with the GPUStack facade: the engine reports which
     # phase it is in and how far through it, and the facade folds that into a
     # global percentage using its own per-model stage weights. Absent (None) for
