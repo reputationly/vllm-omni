@@ -174,3 +174,62 @@ long_video.py          非 long_video 上界 return 15.0        -> 20.0
 原始记录：`raw/acc_shipped_image.log`。
 
 GPUStack 侧怎么换成这个镜像（推荐路径、两个源码级坑、回滚陷阱、停机窗口）见 [UPGRADE.md](UPGRADE.md)。
+
+---
+
+## 6. 现网滚动：latest → main 构建，NFS 分发，删实例重建（2026-11-19 15:00–15:50）
+
+按"用 `arm64-a100-latest` + 脚本 save 到 NFS + 在线升级 + 删除重建实例"的方式落地。
+
+### 6.1 为什么这版要在 main 上出，而不是原来那个分支包
+
+`latest` 当时指向 `0b4425e6c`（11-17，比现网在跑的 `2fae9a2e` 新一个 commit：`feat(tasks): carry billable usage on the async image task`）。
+把 `latest` 挪到基于 `2fae9a2e` 的包，等于把那两个文件的计费上报回退掉。所以改动先 fast-forward 合入 `main`（`0b4425e6c..df481023b`），再从 main 出包——`latest` 单调前进。
+
+| 项 | 值 |
+| --- | --- |
+| main 上的 commit | `8be56f218`（代码）+ `df481023b`（文档） |
+| 镜像 | `arm64-a100-20261119-0635-df481023`，digest `sha256:154787d4…`，alias `arm64-a100-latest` |
+| CI | run [44473208445](https://github.com/reputationly/vllm-omni/actions/runs/44473208445)，20 min 成功 |
+| 上一步的氪版（作废） | `arm64-a100-20261119-0355-7ebda7f7` / `7ebda7f7a`（基于 `2fae9a2e`，**未**用于现网，`latest` 也没经过它） |
+
+### 6.2 NFS 分发（脚本在 `dist/`）
+
+```bash
+# ① 在有镜像的机器上落盘（/nfs-models/images/）
+./image-dist/bake_image_to_nfs.sh                     # 默认 crpi-…/vllm-omni:arm64-a100-latest
+# 产物: vllm-omni-arm64-a100-latest-154787d46865.tar（16 G）+ .sha256 + .manifest
+
+# ② 各 selector 机器载入并**覆盖本地同名 tag**（关键：本地 latest 原本是 4cce9e73）
+./image-dist/load_image_from_nfs.sh <tar> <期望 image_id>
+```
+
+实测：20 台 selector（fl2va 0021–0030、ref2va 0031–0032…0040）在 15:09–15:19 以并发 5 全部载入，`arm64-a100-latest` 由 `4cce9e73` 变成 `154787d4`，20/20 校验通过。
+
+> **这一步不是可选的**：滚动前 20 台本地 `arm64-a100-latest` 全是 `4cce9e73`（旧包）。不覆盖本地 tag 就删实例，容器会直接用本地旧镜像起来，镜像看起来升了、其实没升。
+
+### 6.3 删实例重建（先 ref2va，后 fl2va）
+
+| 步骤 | 时间 | 结果 |
+| --- | --- | --- |
+| DELETE `/v2/model-instances/{id}` × 7（ref2va） | 15:25 | 全部 200 |
+| ref2va 重建 | 15:26 → 15:35 | STARTING×7 → RUNNING 7/7（**~9 min**） |
+| DELETE × 7（fl2va） | 15:37 | 全部 200 |
+| fl2va 重建 | 15:38 → 15:46 | RUNNING 7/7（**~8 min**） |
+
+重建后实例名/端口都变了（例：`minimax-h3-ref2va-1p30g` @ 10.0.0.148:40059，`minimax-h3-fl2va-resv8` @ 10.0.0.84:40060）；GPUStack 模型路由按名字匹配，客户端无需改。
+
+### 6.4 现网验收（直接打新副本，不经网关）
+
+| 检查 | ref2va | fl2va |
+| --- | --- | --- |
+| 容器镜像 | `sha256:154787d4…` ✅ | `sha256:154787d4…` ✅ |
+| 启动日志契约 | `output_duration_seconds': [1.0, 20.0]` ✅ | 同左 ✅ |
+| `seconds=21` | failed `must be in [1, 20] seconds, got 21.0` ✅ | 同左 ✅ |
+| `seconds=1` | completed，39 帧 / **1.625 s**（111.6 s，含冷启动） | completed，39 帧 / **1.625 s**（123.8 s） |
+| `seconds=20` | completed，481 帧 / **20.0417 s**，453 s，峰值 **29.07 GiB/卡** | 包级验收已测（437 s / 481 帧），未重复压现网 |
+
+### 6.5 遗留（需要知道的两件事）
+
+1. **`latest` 现在就是这版**。其它 vLLMOmni 模型（audiox、indextts、qwen3-tts…）仍在旧 digest 的容器里跑，但**它们下次重建就会换到这个镜像**。因为它是 main 的快照（含 11-17 的计费 commit），不是回退，属预期行为。
+2. **旧的两版只能靠不可变 tag 找回**：`arm64-a100-20261117-0116-0b4425e6`（原 latest）、`arm64-a100-20261116-1525-2fae9a2e`（现网原先在跑的 `6881675a`）。浮 tag 不再指向它们。

@@ -29,7 +29,7 @@ models: 20 个 vLLMOmni 模型，models.image_name 全为 NULL                  
 | `arm64-a100-latest` 现在指向 | digest `4cce9e73…` = tag `arm64-a100-20261117-0116-0b4425e6`（commit `0b4425e6`） |
 | 本次新包 | `arm64-a100-20261119-0355-7ebda7f7`（别名 `arm64-a100-h3dur-1-20`），digest `sha256:14d0da31…`，commit `7ebda7f7a`，基座 `vllm/vllm-openai:v0.33.0@sha256:d825baf9…` |
 
-> **两个必须先知道的结论**
+> **两个必须先知道的结论**（第 1 条已于 2026-11-19 15:00 处理：`latest` 现在就是 main 构建 `154787d4`，滚动过程见 §8）
 > 1. **`latest` 已经比现网跑的版本新**。现在随便删掉一个实例，它重建时拿到的是 `4cce9e73`，不是当前的 `6881675a`。所以"回滚"不能靠把浮 tag 当默认值，必须显式钉不可变 tag。
 > 2. **部署档（`--deploy-config`）是烘进镜像的**，改一行参数也要重出包（`bench/prod-baseline-20261114/HANDOVER.md` §2 的老结论，仍成立）。
 
@@ -39,7 +39,9 @@ models: 20 个 vLLMOmni 模型，models.image_name 全为 NULL                  
    → 用「模型级 image_name 覆盖」上线后，**任何一次后续编辑（哪怕只改副本数）都会让它回落到浮动 tag**。
 2. **删除实例 = 重建换镜像**，`DELETE /v2/model-instances/{id}` 后就地按当前 model 配置重建（副本数不变）。想停服务用 `Stop`（= 缩到 0 副本）。
 
-## 4. 推荐路径 A：新增 backend 版本 + 两个模型切版本（只影响选它的模型）
+## 4. 备选路径 A：新增 backend 版本 + 两个模型切版本（只影响选它的模型）
+
+> 本次**没有**走这条，实际走的是 §8 的「推进 latest + NFS 预载 + 删实例」。保留备查：只想给两个模型换镜像、不让其它模型受影响时用这条。
 
 ### 4.1 UI 操作
 
@@ -120,3 +122,41 @@ ssh gpuNN 'docker logs <实例名>-run-0 2>&1 | grep "MiniMax-H3 contract" | hea
 - **只改模型级 `image_name`**（HANDOVER 曾推荐）：一行 `PUT /v2/models/149 {"image_name":"…"}` 即可，但会踩 §3 的坑 1，后续任何编辑都会静默失效。
 - **全局换 `1.0.0` 的 image**：20 个 vLLMOmni 模型下次重建一起换代，TTS/音频类风险未知，不做。
 - **`upgrade/cluster.md` 的流程**：那是升 GPUStack server/worker 自身版本，与本次模型镜像无关。
+
+## 8. 本次实际执行路径（2026-11-19 15:00–15:50，已完成）
+
+选择的是「推进浮动 tag」而不是「新增 backend 版本」，因此**前置条件**是：新镜像必须基于 main 出包（否则等于回退 main 上的 `0b4425e6c`）。
+
+```bash
+# 1) 改动合入主干并在 main 出包（dest_tag=arm64-a100-latest）
+git -C vllm-omni push origin HEAD:main          # 0b4425e6c..df481023b，fast-forward
+gh workflow run build-arm64.yml --repo reputationly/vllm-omni --ref main -f dest_tag=arm64-a100-latest
+#   → arm64-a100-20261119-0635-df481023 / digest sha256:154787d4…  （20 min）
+
+# 2) 落 NFS（在任一有镜像的机器上）
+./image-dist/bake_image_to_nfs.sh
+#   → /nfs-models/images/vllm-omni-arm64-a100-latest-154787d46865.tar (16 G) + .sha256 + .manifest
+
+# 3) 预载到所有可能承载实例的 worker，并覆盖本地同名 tag
+for h in gpu21 gpu22 … gpu40; do
+  ssh $h bash /nfs-models/images/_h3dist/load_image_from_nfs.sh \
+      /nfs-models/images/vllm-omni-arm64-a100-latest-154787d46865.tar 154787d46865
+done   # 20/20 OK
+
+# 4) 删实例触发重建（先 ref2va 后 fl2va）
+curl -s -H "$H" $U/models/151/instances | python3 -c '…' | xargs -I{} curl -s -X DELETE -H "$H" $U/model-instances/{}
+#   ref2va 7/7 RUNNING ~9 min；fl2va 7/7 RUNNING ~8 min
+```
+
+**最重要的一条**：`docker load`/本地 tag 覆盖不可省。滚动前 20 台 worker 的 `arm64-a100-latest` 全是旧包 `4cce9e73`，Docker 创建容器时直接用本地 tag——不覆盖就会"镜像看起来升级了、容器还是旧的"。
+
+验收结果与完整时间线见 `SUMMARY.md` §6。
+
+## 9. 本次之后的镜像坐标
+
+| 用途 | 引用 |
+| --- | --- |
+| 现网在跑（= 浮动 `arm64-a100-latest`） | `arm64-a100-20261119-0635-df481023` / `sha256:154787d4…` |
+| 上一版 latest（原 4cce9e73） | `arm64-a100-20261117-0116-0b4425e6` |
+| 滚动前现网在跑的（6881675a） | `arm64-a100-20261116-1525-2fae9a2e` |
+| 本次作废的中间包（基于 2fae9a2e，未上现网） | `arm64-a100-20261119-0355-7ebda7f7` |
