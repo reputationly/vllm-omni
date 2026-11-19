@@ -261,6 +261,14 @@ class MiniMaxH3InferenceStrategy:
           and generating 0.083 s more than asked is not a contract violation any
           caller can observe as one. Form parity is about what the model does
           with the input, not about refusing inputs the model handles fine.
+
+        ``requested_frames`` (the legacy and production mode) checks what the
+        caller asked for and then aligns, so the low end is the lattice cell's
+        floor rather than its ceiling: at the production floor of 1 s, 24
+        requested frames align up to 39, i.e. a 1 s request returns 1.625 s. That
+        was accepted deliberately on 2026-11-19 — the alternative is a floor of
+        22 frames (0.917 s), which is not something a caller can ask for in whole
+        seconds and would silently *shorten* every 1 s request.
         """
         min_seconds, max_seconds = self.output_duration_seconds
         low = int(math.ceil(min_seconds * fps))
@@ -304,7 +312,19 @@ class MiniMaxH3InferenceStrategy:
 
 
 def legacy_strategy(admission_policy: str = MINIMAX_H3_ADMISSION_PRODUCTION) -> MiniMaxH3InferenceStrategy:
-    """Exactly what production runs today. Changing any value here is a regression."""
+    """Exactly what production runs today. Changing any value here is a regression.
+
+    One value has been changed on purpose, and only one: the duration window,
+    widened from ``(2.0, 16.0)`` to ``(1.0, 20.0)`` on 2026-11-19 at the
+    product's request. Nothing about the model's semantics moves with it — the
+    window is an admission bound, not a generation parameter — and the four
+    gates that decide it (this one, the encoder-side floor and standard ceiling
+    in ``model_executor/models/minimax_h3``, and the alignment in
+    ``_resolve_shape``) were moved together so no gate keeps answering for a
+    window the others no longer enforce. See
+    ``bench/h3-duration-window-20261119/SUMMARY.md`` for the measurement that
+    admits 20 s on 4x A100-40G.
+    """
     return MiniMaxH3InferenceStrategy(
         name=MINIMAX_H3_CONTRACT_LEGACY,
         rng_mode=MINIMAX_H3_RNG_LEGACY,
@@ -318,7 +338,7 @@ def legacy_strategy(admission_policy: str = MINIMAX_H3_ADMISSION_PRODUCTION) -> 
         reference_audio_resample_mode="legacy_double_resample",
         reference_audio_target_truncation=False,
         default_num_frames_by_task=dict(MINIMAX_H3_LEGACY_DEFAULT_NUM_FRAMES),
-        output_duration_seconds=(2.0, 16.0),
+        output_duration_seconds=(1.0, 20.0),
         duration_validation_mode=MINIMAX_H3_DURATION_REQUESTED,
         reference_image_aspect_ratio_range=(0.4, 2.5),
         admission_policy=admission_policy,

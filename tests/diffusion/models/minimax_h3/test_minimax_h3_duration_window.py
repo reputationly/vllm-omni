@@ -23,8 +23,9 @@ differently on 2026-08-18:
   0.083 s of extra video is not something a caller can observe as a contract
   violation. Being a superset by exactly one alignment step is the point.
 
-Legacy is not touched by any of this and its admissible set must stay
-bit-identical — it is what production runs.
+Legacy is what production runs, and its window was widened deliberately on
+2026-11-19 (``(2, 16)`` -> ``(1, 20)`` seconds) at the product's request; nothing
+else about its admissible set moved.
 """
 
 from __future__ import annotations
@@ -66,11 +67,18 @@ def _frames(contract: str, **request) -> int:
 # ------------------------------------------------------------------ the window
 
 
-def test_legacy_admits_exactly_what_it_admitted_before():
-    """2 s to 16 s at 24 fps, on the requested count. Production's envelope."""
+def test_legacy_admits_one_to_twenty_seconds():
+    """1 s to 20 s at 24 fps, on the requested count. Production's envelope.
+
+    2026-11-19: widened from ``(2, 16)`` at the product's request, after
+    measuring 20 s (481 frames) on the deployed Pika BF16 partitions —
+    437-458 s wall and 28.3-29.1 GiB/card, i.e. ~11 GiB of headroom on a 40 G
+    card. The encoder-side floor and standard ceiling moved with it; the
+    end-to-end run is recorded in ``bench/h3-duration-window-20261119/``.
+    """
     from vllm_omni.diffusion.models.minimax_h3.strategy import legacy_strategy
 
-    assert legacy_strategy().requested_frame_window(FPS) == (48, 384)
+    assert legacy_strategy().requested_frame_window(FPS) == (24, 480)
 
 
 def test_official_widens_at_the_bottom_and_by_one_step_at_the_top():
@@ -137,31 +145,32 @@ def test_official_still_refuses_outside_the_window(requested):
         _frames("official_diffusers_v1", num_frames=requested)
 
 
-# ------------------------------------------------------------- legacy unchanged
+# ------------------------------------------------------ legacy's widened window
 
 
 @pytest.mark.parametrize(
     ("requested", "expected"),
     [
+        (24, 39),  # the new floor: 1 s asks for 24 frames and generates 1.625 s
         (48, 56),
         (124, 124),
         (209, 209),
         (360, 362),
-        (384, 396),
+        (384, 396),  # the old ceiling still resolves as it always did
+        (480, 481),  # the new ceiling: 20 s asks for 480 and generates 20.042 s
     ],
 )
-def test_legacy_resolves_what_it_always_did(requested, expected):
+def test_legacy_resolves_across_the_widened_window(requested, expected):
     assert _frames("legacy", num_frames=requested) == expected
 
 
-@pytest.mark.parametrize("requested", [47, 385])
-def test_legacy_rejects_what_it_always_did(requested):
-    """Both ends unchanged: 47 frames and 385 frames were errors and stay errors.
+@pytest.mark.parametrize("requested", [23, 481])
+def test_legacy_rejects_exactly_outside_the_widened_window(requested):
+    """Only the two ends moved: 47 frames and 385 frames are now inside it.
 
-    Note 384 resolves to 396 frames — legacy has always generated past its own
-    ceiling, because it too aligned after checking. That is not fixed here: the
-    check moved only under the official contract, since moving it under legacy
-    would change what a live gateway is allowed to submit.
+    Note 480 resolves to 481 frames — legacy still generates past its own
+    ceiling by up to one alignment step, because it aligns after checking. That
+    is unchanged: the window moved, the ordering did not.
     """
     from vllm_omni.errors import OmniClientError
 
@@ -169,14 +178,14 @@ def test_legacy_rejects_what_it_always_did(requested):
         _frames("legacy", num_frames=requested)
 
 
-def test_the_legacy_rejection_message_is_untouched():
+def test_the_legacy_rejection_message_reports_the_widened_window():
     """Pinned verbatim elsewhere (``test_client_error_across_worker``): the facade
     forwards this string to callers, so its bounds and its rounding are contract."""
     from vllm_omni.errors import OmniClientError
 
     with pytest.raises(OmniClientError) as excinfo:
         _frames("legacy", duration=29.958)
-    assert str(excinfo.value) == "MiniMax H3 output duration must be in [2, 16] seconds, got 29.958"
+    assert str(excinfo.value) == "MiniMax H3 output duration must be in [1, 20] seconds, got 29.958"
 
 
 # ------------------------------------------------------- one window, two checks

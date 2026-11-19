@@ -7,6 +7,14 @@ from typing import Any
 
 from vllm_omni.errors import OmniClientError
 
+# The ceiling for an ordinary request, i.e. one that did not ask for
+# ``long_video``. It is the product's duration limit, not a model limit: the
+# released workflow emits 5..15 s and the released checkpoint has been measured
+# at 0..15 s, but 4x A100-40G serves 20 s (481 frames) at 28-29 GiB/card with
+# ~11 GiB headroom per card, so 20 s is what this deployment admits
+# (2026-11-19, measured on the Pika BF16 partitions at 1344x768:
+# 437-458 s wall, denoise 393-407 s, peak 28.3-29.1 GiB/card).
+MINIMAX_H3_MAX_STANDARD_SECONDS = 20.0
 MINIMAX_H3_MAX_FULL_SECONDS = 30.0
 MINIMAX_H3_MAX_CONTINUATION_SECONDS = 300.0
 
@@ -26,7 +34,7 @@ def resolve_long_video_mode(extra: Mapping[str, Any], task: str) -> str:
 def max_output_seconds(extra: Mapping[str, Any], task: str) -> float:
     mode = resolve_long_video_mode(extra, task)
     if not extra.get("long_video", False):
-        return 15.0
+        return MINIMAX_H3_MAX_STANDARD_SECONDS
     return MINIMAX_H3_MAX_CONTINUATION_SECONDS if mode == "continuation" else MINIMAX_H3_MAX_FULL_SECONDS
 
 
