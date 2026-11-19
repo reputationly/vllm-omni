@@ -196,8 +196,9 @@ def test_model_level_validation_follows_the_contract():
     legacy = resolve_strategy(inference_contract="legacy", admission_policy=None, environ={})
     official = resolve_strategy(inference_contract="official_diffusers_v1", admission_policy=None, environ={})
 
-    # The oracle generates 5..15 s; vLLM's entry widened that to 2..16.
-    assert legacy.output_duration_seconds == (2.0, 16.0)
+    # The oracle generates 5..15 s; vLLM's entry widened that to 2..16, and the
+    # product widened it again to 1..20 on 2026-11-19.
+    assert legacy.output_duration_seconds == (1.0, 20.0)
     assert official.output_duration_seconds == (5.0, 15.0)
     # The oracle accepts 1:4..4:1; vLLM's entry narrowed it to 0.4..2.5.
     assert legacy.reference_image_aspect_ratio_range == (0.4, 2.5)

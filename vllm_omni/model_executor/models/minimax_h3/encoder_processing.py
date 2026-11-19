@@ -43,7 +43,11 @@ from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
     resolve_continuation_request,
     window_frame_index,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    MINIMAX_H3_MAX_STANDARD_SECONDS,
+    max_output_seconds,
+    resolve_long_video_mode,
+)
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     MINIMAX_H3_OUTPUT_SHORT_EDGE,
     load_minimax_h3_images,
@@ -74,8 +78,12 @@ MINIMAX_H3_FPS = 24
 # The audio VAE's rate; standalone references are normalized onto it exactly
 # like a reference video's soundtrack.
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
-MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
-MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_MIN_OUTPUT_SECONDS = 1.0
+# Kept as an alias of the one ceiling that actually decides admission. This
+# constant used to carry its own literal (15.0) and nothing read it, so an
+# operator changing it changed nothing while the real limit sat in
+# ``long_video.max_output_seconds``.
+MINIMAX_H3_MAX_OUTPUT_SECONDS = MINIMAX_H3_MAX_STANDARD_SECONDS
 
 
 def _items(value: Any) -> list[Any]:
@@ -222,7 +230,10 @@ def resolve_minimax_h3_shape(
         raise OmniClientError("MiniMax H3 extra_args['target'] must be an object")
     target = target if isinstance(target, Mapping) else {}
     max_seconds = max_output_seconds(extra, task)
-    duration_range = f"in [4, {max_seconds:g}] seconds"
+    # Rendered from the constant, not retyped: the floor used to be a hardcoded
+    # "4" in this f-string while the check read ``MINIMAX_H3_MIN_OUTPUT_SECONDS``,
+    # so a widened window still rejected callers with "[4, ...]" in the message.
+    duration_range = f"in [{MINIMAX_H3_MIN_OUTPUT_SECONDS:g}, {max_seconds:g}] seconds"
     duration = target.get("duration_seconds", extra.get("duration_seconds", extra.get("duration")))
     if duration is not None:
         if isinstance(duration, bool):
