@@ -142,3 +142,35 @@ long_video.py          非 long_video 上界 return 15.0        -> 20.0
 上线方式：改完需要重建镜像（现网是 pinned digest `6881675a`，只改 GPUStack 的 env/参数不生效）。**不需要**重启现网其它模型；4 处闸门的改动对 <15 s 的请求行为零影响（窗口只是放宽），可以灰度一台 worker 先验证再全量。
 
 若短期不想重建镜像，唯一不改代码的折中是请求里传 `extra_params.long_video: true`（上界变 30 s，但下界仍 4 s，且会走 VDN/continuation 分支——pika BF16 配置没有 VDN，不推荐）。
+
+---
+
+## 5. 落地：出包与镜像验收（2026-11-19）
+
+改动已提交并出包（分支 `feat/h3-duration-window-1-20`）：
+
+| 项 | 值 |
+| --- | --- |
+| 改动 commit | `7ebda7f7a`（基于现网所在 commit `2fae9a2e`，只带这一个改动） |
+| 不可变 tag | `arm64-a100-20261119-0355-7ebda7f7` |
+| 别名 tag | `arm64-a100-h3dur-1-20`（**没有**挪动 `arm64-a100-latest`） |
+| digest | `sha256:14d0da31969a9467a3813cd7a38897d23dc540513186f8f70ce02715bea8087c` |
+| 基座 | `vllm/vllm-openai:v0.33.0@sha256:d825baf9…`（必须传 pinned digest，传浮动 tag 会被 `tools/prepare_ci_telemetry.py` 拦下） |
+| CI run | https://github.com/reputationly/vllm-omni/actions/runs/44454689265 （22 min，成功） |
+
+**单元测试**（在生产镜像 `6881675a` 里、用改动后的源码跑）：`test_minimax_h3_duration_window` /
+`test_minimax_h3_long_video_limits` / `test_minimax_h3_strategy` / `test_client_error_across_worker` → **98 passed**。
+
+**包级验收**（gpu42，直接拉新镜像、**不打任何补丁**、跑现网 pika ref2va 部署档）：
+
+| 项 | 结果 |
+| --- | --- |
+| 镜像 digest 自证 | `sha256:14d0da31…`（与 release 一致） |
+| 镜像内常量 | min `1.0`、`MINIMAX_H3_MAX_STANDARD_SECONDS = 20.0`、legacy 窗口 `(1.0, 20.0)`、文案由常量渲染 ✅ |
+| `seconds=21` | failed：`must be in [1, 20] seconds, got 21.0` ✅（文案已不再是 `[4, 20]`） |
+| `seconds=1` | completed，39 帧 / **1.625 s**，wall 100 s（含冷启动编译） |
+| `seconds=20` | completed，481 帧 / **20.0417 s**，wall 458 s，denoise 410 s，峰值 **29.07 GiB/卡** |
+
+原始记录：`raw/acc_shipped_image.log`。
+
+GPUStack 侧怎么换成这个镜像（推荐路径、两个源码级坑、回滚陷阱、停机窗口）见 [UPGRADE.md](UPGRADE.md)。
