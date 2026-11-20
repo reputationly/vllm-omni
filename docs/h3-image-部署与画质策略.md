@@ -77,7 +77,7 @@
 
 ### 3.4 实测：显存模型（守护依据）
 
-```
+```text
 峰值/卡 ≈ 28.3 GiB（4×TP4 常驻）+ 2.9 GiB（激活地板）
         + 0.19 GiB × 参考 Mpx
         + 0.8 GiB（参考数 > 8）
@@ -147,11 +147,56 @@ vllm serve <path>/MiniMax-H3-Image --omni --port 40042 \
 ## 6. 画质与 prompt
 
 - 官方最佳在 **~16 MP**：追求画质就请求 4K 档（4096² / 4736×3552 / 5472×3072 / 6272×2688），不要用小尺寸再让它缩；
-- **不做 prompt 扩写**是本仓与官方 API 最大的画质差距：官方 API 默认扩写（编辑恒定），本地需自带扩写（`MiniMax-H3-Image-PE` 模型或 `h3-image-prompt-writing` skill）；
+- **不做 prompt 扩写**是本仓与官方 API 最大的画质差距：官方 API 默认扩写（编辑恒定）；本地可在生成或编辑前使用 Context-IR CLI、`MiniMax-H3-Image-PE` 模型或 `h3-image-prompt-writing` skill；
 - 官方 prompt 规范（`skills/h3-image-prompt-writing/references/edit-en.txt`）：一段英文，顺序为
   **源定义 → 目标概述与逐 Subject 关系 → 改动细节**；用 `<Picture N>`/`<Subject N>`，关系句必须显式
   （`Exactly <Subject N> is fully preserved.` / 部分保留 / 属性迁移 / 弱参考）；要显示的文字逐字引用并给位置；
   不要文字时写 `no text, letters or numbers in the image`；网格写 "2 rows and 3 columns" 而非 "2×3"。
+
+### 本地 Context-IR 增强
+
+`tools/minimax_h3/context_ir.py` 可在调用本地 H3-Image 前使用 OpenAI 兼容的对话接口完成提示词增强、规范校验和最多两次校验重修。它不自动接入服务端请求；使用者应将输出的 `revised_prompt` 和 `aspect_ratio` 用于后续图像请求。官方 PE 提示词受 MiniMax community license 限制，仓库不包含提示词原文；运行前从 Hugging Face 下载到本地：
+
+```bash
+huggingface-cli download MiniMaxAI/MiniMax-H3-Image-PE --include 'prompt/*'
+export OPENAI_BASE_URL=https://maas.ovaijisuan.com/v1
+export OPENAI_API_KEY=<your-api-key>
+python tools/minimax_h3/context_ir.py \
+  --model qwen3.8-flash-fp8 \
+  --pe-dir ~/.cache/huggingface/hub/<downloaded-model-snapshot> \
+  --image /path/to/reference.png \
+  --prompt '把标题改成“秋季上新”，其它不变'
+```
+
+T2I 请求不传 `--image`；多个参考图可重复传入 `--image`。默认自动选择宽高比并最多重修两次。`--reasoning-effort` 可覆盖模型档位；未知模型默认使用 `low`。
+
+| MaaS 模型 | Edit reasoning effort | T2I reasoning effort | 建议 |
+| --- | --- | --- | --- |
+| `qwen3.8-flash-fp8` | `none` | `low` | Edit 首选 |
+| `deepseek-v4-1-flash` | `none` | `none` | Edit 备选；T2I 响应较快 |
+| `glm-5.3-flash-w4a8` | `low` | `low` | 通用备选 |
+| `minimax-m3.1-flash` | `low` | `low` | 通用备选，Edit 延迟较高 |
+
+#### 本地策略评测
+
+S3 为 edit 合规附录加校验重修（最多两次）；T2I appendix 为 T2I 合规附录加校验重修（最多两次）。下表为本地提示词策略实验结果：Edit 使用 16 个用例，T2I 使用 6 个用例；`合规`为规范校验通过数量，`文本召回`为源图文字召回率，`必需文字`为 T2I 请求指定文字的召回数量。不同模型及 reasoning effort 的结果不可直接视为服务端性能保证。
+
+| Edit 策略 / 模型 | Effort | 合规 | 文本召回 | 平均 Subject 数 | p50 |
+| --- | --- | --- | --- | --- | --- |
+| S3 `qwen3.8-flash-fp8` | `none` | 16/16 | 1.00 | 7.1 | 10.4 s |
+| S3 `deepseek-v4-1-flash` | `none` | 15/16 | 1.00 | — | 12.5 s |
+| S3 `glm-5.3-flash-w4a8` | `low` | 16/16 | 0.99 | — | 19.3 s |
+| S3 `minimax-m3.1-flash` | `low` | 16/16 | 0.98 | — | 80 s |
+| S3 `minimax-m3.1-flash` | `minimal` | — | — | — | 67 s |
+| S3 `qwen3.8-flash-fp8` | `low` | 16/16 | 0.98 | — | 26.8 s |
+
+| T2I 策略 / 模型 | Effort | 合规 | 必需文字 | 平均输出字符数 | p50 |
+| --- | --- | --- | --- | --- | --- |
+| T2I appendix `qwen3.8-flash-fp8` | `low` | 6/6 | 6/6 | 1,646 | 17.0 s |
+| T2I appendix `deepseek-v4-1-flash` | `none` | 6/6 | 6/6 | 1,377 | 8.5 s |
+| T2I appendix `glm-5.3-flash-w4a8` | `low` | 6/6 | 6/6 | 1,125 | 10.8 s |
+| T2I appendix `minimax-m3.1-flash` | `low` | 6/6 | 6/6 | 1,578 | 22.5 s |
+| T2I appendix `qwen3.8-flash-fp8` | `none` | 6/6 | 6/6 | 1,194 | 9.4 s |
 
 ---
 
