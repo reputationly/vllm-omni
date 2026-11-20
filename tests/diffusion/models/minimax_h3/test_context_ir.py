@@ -185,6 +185,15 @@ def test_official_edit_revised_prompt_examples_pass_the_spec():
         )
 
 
+def test_check_edit_caption_does_not_split_single_quoted_periods():
+    caption = (
+        "The sign reading 'Hello. Welcome' in <Picture 1> is <Subject 1>. "
+        "The target image shows the sign. <Subject 1> is fully preserved."
+    )
+
+    assert check_edit_caption(caption, "1:1", 1) == []
+
+
 @pytest.mark.parametrize(
     ("caption", "ratio", "n_pictures", "user_ratio", "expected_issue"),
     [

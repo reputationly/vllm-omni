@@ -60,6 +60,7 @@ SUBJECT_PATTERN = re.compile(r"<Subject (\d+)>")
 PICTURE_PATTERN = re.compile(r"<Picture (\d+)>")
 CJK_PATTERN = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z<'\"(])")
+SINGLE_QUOTED_LITERAL = re.compile(r"(?<![A-Za-z0-9])'[^']*'(?![A-Za-z])")
 
 MODEL_PROFILES: dict[str, dict[str, str]] = {
     "qwen3.8-flash-fp8": {"edit": "none", "t2i": "low"},
@@ -233,11 +234,23 @@ def parse_json_object(content: object, keys: Sequence[str]) -> tuple[dict[str, o
 
 
 def _unquoted(text: str) -> str:
-    return re.sub(r"(?<![A-Za-z0-9])'[^']*'(?![A-Za-z])", "''", text)
+    return SINGLE_QUOTED_LITERAL.sub("''", text)
 
 
 def _split_sentences(text: str) -> list[str]:
-    return [sentence.strip() for sentence in SENTENCE_BOUNDARY.split(text) if sentence.strip()]
+    masked = list(text)
+    for match in SINGLE_QUOTED_LITERAL.finditer(text):
+        for index in range(match.start(), match.end()):
+            if masked[index] in ".!?":
+                masked[index] = "_"
+    masked_text = "".join(masked)
+    sentences: list[str] = []
+    start = 0
+    for boundary in SENTENCE_BOUNDARY.finditer(masked_text):
+        sentences.append(text[start : boundary.start()].strip())
+        start = boundary.end()
+    sentences.append(text[start:].strip())
+    return [sentence for sentence in sentences if sentence]
 
 
 def check_edit_caption(caption: object, ratio: object, n_pictures: int, user_ratio: str = "adaptive") -> list[str]:
