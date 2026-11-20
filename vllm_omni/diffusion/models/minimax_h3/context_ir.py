@@ -328,9 +328,12 @@ def check_edit_caption(caption: object, ratio: object, n_pictures: int, user_rat
 def check_t2i(content: object, allowed_ratios: Sequence[str]) -> list[str]:
     """Return issue codes for a text-to-image response."""
     parsed, issues = parse_json_object(content, ("expanded_caption", "aspect_ratio"))
-    if parsed is None or not isinstance(parsed.get("expanded_caption"), str):
+    if parsed is None or not all(key in parsed for key in ("expanded_caption", "aspect_ratio")):
         return issues
     caption = parsed["expanded_caption"]
+    if not isinstance(caption, str) or not caption.strip():
+        issues.append("empty_caption")
+        return issues
     if parsed.get("aspect_ratio") not in allowed_ratios:
         issues.append("ratio_enum")
     if "\n" in caption.strip():
@@ -359,6 +362,7 @@ def describe_issues(codes: Sequence[str]) -> list[str]:
         "undefined_subject": "a <Subject N> is used without being defined",
         "multiple_relationships": "a Subject receives more than one relationship",
         "merged_fully_preserved": "several Subjects share one fully-preserved clause",
+        "empty_caption": "expanded_caption must be a non-empty string",
         "line_breaks": "expanded_caption contains line breaks",
         "keys": "the object must have exactly expanded_caption and target_aspect_ratio",
         "not_pure_json": "the answer is not a bare JSON object",

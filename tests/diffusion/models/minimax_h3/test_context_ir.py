@@ -277,6 +277,14 @@ def test_check_t2i_checks_ratio_english_newlines_and_exact_keys():
     )
 
 
+@pytest.mark.parametrize("caption", [None, ""])
+def test_check_t2i_rejects_empty_caption(caption):
+    content = json.dumps({"expanded_caption": caption, "aspect_ratio": "1:1"})
+
+    assert check_t2i(content, T2I_RATIOS) == ["empty_caption"]
+    assert describe_issues(["empty_caption"]) == ["expanded_caption must be a non-empty string"]
+
+
 def test_parse_json_object_recovers_fenced_object_and_describes_issues():
     parsed, issues = parse_json_object('```json\n{"a": 1}\n```', ("a",))
 
@@ -323,6 +331,22 @@ def test_enhance_repairs_t2i_response_and_passes_request_parameters(tmp_path):
     repair_message = second_messages[-1]["content"]
     assert isinstance(repair_message, str)
     assert "non_english_prose" in repair_message
+
+
+def test_enhance_repairs_empty_t2i_caption(tmp_path):
+    prompts = _write_fake_prompts(tmp_path / "model")
+    chat = FakeChat(
+        json.dumps({"expanded_caption": None, "aspect_ratio": "1:1"}),
+        json.dumps({"expanded_caption": "The image is a red roof.", "aspect_ratio": "1:1"}),
+    )
+
+    result = enhance(chat, model="qwen3.8-flash-fp8", prompts=prompts, prompt="a red roof")
+
+    assert result["issues"] == []
+    assert result["attempts"] == 2
+    repair_message = chat.calls[1][0][-1]["content"]
+    assert isinstance(repair_message, str)
+    assert "empty_caption" in repair_message
 
 
 def test_enhance_retries_empty_content_and_returns_user_selected_edit_ratio(tmp_path):
