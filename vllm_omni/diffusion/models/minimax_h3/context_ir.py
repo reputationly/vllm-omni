@@ -111,10 +111,10 @@ def load_pe_prompts(pe_dir: str | Path) -> PEPrompts:
     )
 
 
-def reference_media(image: str | Path | bytes | Image.Image) -> tuple[str, str]:
+def reference_media(image: str | Path | bytes | Image.Image) -> tuple[str, str | None]:
     """Return a media URI and reduced EXIF-corrected source aspect ratio."""
     if isinstance(image, str) and image.startswith(("data:", "http://", "https://")):
-        return image, "aspect_ratio unavailable"
+        return image, None
 
     if isinstance(image, Image.Image):
         source = ImageOps.exif_transpose(image).convert("RGB")
@@ -160,9 +160,10 @@ def build_edit_messages(
     ]
     for index, image in enumerate(images, 1):
         uri, ratio = reference_media(image)
+        ratio_label = f"aspect_ratio {ratio}" if ratio is not None else "aspect_ratio unavailable"
         content.extend(
             [
-                {"type": "text", "text": f"Reference Media:\n- <Picture {index}> [aspect_ratio {ratio}]"},
+                {"type": "text", "text": f"Reference Media:\n- <Picture {index}> [{ratio_label}]"},
                 {"type": "image_url", "image_url": {"url": uri}},
             ]
         )

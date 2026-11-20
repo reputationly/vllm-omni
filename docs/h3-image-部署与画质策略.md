@@ -158,12 +158,12 @@ vllm serve <path>/MiniMax-H3-Image --omni --port 40042 \
 `tools/minimax_h3/context_ir.py` 可在调用本地 H3-Image 前使用 OpenAI 兼容的对话接口完成提示词增强、规范校验和最多两次校验重修。它不自动接入服务端请求；使用者应将输出的 `revised_prompt` 和 `aspect_ratio` 用于后续图像请求。官方 PE 提示词受 MiniMax community license 限制，仓库不包含提示词原文；运行前从 Hugging Face 下载到本地：
 
 ```bash
-huggingface-cli download MiniMaxAI/MiniMax-H3-Image-PE --include 'prompt/*'
+huggingface-cli download MiniMaxAI/MiniMax-H3-Image-PE --include 'prompt/*' --local-dir ./MiniMax-H3-Image-PE
 export OPENAI_BASE_URL=https://maas.ovaijisuan.com/v1
 export OPENAI_API_KEY=<your-api-key>
 python tools/minimax_h3/context_ir.py \
   --model qwen3.8-flash-fp8 \
-  --pe-dir ~/.cache/huggingface/hub/<downloaded-model-snapshot> \
+  --pe-dir ./MiniMax-H3-Image-PE \
   --image /path/to/reference.png \
   --prompt '把标题改成“秋季上新”，其它不变'
 ```
@@ -183,12 +183,16 @@ S3 为 edit 合规附录加校验重修（最多两次）；T2I appendix 为 T2I
 
 | Edit 策略 / 模型 | Effort | 合规 | 文本召回 | 平均 Subject 数 | p50 |
 | --- | --- | --- | --- | --- | --- |
+| 官方 Context-IR API | — | 15/16（唯一一条“不通过”是用户指定比例时 API 返回的 `aspect_ratio` 为 `null`，不算违规） | 1.00 | 4.3 | 7.0 s |
+| 官方 PE 提示词原样（四个模型） | `low` | 11–14/16 | 0.70–0.87 | 1.6–2.6 | 11.9–67.5 s |
 | S3 `qwen3.8-flash-fp8` | `none` | 16/16 | 1.00 | 7.1 | 10.4 s |
-| S3 `deepseek-v4-1-flash` | `none` | 15/16 | 1.00 | — | 12.5 s |
-| S3 `glm-5.3-flash-w4a8` | `low` | 16/16 | 0.99 | — | 19.3 s |
-| S3 `minimax-m3.1-flash` | `low` | 16/16 | 0.98 | — | 80 s |
-| S3 `minimax-m3.1-flash` | `minimal` | — | — | — | 67 s |
-| S3 `qwen3.8-flash-fp8` | `low` | 16/16 | 0.98 | — | 26.8 s |
+| S3 `deepseek-v4-1-flash` | `none` | 15/16 | 1.00 | 5.6 | 12.5 s |
+| S3 `glm-5.3-flash-w4a8` | `low` | 16/16 | 0.99 | 3.6 | 19.3 s |
+| S3 `minimax-m3.1-flash` | `low` | 16/16 | 0.98 | 5.8 | 80 s |
+| S3 `minimax-m3.1-flash` | `minimal` | 16/16 | 0.98 | 6.2 | 67 s |
+| S3 `qwen3.8-flash-fp8` | `low` | 16/16 | 0.98 | 4.9 | 26.8 s |
+
+DeepSeek `low` 做 Edit 时有 5/16 条正文为空或被截断，所以 Edit 用 `none`；不传 `reasoning_effort` 时，DeepSeek、MiniMax、GLM 都会把 8192 token 全用于思考、正文为空。以上结论只来自格式规范和文字召回两项指标，未做语义质量盲评。
 
 | T2I 策略 / 模型 | Effort | 合规 | 必需文字 | 平均输出字符数 | p50 |
 | --- | --- | --- | --- | --- | --- |

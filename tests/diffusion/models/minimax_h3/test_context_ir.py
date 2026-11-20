@@ -104,11 +104,11 @@ def test_reference_media_normalizes_exif_ratio_and_resizes_preview(tmp_path):
     assert reference_media(Image.new("RGB", (1600, 1189)))[1] == ratio
     assert reference_media("https://example.test/image.png") == (
         "https://example.test/image.png",
-        "aspect_ratio unavailable",
+        None,
     )
     assert reference_media("data:image/png;base64,abc") == (
         "data:image/png;base64,abc",
-        "aspect_ratio unavailable",
+        None,
     )
 
     for preview in (uri, rotated_uri):
@@ -144,6 +144,18 @@ def test_build_edit_messages_orders_segments_and_adds_appendix_before_apply(tmp_
         "Apply the instructions above to the supplied inputs and reference images. "
         "Output only the required two-field JSON object."
     )
+
+
+def test_build_edit_messages_preserves_http_image_without_aspect_ratio(tmp_path):
+    prompts = _write_fake_prompts(tmp_path / "model")
+    image_url = "https://example.com/a.png"
+
+    messages = build_edit_messages(prompts, "make a change", [image_url], appendix=False)
+    content = messages[0]["content"]
+
+    assert content[2]["text"] == "Reference Media:\n- <Picture 1> [aspect_ratio unavailable]"
+    assert content[3] == {"type": "image_url", "image_url": {"url": image_url}}
+    assert "aspect_ratio aspect_ratio" not in content[2]["text"]
 
 
 def test_build_t2i_messages_adds_t2i_appendix(tmp_path):
