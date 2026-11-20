@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import binascii
+import copy
 import io
 import json
 import urllib.error
@@ -182,10 +183,20 @@ def build_edit_messages(
     return [{"role": "user", "content": content}]
 
 
-def build_t2i_messages(prompts: PEPrompts, prompt: str, appendix: bool = True) -> list[dict[str, object]]:
+def build_t2i_messages(
+    prompts: PEPrompts,
+    prompt: str,
+    appendix: bool = True,
+    aspect_ratio: str | None = None,
+) -> list[dict[str, object]]:
     user_content = prompts.t2i_task.format(prompt)
     if appendix:
         user_content += f"\n\n{T2I_APPENDIX}"
+    if aspect_ratio is not None:
+        user_content += (
+            "\n\nUser Aspect Ratio Selection: "
+            f"{aspect_ratio}. Compose the image for exactly this final canvas and output it as aspect_ratio."
+        )
     return [
         {"role": "system", "content": prompts.t2i_system},
         {"role": "user", "content": user_content},
@@ -366,6 +377,7 @@ def describe_issues(codes: Sequence[str]) -> list[str]:
         "line_breaks": "expanded_caption contains line breaks",
         "keys": "the object must have exactly expanded_caption and target_aspect_ratio",
         "not_pure_json": "the answer is not a bare JSON object",
+        "ratio_enum": "aspect_ratio must be one of the allowed ratios",
         "ratio_ignores_user_selection": "target_aspect_ratio must equal the user aspect ratio selection",
         "bad_ratio": "target_aspect_ratio must be W:H with positive integers",
         "subject_numbering": "Subjects must be numbered 1, 2, 3, ... in definition order",
@@ -408,6 +420,7 @@ def _validate_response(
     edit: bool,
     image_count: int,
     user_ratio: str,
+    allowed_ratios: Sequence[str] = T2I_RATIOS,
 ) -> tuple[dict[str, object] | None, list[str]]:
     keys = ("expanded_caption", "target_aspect_ratio") if edit else ("expanded_caption", "aspect_ratio")
     parsed, issues = parse_json_object(content, keys)
@@ -420,7 +433,7 @@ def _validate_response(
             )
         )
     else:
-        issues = check_t2i(content, T2I_RATIOS)
+        issues = check_t2i(content, allowed_ratios)
     return parsed, issues
 
 
@@ -439,8 +452,12 @@ def enhance(
     edit = bool(images)
     image_inputs = images or []
     user_ratio = "adaptive" if aspect_ratio in (None, "auto") else aspect_ratio
+    t2i_aspect_ratio = aspect_ratio if not edit and aspect_ratio not in (None, "auto") else None
+    allowed = [t2i_aspect_ratio] if t2i_aspect_ratio is not None else list(T2I_RATIOS)
     messages = (
-        build_edit_messages(prompts, prompt, image_inputs, user_ratio) if edit else build_t2i_messages(prompts, prompt)
+        build_edit_messages(prompts, prompt, image_inputs, user_ratio)
+        if edit
+        else build_t2i_messages(prompts, prompt, aspect_ratio=t2i_aspect_ratio)
     )
     profile = MODEL_PROFILES.get(model, {"edit": "low", "t2i": "low"})
     effort = reasoning_effort if reasoning_effort is not None else profile["edit" if edit else "t2i"]
@@ -449,11 +466,22 @@ def enhance(
     if effort:
         params["reasoning_effort"] = effort
     if not edit:
+        response_format = copy.deepcopy(prompts.t2i_params["response_format"])
+        if isinstance(response_format, dict):
+            json_schema = response_format.get("json_schema")
+            if isinstance(json_schema, dict):
+                schema = json_schema.get("schema")
+                if isinstance(schema, dict):
+                    properties = schema.get("properties")
+                    if isinstance(properties, dict):
+                        aspect_ratio_schema = properties.get("aspect_ratio")
+                        if isinstance(aspect_ratio_schema, dict) and "enum" in aspect_ratio_schema:
+                            aspect_ratio_schema["enum"] = allowed
         params.update(
             {
                 "temperature": prompts.t2i_params["temperature"],
                 "top_p": prompts.t2i_params["top_p"],
-                "response_format": prompts.t2i_params["response_format"],
+                "response_format": response_format,
             }
         )
 
@@ -487,6 +515,7 @@ def enhance(
             edit=edit,
             image_count=len(image_inputs),
             user_ratio=user_ratio,
+            allowed_ratios=allowed,
         )
         repair_issues = issues
         if parsed is not None:

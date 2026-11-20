@@ -256,6 +256,7 @@ def test_check_t2i_checks_ratio_english_newlines_and_exact_keys():
         ensure_ascii=False,
     )
     assert check_t2i(valid, T2I_RATIOS) == []
+    assert describe_issues(["ratio_enum"]) == ["aspect_ratio must be one of the allowed ratios"]
     assert "ratio_enum" in check_t2i(
         json.dumps({"expanded_caption": "The image is a landscape.", "aspect_ratio": "16:10"}),
         T2I_RATIOS,
@@ -347,6 +348,77 @@ def test_enhance_repairs_empty_t2i_caption(tmp_path):
     repair_message = chat.calls[1][0][-1]["content"]
     assert isinstance(repair_message, str)
     assert "empty_caption" in repair_message
+
+
+def test_enhance_honors_t2i_user_selected_aspect_ratio(tmp_path):
+    prompts = _write_fake_prompts(tmp_path / "model")
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "expanded_caption": {"type": "string"},
+                    "aspect_ratio": {"type": "string", "enum": list(T2I_RATIOS)},
+                },
+            }
+        },
+    }
+    prompts.t2i_params["response_format"] = response_format
+    chat = FakeChat(
+        json.dumps({"expanded_caption": "The image is a red roof.", "aspect_ratio": "1:1"}),
+        json.dumps({"expanded_caption": "The image is a red roof.", "aspect_ratio": "16:9"}),
+    )
+
+    result = enhance(
+        chat,
+        model="qwen3.8-flash-fp8",
+        prompts=prompts,
+        prompt="a red roof",
+        aspect_ratio="16:9",
+    )
+
+    assert result == {
+        "revised_prompt": "The image is a red roof.",
+        "aspect_ratio": "16:9",
+        "issues": [],
+        "attempts": 2,
+    }
+    first_messages, params = chat.calls[0]
+    assert params["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "expanded_caption": {"type": "string"},
+                    "aspect_ratio": {"type": "string", "enum": ["16:9"]},
+                },
+            }
+        },
+    }
+    assert response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "expanded_caption": {"type": "string"},
+                    "aspect_ratio": {"type": "string", "enum": list(T2I_RATIOS)},
+                },
+            }
+        },
+    }
+    user_content = first_messages[1]["content"]
+    assert isinstance(user_content, str)
+    assert user_content.endswith(
+        "\n\nUser Aspect Ratio Selection: 16:9. "
+        "Compose the image for exactly this final canvas and output it as aspect_ratio."
+    )
+    assert chat.calls[1][0][-2] == {
+        "role": "assistant",
+        "content": json.dumps({"expanded_caption": "The image is a red roof.", "aspect_ratio": "1:1"}),
+    }
 
 
 def test_enhance_retries_empty_content_and_returns_user_selected_edit_ratio(tmp_path):
