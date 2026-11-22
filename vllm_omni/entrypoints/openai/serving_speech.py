@@ -42,6 +42,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
+from vllm_omni.entrypoints.openai.audio_output_formats import available_output_formats
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -704,6 +705,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if adapter is not None:
             adapter.load_capabilities()
             self._drop_shadowing_uploads()
+        # Probe the audio encoders once, at boot: an image whose libsndfile lacks
+        # (say) MPEG support should say so in the startup log, not fail the first
+        # mp3 request after generating the whole waveform.
+        logger.info(
+            "Audio output containers available: %s",
+            ", ".join(sorted(available_output_formats())),
+        )
         available_speakers = self._get_available_speakers()
         logger.info("Loaded %d supported speakers: %s", len(available_speakers), sorted(available_speakers))
 

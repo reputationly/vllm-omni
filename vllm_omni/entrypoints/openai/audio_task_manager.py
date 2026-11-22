@@ -42,6 +42,10 @@ def resolve_save_path(save_result_path: str, task_id: str, output_root: str, def
 
     Absolute -> used verbatim; relative -> under ``output_root``; empty ->
     ``task_id``; missing suffix -> ``default_ext`` appended.
+
+    ``default_ext`` only applies when the caller gave no suffix at all. When a
+    caller DOES pass one, it owns it — see :func:`check_save_path_matches_format`,
+    which refuses a path whose suffix contradicts ``response_format``.
     """
     raw = save_result_path or task_id
     path = Path(raw)
@@ -50,6 +54,42 @@ def resolve_save_path(save_result_path: str, task_id: str, output_root: str, def
     if not path.suffix:
         path = path.with_suffix(default_ext)
     return str(path)
+
+
+#: ``response_format`` -> the one suffix the artifact may carry.
+FORMAT_SUFFIXES: dict[str, str] = {
+    "wav": ".wav",
+    "mp3": ".mp3",
+    "flac": ".flac",
+    "opus": ".opus",
+    "pcm": ".pcm",
+}
+
+
+def check_save_path_matches_format(save_result_path: str, response_format: str | None) -> str | None:
+    """Return an error message when the artifact's name contradicts its bytes.
+
+    The facade (GPUStack) names the artifact; the engine writes the container the
+    request asked for. Both are correct on their own, and the combination is
+    corrupt: mp3 bytes in a ``.wav`` file, which every downstream hop then labels
+    ``audio/wav``. The failure is silent and expensive to trace, so it is checked
+    here — the one place where both facts are visible before any audio is written.
+
+    Returns an error for a caller to surface as 400 (fail closed: a 400 costs one
+    round trip, a mislabelled artifact costs a support ticket).
+    """
+    requested = (response_format or "").strip().lower()
+    expected = FORMAT_SUFFIXES.get(requested)
+    if expected is None:
+        return None
+    actual = Path(save_result_path).suffix.lower()
+    if not actual or actual == expected:
+        return None
+    return (
+        f"save_result_path ends with '{actual}' but response_format='{requested}' "
+        f"produces {expected} bytes; the caller naming the artifact must use "
+        f"the same container it asked the engine for"
+    )
 
 
 def visible_task_status(status: AudioTaskStatus, executing: bool | None) -> AudioTaskStatus:

@@ -183,3 +183,30 @@ def test_filled_context_is_rejected_without_mutating_sampling_defaults(adapter, 
     with pytest.raises(ValueError, match="fills the model context"):
         adapter.apply_sampling_overrides([default], request, {"prompt_token_ids": [0] * prompt_length})
     assert default.max_tokens == 20
+
+
+def test_breeze_declares_every_container_the_engine_can_encode():
+    """Breeze narrows nothing today; the declaration must say so explicitly.
+
+    The codec stage hands the response encoder 24 kHz mono float32, which every
+    container in ``SUPPORTED_AUDIO_FORMATS`` accepts. If a future change makes a
+    container unproducible for this model, this test is where the narrowing has to
+    be written down — silently inheriting "all containers" is how a model ends up
+    advertising a format it 500s on.
+    """
+    from vllm_omni.entrypoints.openai.protocol.audio import SUPPORTED_AUDIO_FORMATS
+
+    assert BreezeTTS2Adapter.supported_response_formats == SUPPORTED_AUDIO_FORMATS
+
+
+def test_breeze_adapter_itself_does_not_gate_the_container(adapter):
+    """Container gating belongs to the shared validator, not to per-model validation.
+
+    ``adapter.validate`` owns request *semantics* (task type, ref pairing, speed);
+    the container is a server capability question, answered once for every model by
+    ``tts_adapters.base.validate_tts_request`` → ``audio_output_formats.check_output_format``.
+    Keeping it out of here means a model cannot accidentally reject a container the
+    image supports.
+    """
+    assert adapter.validate(OpenAICreateSpeechRequest(input="Hello.", response_format="mp3")) is None
+    assert adapter.validate(OpenAICreateSpeechRequest(input="Hello.", response_format="flac")) is None

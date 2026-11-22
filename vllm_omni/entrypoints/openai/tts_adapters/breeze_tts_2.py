@@ -32,6 +32,12 @@ class BreezeTTS2Adapter(ARTTSAdapter):
     model_archs = frozenset({"BreezeForConditionalGeneration"})
     detect_priority = 9
     supported_output_sample_rates = frozenset({24000})
+    # The codec stage decodes to 24 kHz mono float32 and the response encoder
+    # handles every container the image can produce, so there is nothing to
+    # narrow here. Declared explicitly anyway: it is the field a future model
+    # with a container-restricted codec has to fill in, and stating it keeps this
+    # model honest about what its product surface is.
+    supported_response_formats = frozenset({"wav", "pcm", "mp3", "flac", "opus"})
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         super().__init__(ctx)

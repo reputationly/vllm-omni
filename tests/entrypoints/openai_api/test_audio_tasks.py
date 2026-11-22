@@ -11,11 +11,13 @@ Covers the pure-logic contract of the P1 async pieces — no GPU/model needed:
 """
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from vllm_omni.entrypoints.openai.audio_task_manager import (
     AudioTaskManager,
+    check_save_path_matches_format,
     resolve_save_path,
     visible_task_status,
 )
@@ -208,6 +210,60 @@ def test_resolve_save_path_appends_default_extension():
     assert resolve_save_path("/nfs/out", "task1", "/root") == "/nfs/out.wav"
     # relative without suffix -> under root + .wav
     assert resolve_save_path("out", "task1", "/root") == "/root/out.wav"
+
+
+def test_resolve_save_path_honours_a_caller_supplied_default_ext():
+    # The route derives this from response_format, so an mp3 task with no suffix
+    # must not be named ".wav" (that is the mismatch the guard below forbids).
+    assert resolve_save_path("out", "task1", "/root", ".mp3") == "/root/out.mp3"
+    assert resolve_save_path("", "task1", "/root", ".mp3") == "/root/task1.mp3"
+    # An explicit suffix always wins over the default.
+    assert resolve_save_path("out.wav", "task1", "/root", ".mp3") == "/root/out.wav"
+
+
+# --------------------------------------------------------------------------- #
+# 3b. Named-artifact vs requested-container guard.
+#
+# The facade names the artifact and the engine encodes what the request asked for.
+# Each is right alone; together "mp3 bytes in a .wav file" is corrupt, and every
+# downstream hop then labels it audio/wav. The engine is the only place that sees
+# both facts before writing bytes, so it refuses the combination.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "fmt,path",
+    [
+        ("wav", "/nfs/out.wav"),
+        ("mp3", "/nfs/out.mp3"),
+        ("flac", "/nfs/out.flac"),
+        ("opus", "/nfs/out.opus"),
+        ("pcm", "/nfs/out.pcm"),
+    ],
+)
+def test_save_path_matching_the_container_is_accepted(fmt, path):
+    assert check_save_path_matches_format(path, fmt) is None
+    assert check_save_path_matches_format(path, fmt.upper()) is None
+
+
+@pytest.mark.parametrize(
+    "fmt,path",
+    [
+        ("mp3", "/nfs/out.wav"),
+        ("wav", "/nfs/out.mp3"),
+    ],
+)
+def test_save_path_contradicting_the_container_is_refused(fmt, path):
+    error = check_save_path_matches_format(path, fmt)
+    assert error is not None
+    # The message has to name both sides: this is a cross-service contract break.
+    assert fmt in error and Path(path).suffix in error
+
+
+def test_unsuffixed_or_unknown_format_defers():
+    # No suffix at all: resolve_save_path already appended one, nothing to compare.
+    assert check_save_path_matches_format("/nfs/out", "mp3") is None
+    # Format the suffix table does not know (e.g. audiogen wav base64 path).
+    assert check_save_path_matches_format("/nfs/out.wav", "aac") is None
+    assert check_save_path_matches_format("/nfs/out.wav", None) is None
 
 
 # --------------------------------------------------------------------------- #

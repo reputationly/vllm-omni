@@ -127,6 +127,8 @@ from vllm_omni.entrypoints.openai.app_state import (
 )
 from vllm_omni.entrypoints.openai.audio_task_manager import (
     AUDIO_TASK_MANAGER,
+    FORMAT_SUFFIXES,
+    check_save_path_matches_format,
     resolve_save_path,
     visible_task_status,
 )
@@ -3797,7 +3799,22 @@ async def create_audio_task(request: AudioTaskRequest, raw_request: Request) -> 
         )
 
     task_id = request.task_id or f"audio_task_{random_uuid()}"
-    save_result_path = resolve_save_path(request.save_result_path, task_id, STORAGE_MANAGER.storage_path)
+    # A caller that gave no suffix gets one matching the container it asked for,
+    # not the historical ".wav": otherwise asking for mp3 without naming a file
+    # would trip the mismatch check below on our own default.
+    save_result_path = resolve_save_path(
+        request.save_result_path,
+        task_id,
+        STORAGE_MANAGER.storage_path,
+        FORMAT_SUFFIXES.get((request.response_format or "wav").strip().lower(), ".wav"),
+    )
+    # The caller naming the artifact (GPUStack facade) and the container the engine
+    # is about to encode must agree. A mismatch used to produce valid mp3 bytes in a
+    # ".wav" file, which every hop downstream then labelled audio/wav — silent, and
+    # only visible to the end user as "the player won't open it".
+    path_error = check_save_path_matches_format(save_result_path, request.response_format)
+    if path_error is not None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=path_error)
 
     try:
         ref = await AUDIO_TASK_MANAGER.reserve(task_id, save_result_path)

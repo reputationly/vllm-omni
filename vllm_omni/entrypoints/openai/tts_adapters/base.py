@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai.audio_output_formats import check_output_format
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
 
 logger = init_logger(__name__)
@@ -129,8 +130,20 @@ def conditioning_cache_salt(
 
 
 def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> str | None:
-    """``adapter.validate`` after the checks every adapter shares: ``ref_audio_codes``
-    only where supported, rather than silently dropped."""
+    """``adapter.validate`` after the checks every adapter shares: the requested
+    output container, then ``ref_audio_codes`` only where supported, rather than
+    silently dropped.
+
+    The container check lives here rather than in an adapter because it is a
+    *server* capability question (what this image can encode), not a per-model one:
+    a model may narrow it through ``supported_response_formats``, but no adapter can
+    talk the process into encoding a container libsndfile does not provide. Putting
+    it in the shared entrypoint also covers the batch and websocket paths, which
+    call this function directly.
+    """
+    format_error = check_output_format(request.response_format, adapter)
+    if format_error is not None:
+        return format_error
     if getattr(request, "ref_audio_codes", None) is not None and not getattr(
         adapter, "supports_reference_codes", False
     ):
@@ -280,6 +293,13 @@ class TTSModelAdapter(ABC):
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
+    #: Audio containers this model can return for a NON-streaming response.
+    #: ``None`` means "whatever the process can encode" (see
+    #: :mod:`vllm_omni.entrypoints.openai.audio_output_formats`). Declare a set
+    #: only when a model genuinely cannot produce a container the image can —
+    #: e.g. a codec stage that only emits 16-bit PCM at a rate mp3 rejects.
+    #: Streaming is separate and stays pcm/wav by protocol, not by this field.
+    supported_response_formats: ClassVar[frozenset[str] | None] = None
 
     max_new_tokens_min = 1
 

@@ -166,6 +166,43 @@ Content-Type: application/json
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
+### Output Containers
+
+`response_format` selects the container for a **non-streaming** response. The
+default is `wav`; `mp3`, `flac`, `opus` and `pcm` are available when the image can
+encode them.
+
+| Container | Availability |
+| --- | --- |
+| `wav` | Always (written by this repo, not by a codec library). |
+| `pcm` | Always. Raw 16-bit signed little-endian, no header. |
+| `mp3` | Requires `libsndfile` with MPEG support — the `soundfile` wheels from PyPI ship it; a distro `libsndfile` older than 1.1.0 does not. |
+| `flac` | Requires `libsndfile` FLAC support. |
+| `opus` | Requires `libsndfile` Ogg support (Opus inside an Ogg container). |
+
+Availability is probed once at startup and logged; the probed set is what
+`/v1/audio/speech` and `/v1/audio/speech/batch` accept. A container the image
+cannot produce is rejected **before** generation with a readable
+`response_format='...' is not available on this server; supported: ...` message,
+not a 500 after the waveform has already been decoded. Per-model narrowing is
+possible through `TTSModelAdapter.supported_response_formats`; today every model
+inherits the full set, because the response encoder — not the model — decides the
+container.
+
+For the async task API (`POST /v1/tasks/audio/`), the caller that names the
+artifact (`save_result_path`) and the container it asks for must agree: `mp3`
+bytes in a `.wav` file are rejected with a 400 rather than written, because every
+downstream hop would otherwise label them `audio/wav`.
+
+Streaming is unaffected by this table: both streaming modes are pinned to
+`pcm`/`wav` by the request model.
+
+Rollout order matters when a gateway names the artifact: upgrade the naming side
+(GPUStack `_output_ext`) **before** the engine that enforces the suffix check,
+otherwise every `response_format=mp3` task is refused with a 400 until the facade
+catches up. That refusal is deliberate — the alternative is a valid mp3 hidden
+behind a `.wav` name.
+
 ### Response Format
 
 The response shape depends on the streaming parameters:
