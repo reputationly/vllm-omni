@@ -50,9 +50,9 @@ def _update_conditioning_hash(h: hashlib._Hash, value: Any) -> None:
         h.update(repr((arr.shape, str(arr.dtype))).encode("utf-8"))
         h.update(arr.tobytes())
         return
-    if isinstance(value, (list, tuple)) and len(value) == 2 and isinstance(value[1], (int, np.integer)):
+    if isinstance(value, list | tuple) and len(value) == 2 and isinstance(value[1], int | np.integer):
         samples = value[0]
-        if isinstance(samples, (list, tuple, np.ndarray, torch.Tensor)):
+        if isinstance(samples, list | tuple | np.ndarray | torch.Tensor):
             if isinstance(samples, torch.Tensor):
                 samples_arr = samples.detach().cpu().numpy()
             else:
@@ -71,7 +71,7 @@ def _update_conditioning_hash(h: hashlib._Hash, value: Any) -> None:
             h.update(b"\x02")
             _update_conditioning_hash(h, value[key])
         return
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         h.update(f"sequence:{len(value)}".encode())
         for item in value:
             h.update(b"\x03")
@@ -171,6 +171,12 @@ def _warmup_ref_audio_uri() -> str:
 
 @register_tts_adapter
 class IndexTTS2Adapter(ARTTSAdapter):
+    #: The S2Mel/BigVGAN decoder renders 22.05 kHz (indextts2_s2mel_decoder), which
+    #: matters for the container check: opus cannot encode that rate, so
+    #: ``response_format=opus`` is refused before generation instead of failing in
+    #: the encoder afterwards.
+    supported_output_sample_rates = frozenset({22050})
+
     stage_keys = frozenset({"indextts2_talker"})
     name = "indextts2"
 
@@ -260,14 +266,14 @@ class IndexTTS2Adapter(ARTTSAdapter):
             if not isinstance(value, list) or len(value) != 8:
                 return "extra_params.emo_vector must be a list of 8 numbers"
             for item in value:
-                if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+                if isinstance(item, bool) or not isinstance(item, int | float) or not math.isfinite(float(item)):
                     return "extra_params.emo_vector must be a list of 8 finite numbers"
                 if float(item) < 0.0 or float(item) > 1.2:
                     return "extra_params.emo_vector values must be in [0, 1.2]"
 
         if "emo_alpha" in extras:
             value = extras["emo_alpha"]
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
                 return "extra_params.emo_alpha must be a finite number"
 
         if "emo_text" in extras and extras["emo_text"] is not None and not isinstance(extras["emo_text"], str):

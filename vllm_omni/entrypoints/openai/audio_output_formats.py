@@ -36,8 +36,36 @@ _ALWAYS_AVAILABLE = frozenset({"wav", "pcm"})
 _CODEC_PROBED = {
     "mp3": "MP3",
     "flac": "FLAC",
-    "opus": "OGG",  # soundfile writes Opus into an Ogg container.
+    "opus": "OGG",  # 容器;还要看 subtype 里有没有 OPUS,见 _opus_subtype_available。
 }
+
+#: Sample rates each lossy container can encode (libsndfile / the underlying codec).
+#:
+#: Opus is the trap: libsndfile writes it into an Ogg container, so an OGG-capable
+#: build looks like it supports opus — but the codec only accepts 8/12/16/24/48 kHz.
+#: IndexTTS2 renders 22.05 kHz, so ``response_format=opus`` used to pass the
+#: capability check and then fail while *encoding*, after the whole waveform had been
+#: generated. ``wav``/``pcm``/``flac`` accept any rate and are absent here.
+_CONTAINER_SAMPLE_RATES: dict[str, frozenset[int]] = {
+    "opus": frozenset({8000, 12000, 16000, 24000, 48000}),
+    "mp3": frozenset({8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000}),
+}
+
+
+def _opus_subtype_available() -> bool:
+    """True when the Ogg encoder can actually produce Opus.
+
+    Split out for the same reason as ``_codec_containers``: tests substitute it.
+    """
+    try:
+        import soundfile
+    except ImportError:  # pragma: no cover - soundfile is a hard requirement
+        return False
+    try:
+        return "OPUS" in set(soundfile.available_subtypes("OGG") or ())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not query OGG subtypes (%s); treating opus as unavailable", exc)
+        return False
 
 
 def _codec_containers() -> set[str]:
@@ -70,6 +98,9 @@ def available_output_formats() -> frozenset[str]:
     for container, codec in _CODEC_PROBED.items():
         if codec in codecs:
             available.add(container)
+    # OGG alone is not Opus: the container can exist while the codec is missing.
+    if "opus" in available and not _opus_subtype_available():
+        available.discard("opus")
     missing = sorted(SUPPORTED_AUDIO_FORMATS - available)
     if missing:
         # Loud but not fatal: the server still serves the other containers, and the
@@ -97,12 +128,30 @@ def allowed_output_formats(adapter: object | None = None) -> frozenset[str]:
     return frozenset(declared) & available
 
 
-def check_output_format(response_format: str, adapter: object | None = None) -> str | None:
-    """Return an error message for an unproducible container, else ``None``."""
+def check_output_format(
+    response_format: str,
+    adapter: object | None = None,
+    sample_rate: int | None = None,
+) -> str | None:
+    """Return an error message for an unproducible container, else ``None``.
+
+    ``sample_rate`` is the rate the response will actually be encoded at (the
+    request's ``sample_rate``, or the model's native rate when the adapter declares
+    exactly one). When it is known and the container cannot encode it, this answers
+    *before* generation: otherwise the request burns a full synthesis and only then
+    fails inside the encoder.
+    """
     requested = (response_format or "").strip().lower()
     if not requested:
         return None
     allowed = allowed_output_formats(adapter)
-    if requested in allowed:
-        return None
-    return f"response_format='{requested}' is not available on this server; supported: {', '.join(sorted(allowed))}"
+    if requested not in allowed:
+        return f"response_format='{requested}' is not available on this server; supported: {', '.join(sorted(allowed))}"
+
+    rates = _CONTAINER_SAMPLE_RATES.get(requested)
+    if sample_rate and rates and sample_rate not in rates:
+        return (
+            f"response_format='{requested}' cannot be encoded at {sample_rate} Hz on this server; "
+            f"supported sample rates for {requested}: {', '.join(str(r) for r in sorted(rates))}"
+        )
+    return None

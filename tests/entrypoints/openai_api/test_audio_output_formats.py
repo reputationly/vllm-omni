@@ -41,8 +41,11 @@ def _fresh_probe():
     aof.available_output_formats.cache_clear()
 
 
-def _probe(monkeypatch, codecs: set[str]) -> None:
+def _probe(monkeypatch, codecs: set[str], *, opus: bool = True) -> None:
     monkeypatch.setattr(aof, "_codec_containers", lambda: set(codecs))
+    # OGG 容器存在不代表能编 Opus(libsndfile 的 Ogg 里可能是 Vorbis),所以探测要
+    # 走 subtype;测试里单独控制,才能覆盖"有 OGG 没 OPUS"这种真实镜像。
+    monkeypatch.setattr(aof, "_opus_subtype_available", lambda: opus)
 
 
 def test_wav_and_pcm_never_depend_on_a_codec(monkeypatch):
@@ -102,3 +105,68 @@ def test_empty_format_defers_to_the_request_default(monkeypatch):
 def test_case_and_whitespace_tolerated(monkeypatch):
     _probe(monkeypatch, ALL_CODECS)
     assert aof.check_output_format("  MP3 ", _FullAdapter()) is None
+
+
+def test_ogg_without_opus_subtype_does_not_advertise_opus(monkeypatch):
+    """Containers are not codecs: OGG present ≠ Opus encodable.
+
+    An OGG-capable libsndfile without the OPUS subtype used to advertise opus, and
+    the request then failed inside the encoder — after the waveform was generated.
+    """
+    _probe(monkeypatch, ALL_CODECS, opus=False)
+    available = aof.available_output_formats()
+    assert "ogg" not in available  # never an output container of ours
+    assert "opus" not in available
+    assert {"wav", "pcm", "mp3", "flac"} <= available
+    assert aof.check_output_format("opus", _FullAdapter()) is not None
+
+
+def test_opus_is_capped_by_sample_rate(monkeypatch):
+    """Opus only accepts 8/12/16/24/48 kHz; 22.05 kHz (IndexTTS2) must be refused up front."""
+    _probe(monkeypatch, ALL_CODECS)
+
+    for rate in (8000, 12000, 16000, 24000, 48000):
+        assert aof.check_output_format("opus", _FullAdapter(), rate) is None
+
+    message = aof.check_output_format("opus", _FullAdapter(), 22050)
+    assert message is not None
+    assert "22050" in message
+    # 文案要告诉调用方能用什么采样率,否则只能靠试。
+    assert "24000" in message
+
+
+def test_mp3_accepts_the_speech_rates(monkeypatch):
+    _probe(monkeypatch, ALL_CODECS)
+    for rate in (16000, 22050, 24000, 44100, 48000):
+        assert aof.check_output_format("mp3", _FullAdapter(), rate) is None
+    assert aof.check_output_format("mp3", _FullAdapter(), 4000) is not None
+
+
+def test_rate_check_is_skipped_when_the_rate_is_unknown(monkeypatch):
+    _probe(monkeypatch, ALL_CODECS)
+    # 不知道采样率时不要乱拒:交给编码器,而不是猜。
+    assert aof.check_output_format("opus", _FullAdapter(), None) is None
+
+
+# --------------------------------------------------------------------------- #
+# Which sample rate the container check reasons about.
+# --------------------------------------------------------------------------- #
+def test_effective_output_sample_rate_prefers_the_request():
+    from vllm_omni.entrypoints.openai.tts_adapters.base import effective_output_sample_rate
+
+    class _Adapter:
+        supported_output_sample_rates = frozenset({24000})
+
+    class _Request:
+        def __init__(self, sample_rate):
+            self.sample_rate = sample_rate
+
+    assert effective_output_sample_rate(_Adapter(), _Request(48000)) == 48000
+    # 没有显式请求时,只输出一种采样率的模型是可知的
+    assert effective_output_sample_rate(_Adapter(), _Request(None)) == 24000
+
+    class _ManyRates:
+        supported_output_sample_rates = frozenset({8000, 24000})
+
+    # 多采样率模型无法在请求前确定 → 不猜,交给编码器
+    assert effective_output_sample_rate(_ManyRates(), _Request(None)) is None

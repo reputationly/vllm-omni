@@ -129,6 +129,21 @@ def conditioning_cache_salt(
     return h.hexdigest()[:32]
 
 
+def effective_output_sample_rate(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> int | None:
+    """The rate the response will be encoded at, when it can be known up front.
+
+    ``request.sample_rate`` wins; otherwise a model that only ever emits one rate
+    (declared through ``supported_output_sample_rates``) has that rate. ``None`` means
+    "unknown" — the container check then skips the rate test rather than guessing.
+    """
+    if request.sample_rate:
+        return request.sample_rate
+    declared: frozenset[int] = getattr(adapter, "supported_output_sample_rates", frozenset())
+    if len(declared) == 1:
+        return next(iter(declared))
+    return None
+
+
 def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> str | None:
     """``adapter.validate`` after the checks every adapter shares: the requested
     output container, then ``ref_audio_codes`` only where supported, rather than
@@ -141,7 +156,11 @@ def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeec
     it in the shared entrypoint also covers the batch and websocket paths, which
     call this function directly.
     """
-    format_error = check_output_format(request.response_format, adapter)
+    format_error = check_output_format(
+        request.response_format,
+        adapter,
+        effective_output_sample_rate(adapter, request),
+    )
     if format_error is not None:
         return format_error
     if getattr(request, "ref_audio_codes", None) is not None and not getattr(
