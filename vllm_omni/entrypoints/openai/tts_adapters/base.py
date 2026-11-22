@@ -132,16 +132,12 @@ def conditioning_cache_salt(
 def effective_output_sample_rate(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> int | None:
     """The rate the response will be encoded at, when it can be known up front.
 
-    ``request.sample_rate`` wins; otherwise a model that only ever emits one rate
-    (declared through ``supported_output_sample_rates``) has that rate. ``None`` means
+    ``request.sample_rate`` wins; otherwise use the adapter's native rate. ``None`` means
     "unknown" — the container check then skips the rate test rather than guessing.
     """
     if request.sample_rate:
         return request.sample_rate
-    declared: frozenset[int] = getattr(adapter, "supported_output_sample_rates", frozenset())
-    if len(declared) == 1:
-        return next(iter(declared))
-    return None
+    return adapter.native_output_sample_rate()
 
 
 def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> str | None:
@@ -352,6 +348,11 @@ class TTSModelAdapter(ABC):
         deployed alongside). Default: always.
         """
         return True
+
+    def native_output_sample_rate(self) -> int | None:
+        if len(self.supported_output_sample_rates) == 1:
+            return next(iter(self.supported_output_sample_rates))
+        return None
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """In-place request normalization/mutation (e.g. infer task type,

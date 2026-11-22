@@ -12,6 +12,8 @@ failed with a 500. These tests pin the replacement contract:
 4. an unproducible container yields a readable 400-style message, not a crash.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.entrypoints.openai import audio_output_formats as aof
@@ -152,10 +154,11 @@ def test_rate_check_is_skipped_when_the_rate_is_unknown(monkeypatch):
 # Which sample rate the container check reasons about.
 # --------------------------------------------------------------------------- #
 def test_effective_output_sample_rate_prefers_the_request():
-    from vllm_omni.entrypoints.openai.tts_adapters.base import effective_output_sample_rate
+    from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter, effective_output_sample_rate
 
     class _Adapter:
         supported_output_sample_rates = frozenset({24000})
+        native_output_sample_rate = TTSModelAdapter.native_output_sample_rate
 
     class _Request:
         def __init__(self, sample_rate):
@@ -167,6 +170,7 @@ def test_effective_output_sample_rate_prefers_the_request():
 
     class _ManyRates:
         supported_output_sample_rates = frozenset({8000, 24000})
+        native_output_sample_rate = TTSModelAdapter.native_output_sample_rate
 
     # 多采样率模型无法在请求前确定 → 不猜,交给编码器
     assert effective_output_sample_rate(_ManyRates(), _Request(None)) is None
@@ -202,9 +206,21 @@ def test_fixed_rate_models_declare_their_rate():
     ``response_format=opus`` only fails inside the encoder — after generation.
     """
     from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts_2 import BreezeTTS2Adapter
+    from vllm_omni.entrypoints.openai.tts_adapters.fish_omni import FishOmniAdapter
     from vllm_omni.entrypoints.openai.tts_adapters.fish_speech import FishSpeechAdapter
     from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS2Adapter
 
     assert BreezeTTS2Adapter.supported_output_sample_rates == frozenset({24000})
     assert IndexTTS2Adapter.supported_output_sample_rates == frozenset({22050})
     assert FishSpeechAdapter.supported_output_sample_rates == frozenset({44100})
+    assert FishOmniAdapter.supported_output_sample_rates == FishSpeechAdapter.supported_output_sample_rates
+
+
+@pytest.mark.parametrize(("config", "rate"), [({}, 44100), ({"codec_sample_rate": 24000}, 24000)])
+def test_audio8_uses_the_decoder_sample_rate(config, rate):
+    from vllm_omni.entrypoints.openai.tts_adapters.audio8_tts import Audio8TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext, effective_output_sample_rate
+
+    engine = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(**config)))
+    adapter = Audio8TTSAdapter(SpeechServingContext(server=None, engine_client=engine))
+    assert effective_output_sample_rate(adapter, SimpleNamespace(sample_rate=None)) == rate

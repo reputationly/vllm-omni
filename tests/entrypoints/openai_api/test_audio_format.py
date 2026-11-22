@@ -22,6 +22,7 @@ import soundfile
 import torch
 import torchaudio
 
+from vllm_omni.entrypoints.openai.audio_output_formats import artifact_media_type
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
@@ -69,6 +70,7 @@ class TestCreateAudio:
         )
         response = mixin.create_audio(audio_obj)
         assert len(response.audio_data) > 0
+        assert response.media_type == artifact_media_type(f"task.{fmt}")
         assert response.audio_metadata is not None
         assert response.audio_metadata.model_dump() == {
             "format": fmt,

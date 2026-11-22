@@ -28,6 +28,7 @@ import torch
 import torchaudio
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai.audio_output_formats import ARTIFACT_MEDIA_TYPES
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
     AudioChunkMetadata,
@@ -107,18 +108,19 @@ class AudioMixin:
             sample_rate = audio_obj.output_sample_rate
 
         supported_formats = {
-            "wav": ("WAV", "audio/wav", {}),
-            "pcm": ("RAW", "audio/pcm", {"subtype": "PCM_16"}),
-            "flac": ("FLAC", "audio/flac", {}),
-            "mp3": ("MP3", "audio/mpeg", {}),
-            "opus": ("OGG", "audio/ogg", {"subtype": "OPUS"}),
+            "wav": ("WAV", {}),
+            "pcm": ("RAW", {"subtype": "PCM_16"}),
+            "flac": ("FLAC", {}),
+            "mp3": ("MP3", {}),
+            "opus": ("OGG", {"subtype": "OPUS"}),
         }
 
         if response_format not in supported_formats:
             logger.warning(f"Unsupported response format '{response_format}', defaulting to '{DEFAULT_AUDIO_FORMAT}'.")
             response_format = DEFAULT_AUDIO_FORMAT
 
-        soundfile_format, media_type, kwargs = supported_formats[response_format]
+        soundfile_format, kwargs = supported_formats[response_format]
+        media_type = ARTIFACT_MEDIA_TYPES[f".{response_format}"]
 
         audio_data: bytes | str
         if response_format == "pcm" and isinstance(audio_tensor, np.ndarray) and audio_tensor.dtype == np.float32:
