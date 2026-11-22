@@ -155,3 +155,24 @@ def check_output_format(
             f"supported sample rates for {requested}: {', '.join(str(r) for r in sorted(rates))}"
         )
     return None
+
+
+#: Artifact suffix -> media type, for endpoints that serve a stored file.
+#: Starlette's own table has no entry for .pcm/.opus/.flac, so guessing made a
+#: ``.pcm`` download arrive as ``application/octet-stream`` while the synchronous
+#: endpoint reported ``audio/pcm`` for the same container.
+ARTIFACT_MEDIA_TYPES: dict[str, str] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".opus": "audio/opus",
+    ".pcm": "audio/pcm",
+    ".ogg": "audio/ogg",
+}
+
+
+def artifact_media_type(path: str) -> str | None:
+    """Media type for a stored artifact, or ``None`` to let the framework guess."""
+    import os
+
+    return ARTIFACT_MEDIA_TYPES.get(os.path.splitext(path)[1].lower())

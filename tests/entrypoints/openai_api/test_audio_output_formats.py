@@ -170,3 +170,41 @@ def test_effective_output_sample_rate_prefers_the_request():
 
     # 多采样率模型无法在请求前确定 → 不猜,交给编码器
     assert effective_output_sample_rate(_ManyRates(), _Request(None)) is None
+
+
+# --------------------------------------------------------------------------- #
+# Serving a stored artifact must use the same media type as the sync endpoint.
+# --------------------------------------------------------------------------- #
+def test_artifact_media_types_cover_every_container():
+    """Starlette has no entry for .pcm/.opus/.flac — a ``.pcm`` download used to
+    arrive as ``application/octet-stream`` while the sync endpoint said ``audio/pcm``."""
+    from vllm_omni.entrypoints.openai.audio_output_formats import artifact_media_type
+
+    expected = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".flac": "audio/flac",
+        ".opus": "audio/opus",
+        ".pcm": "audio/pcm",
+    }
+    for suffix, media_type in expected.items():
+        assert artifact_media_type("task-1" + suffix) == media_type
+    # 大写后缀同样认
+    assert artifact_media_type("task-1.PCM") == "audio/pcm"
+    # 认不出就交给框架猜,不要瞎标
+    assert artifact_media_type("task-1.bin") is None
+
+
+def test_fixed_rate_models_declare_their_rate():
+    """Opus cannot encode 44.1 kHz, so a fixed-rate decoder must say which rate it has.
+
+    Otherwise the rate is "unknown", the container check is skipped, and
+    ``response_format=opus`` only fails inside the encoder — after generation.
+    """
+    from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts_2 import BreezeTTS2Adapter
+    from vllm_omni.entrypoints.openai.tts_adapters.fish_speech import FishSpeechAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS2Adapter
+
+    assert BreezeTTS2Adapter.supported_output_sample_rates == frozenset({24000})
+    assert IndexTTS2Adapter.supported_output_sample_rates == frozenset({22050})
+    assert FishSpeechAdapter.supported_output_sample_rates == frozenset({44100})

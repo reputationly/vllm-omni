@@ -24,6 +24,14 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class FishSpeechAdapter(ARTTSAdapter):
+    #: The DAC decoder is fixed at 44.1 kHz (fish_speech/dac_utils.DAC_SAMPLE_RATE),
+    #: and it matters for the container check: Opus cannot encode 44.1 kHz, so
+    #: ``response_format=opus`` on this model has to be refused before a synthesis is
+    #: wasted. Capability gating needs the real number — leaving it undeclared meant
+    #: the rate was "unknown", the check was skipped, and the failure only showed up
+    #: inside the encoder after generation.
+    supported_output_sample_rates = frozenset({44100})
+
     stage_keys = frozenset({"fish_speech_slow_ar"})
     name = "fish_tts"
 
@@ -36,7 +44,7 @@ class FishSpeechAdapter(ARTTSAdapter):
     def _estimate_ref_code_len(ref_audio: object) -> int | None:
         from vllm_omni.model_executor.models.fish_speech.dac_utils import DAC_HOP_LENGTH, DAC_SAMPLE_RATE
 
-        if not isinstance(ref_audio, (list, tuple)) or len(ref_audio) != 2:
+        if not isinstance(ref_audio, list | tuple) or len(ref_audio) != 2:
             return None
         wav, sr = ref_audio
         sr = int(sr)
@@ -48,9 +56,10 @@ class FishSpeechAdapter(ARTTSAdapter):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.ctx.engine_client.model_config.model, trust_remote_code=True
-            )
+            engine_client = self.ctx.engine_client
+            if engine_client is None:
+                raise RuntimeError("Fish Speech serving requires an engine client")
+            self._tokenizer = AutoTokenizer.from_pretrained(engine_client.model_config.model, trust_remote_code=True)
         return self._tokenizer
 
     def _estimate_prompt_len(self, text: str, ref_text: str, ref_audio: object) -> int:

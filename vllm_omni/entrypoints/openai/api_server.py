@@ -125,6 +125,7 @@ from vllm_omni.entrypoints.openai.app_state import (
     Omnivideo,
     _get_engine_and_model,
 )
+from vllm_omni.entrypoints.openai.audio_output_formats import artifact_media_type
 from vllm_omni.entrypoints.openai.audio_task_manager import (
     AUDIO_TASK_MANAGER,
     FORMAT_SUFFIXES,
@@ -5155,7 +5156,11 @@ async def get_audio_task_result(task_id: str) -> Response:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Result not ready")
     if not os.path.exists(job.save_result_path):
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="Result file not found on disk")
-    return FileResponse(path=job.save_result_path, filename=os.path.basename(job.save_result_path))
+    return FileResponse(
+        path=job.save_result_path,
+        filename=os.path.basename(job.save_result_path),
+        media_type=artifact_media_type(job.save_result_path),
+    )
 
 
 @router.delete("/v1/tasks/{task_id}")
