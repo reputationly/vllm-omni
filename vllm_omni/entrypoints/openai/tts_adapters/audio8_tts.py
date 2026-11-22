@@ -44,9 +44,15 @@ class Audio8TTSAdapter(ARTTSAdapter):
 
     def native_output_sample_rate(self) -> int | None:
         engine_client = self.ctx.engine_client
-        if engine_client is None:
+        engine = getattr(engine_client, "engine", None)
+        for stage in getattr(engine, "stage_vllm_configs", ()):
+            model_config = getattr(stage, "model_config", None)
+            if model_config is not None and model_config.model_stage == "audio8_tts_codec_decoder":
+                return int(getattr(model_config.hf_config, "codec_sample_rate", ARKTTS_CODEC_SAMPLE_RATE))
+        model_config = getattr(engine_client, "model_config", None)
+        if model_config is None:
             return None
-        return int(getattr(engine_client.model_config.hf_config, "codec_sample_rate", ARKTTS_CODEC_SAMPLE_RATE))
+        return int(getattr(model_config.hf_config, "codec_sample_rate", ARKTTS_CODEC_SAMPLE_RATE))
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         server = self.ctx.server

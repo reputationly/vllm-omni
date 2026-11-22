@@ -224,3 +224,18 @@ def test_audio8_uses_the_decoder_sample_rate(config, rate):
     engine = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(**config)))
     adapter = Audio8TTSAdapter(SpeechServingContext(server=None, engine_client=engine))
     assert effective_output_sample_rate(adapter, SimpleNamespace(sample_rate=None)) == rate
+
+
+def test_audio8_prefers_the_codec_stage_config():
+    from vllm_omni.entrypoints.openai.tts_adapters.audio8_tts import Audio8TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+
+    slow_ar = SimpleNamespace(model_stage="audio8_tts_slow_ar", hf_config=SimpleNamespace(codec_sample_rate=44100))
+    decoder = SimpleNamespace(
+        model_stage="audio8_tts_codec_decoder", hf_config=SimpleNamespace(codec_sample_rate=24000)
+    )
+    engine = SimpleNamespace(stage_vllm_configs=[SimpleNamespace(model_config=c) for c in (slow_ar, decoder)])
+    adapter = Audio8TTSAdapter(
+        SpeechServingContext(server=None, engine_client=SimpleNamespace(engine=engine, model_config=slow_ar))
+    )
+    assert adapter.native_output_sample_rate() == 24000
