@@ -20,6 +20,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 from vllm_omni.model_executor.models.audio8_tts.codec_utils import (
     estimate_reference_code_frames,
 )
+from vllm_omni.model_executor.models.audio8_tts.configuration_audio8_tts import ARKTTS_CODEC_SAMPLE_RATE
 from vllm_omni.model_executor.models.audio8_tts.prompt_utils import (
     build_text_only_prompt_ids,
     estimate_voice_clone_prompt_len,
@@ -40,6 +41,18 @@ class Audio8TTSAdapter(ARTTSAdapter):
     def __init__(self, ctx: Any) -> None:
         super().__init__(ctx)
         self._cached_tokenizer: Any = None
+
+    def native_output_sample_rate(self) -> int | None:
+        engine_client = self.ctx.engine_client
+        engine = getattr(engine_client, "engine", None)
+        for stage in getattr(engine, "stage_vllm_configs", ()):
+            model_config = getattr(stage, "model_config", None)
+            if model_config is not None and model_config.model_stage == "audio8_tts_codec_decoder":
+                return int(getattr(model_config.hf_config, "codec_sample_rate", ARKTTS_CODEC_SAMPLE_RATE))
+        model_config = getattr(engine_client, "model_config", None)
+        if model_config is None:
+            return None
+        return int(getattr(model_config.hf_config, "codec_sample_rate", ARKTTS_CODEC_SAMPLE_RATE))
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         server = self.ctx.server

@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 class FishOmniAdapter(ARTTSAdapter):
     stage_keys = frozenset({"fish_omni"})
     name = "fish_omni_tts"
+    supported_output_sample_rates = frozenset({44100})
     supports_reference_codes = True
 
     def __init__(self, ctx) -> None:
